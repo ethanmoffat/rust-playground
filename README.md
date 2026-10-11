@@ -72,6 +72,31 @@ Run all verification targets serially with:
 npx nx run-many -t verify --all --parallel=1
 ```
 
+## Cleaning temporary state
+
+Every Nx project has an uncached `clean` target. The root `rust:clean` runs all
+project cleanup targets, then cleans root-owned temporary state:
+
+```bash
+npx --no-install nx run rust:clean
+npx --no-install nx run loadtest:clean
+npx --no-install nx run greeting:clean
+```
+
+Cleanup removes only each project's `.temp/`, `.ci-logs/`, `logs/`, and
+`coverage/`. `loadtest:clean` also removes the root `onelake/` directory,
+including retained demo tables and E2E diagnostics. Missing state is a no-op;
+directory symlinks are removed without following their targets.
+
+Managed caches and build outputs are preserved: `node_modules/`, `.nx/`,
+Cargo caches and `target/`, Docker images/volumes/build caches, `dist/`, and
+`out/`. Configuration, credentials, and cached authentication profiles are
+not removed.
+
+These targets clean files only; they do not stop running processes or
+containers. Stop the demo with `npx --no-install nx run loadtest:down` before
+cleaning its state.
+
 ## Sample CLI and image
 
 Run the sample application:
@@ -115,7 +140,7 @@ docker run --rm --platform linux/amd64 \
   plugin.
 - `projects/otelcol-rust/` - Nx build/configuration and Docker image for the
   editable otel-arrow fork at `submodules/otel-arrow`.
-- `projects/loadtest/` - Two-service Compose demo and content-verified Parquet
+- `projects/loadtest/` - Two-service Compose demo and content-verified Delta
   E2E; generated telemetry lives in gitignored `onelake/`.
 - `.devcontainer/` - Reproducible source-built and immutable prebuilt
   development environments.
@@ -134,9 +159,17 @@ npx --no-install nx run loadtest:e2e
 ```
 
 The sample sends logs, metrics, and traces to the Rust collector and writes
-readable local Parquet. `loadtest:up` rebuilds both local Dockerfiles, including
-uncommitted fork edits. See [loadtest](projects/loadtest/README.md) and
+readable local Delta tables containing Parquet. Multiple collector cores stream
+files concurrently and share batched Delta commits per table. `loadtest:up`
+rebuilds both local Dockerfiles, including uncommitted fork edits.
+See [loadtest](projects/loadtest/README.md) and
 [collector development](projects/otelcol-rust/README.md#editing-the-fork).
+
+The [arrow-deltalake SDK](crates/arrow-deltalake/README.md) accepts pure Arrow
+batches for Parquet-only or Delta writing. OTEL-specific routing and joins
+live in the separate [Delta adapter](crates/otel-deltalake-exporter/README.md).
+Writer-side Delta operations use Delta Kernel; delta-rs is confined to the
+loadtest reader.
 
 ## Public GHCR images
 

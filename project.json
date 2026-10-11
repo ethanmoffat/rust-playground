@@ -3,6 +3,9 @@
   "$schema": "./node_modules/nx/schemas/project-schema.json",
   "projectType": "library",
   "implicitDependencies": [
+    "arrow-deltalake",
+    "otel-deltalake-exporter",
+    "otelcol-rust",
     "greeting",
     "hello-world",
     "loadtest"
@@ -11,12 +14,44 @@
     "description": "Aggregate targets for the Rust workspace."
   },
   "targets": {
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        {
+          "projects": [
+            "arrow-deltalake",
+            "otel-deltalake-exporter",
+            "otelcol-rust",
+            "greeting",
+            "hello-world",
+            "loadtest",
+            "auth-automation",
+            "rust-playground-build",
+            "tools-scripts",
+            "devcontainer"
+          ],
+          "target": "clean"
+        }
+      ],
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/clean.ts .",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      },
+      "metadata": {
+        "description": "Clean all projects' temporary state without removing managed caches or build artifacts."
+      }
+    },
     "format": {
       "executor": "nx:run-commands",
       "cache": false,
       "dependsOn": [
         {
           "projects": [
+            "arrow-deltalake",
+            "otel-deltalake-exporter",
+            "otelcol-rust",
             "greeting",
             "hello-world",
             "loadtest"
@@ -37,6 +72,9 @@
       "dependsOn": [
         {
           "projects": [
+            "arrow-deltalake",
+            "otel-deltalake-exporter",
+            "otelcol-rust",
             "greeting",
             "hello-world",
             "loadtest"
@@ -57,6 +95,9 @@
       "dependsOn": [
         {
           "projects": [
+            "arrow-deltalake",
+            "otel-deltalake-exporter",
+            "otelcol-rust",
             "greeting",
             "hello-world",
             "loadtest"
@@ -77,6 +118,9 @@
       "dependsOn": [
         {
           "projects": [
+            "arrow-deltalake",
+            "otel-deltalake-exporter",
+            "otelcol-rust",
             "greeting",
             "hello-world"
           ],
@@ -100,6 +144,9 @@
       "dependsOn": [
         {
           "projects": [
+            "arrow-deltalake",
+            "otel-deltalake-exporter",
+            "otelcol-rust",
             "greeting",
             "hello-world",
             "loadtest"
@@ -122,7 +169,9 @@
         "{workspaceRoot}/Cargo.lock",
         "{workspaceRoot}/crates/*/Cargo.toml",
         "{workspaceRoot}/bin/*/Cargo.toml",
-        "{workspaceRoot}/projects/loadtest/reader/Cargo.toml"
+        "{workspaceRoot}/projects/loadtest/reader/Cargo.toml",
+        "{workspaceRoot}/projects/otelcol-rust/Cargo.toml",
+        "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/**/Cargo.toml"
       ],
       "options": {
         "command": "cargo metadata --locked --format-version 1 --no-deps",
@@ -144,7 +193,11 @@
         "{workspaceRoot}/bin/*/Cargo.toml",
         "{workspaceRoot}/bin/*/src/**/*",
         "{workspaceRoot}/projects/loadtest/reader/Cargo.toml",
-        "{workspaceRoot}/projects/loadtest/reader/src/**/*"
+        "{workspaceRoot}/projects/loadtest/reader/src/**/*",
+        "{workspaceRoot}/projects/otelcol-rust/Cargo.toml",
+        "{workspaceRoot}/projects/otelcol-rust/src/**/*",
+        "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/**/*.rs",
+        "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/**/Cargo.toml"
       ],
       "options": {
         "command": "cargo test --locked --workspace --doc --all-features",

@@ -1,0 +1,30 @@
+{
+  "name": "arrow-deltalake",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "crates/arrow-deltalake/src",
+  "namedInputs": {
+    "default": ["{projectRoot}/**/*", "{workspaceRoot}/Cargo.toml", "{workspaceRoot}/Cargo.lock", "{workspaceRoot}/rust-toolchain.toml"]
+  },
+  "targets": {
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/clean.ts crates/arrow-deltalake",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "format": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package arrow-deltalake"}},
+    "format-check": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package arrow-deltalake -- --check"}},
+    "lint": {"executor": "nx:run-commands", "options": {"command": "cargo clippy --locked --package arrow-deltalake --all-targets --all-features -- -D warnings"}},
+    "build": {"executor": "nx:run-commands", "cache": false, "options": {"command": "cargo build --locked --package arrow-deltalake --all-features"}},
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {"commands": ["cargo test --locked --package arrow-deltalake --all-features", "cargo test --locked --package arrow-deltalake --no-default-features"], "parallel": false}
+    },
+    "verify": {"executor": "nx:run-commands", "dependsOn": ["format-check", "lint", "build", "test"], "options": {"commands": []}}
+  },
+  "tags": ["scope:rust", "type:library"]
+}
