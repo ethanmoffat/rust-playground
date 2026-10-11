@@ -159,7 +159,7 @@ export function runPostCreate(
   let forceCargoMakeInstall = false;
   if (!installCargoMake) {
     const installedVersion = dependencies
-      .capture('cargo-make', ['--version'], repositoryRoot)
+      .capture('cargo', ['make', '--version'], repositoryRoot)
       .trim();
     if (!new RegExp(`\\b${cargoMakeVersion.replaceAll('.', '\\.')}\\b`, 'u').test(
       installedVersion,

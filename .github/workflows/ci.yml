@@ -15,11 +15,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
-    name: Verify in source devcontainer
+  plan:
+    name: Discover independent Nx checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
-
+    timeout-minutes: 10
+    outputs:
+      node: ${{ steps.plan.outputs.node_matrix }}
+      rust: ${{ steps.plan.outputs.rust_matrix }}
+      images: ${{ steps.plan.outputs.image_matrix }}
+      image_refs: ${{ steps.plan.outputs.image_refs }}
+      reader: ${{ steps.plan.outputs.reader }}
+      integration: ${{ steps.plan.outputs.integration }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -37,31 +43,149 @@ jobs:
       - name: Install host CLI dependencies
         run: npm ci
 
-      - name: Prepare CI host environment
-        run: npx --no-install nx run tools-scripts:ci-prepare
+      - name: Generate dependency-closed verification matrices
+        id: plan
+        run: npx --no-install nx run tools-scripts:ci-plan
 
-      - name: Start source devcontainer
-        id: devcontainer
-        run: npx --no-install nx run tools-scripts:ci-start-source
-
-      - name: Verify every Nx target
-        env:
-          CONTAINER_ID: ${{ steps.devcontainer.outputs.container_id }}
-        run: npx --no-install nx run tools-scripts:ci-verify
-
-      - name: Remove CI devcontainer resources
-        if: always()
-        env:
-          CI_LABEL: ${{ steps.devcontainer.outputs.ci_label }}
-          COMPOSE_PROJECT: ${{ steps.devcontainer.outputs.compose_project }}
-          CONTAINER_ID: ${{ steps.devcontainer.outputs.container_id }}
-        run: npx --no-install nx run tools-scripts:ci-cleanup
-
-      - name: Upload telemetry E2E diagnostics
-        if: failure()
+  environment:
+    name: Build shared source environment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      image: ${{ steps.environment.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Build locked tools and export the source image
+        id: environment
+        run: |
+          CI_BASE_IMAGE="$(node --input-type=module -e 'import { immutableImage, readContentHash } from "./.devcontainer/scripts/config.ts"; process.stdout.write(immutableImage(readContentHash(".")));')"
+          export CI_BASE_IMAGE
+          npx --no-install nx run tools-scripts:ci-build-environment
+      - name: Share the source environment with Rust runners
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: telemetry-e2e-diagnostics
-          path: onelake/e2e/
-          if-no-files-found: ignore
-          retention-days: 7
+          name: ci-source-environment
+          path: .temp/ci/environment/environment.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+  node:
+    name: Node (${{ matrix.task }})
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.node) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Run this independent verification closure
+        env:
+          CI_TASK: ${{ matrix.task }}
+        run: npx --no-install nx run tools-scripts:ci-verify-host
+
+  images:
+    name: Image (${{ matrix.task }})
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.images) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Build this source image on its own runner
+        env:
+          CI_TASK: ${{ matrix.task }}
+        run: npx --no-install nx run tools-scripts:ci-verify-host
+      - name: Export the built image and its identity
+        env:
+          CI_ARTIFACT_KEY: ${{ matrix.key }}
+          CI_IMAGE_REFS: ${{ toJSON(matrix.image_refs) }}
+        run: npx --no-install nx run tools-scripts:ci-export-images
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-image-${{ matrix.key }}
+          path: .temp/ci/images/${{ matrix.key }}.*
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+  rust:
+    name: Rust (${{ matrix.task }})
+    needs: [plan, environment]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.rust) }}
+    uses: ./.github/workflows/ci-container.yml
+    with:
+      image: ${{ needs.environment.outputs.image }}
+      task: ${{ matrix.task }}
+      key: ${{ matrix.key }}
+
+  reader:
+    name: Build independent Delta reader
+    needs: [plan, environment]
+    uses: ./.github/workflows/ci-container.yml
+    with:
+      image: ${{ needs.environment.outputs.image }}
+      task: ${{ needs.plan.outputs.reader }}
+      key: loadtest-reader-build
+      export-reader: true
+
+  e2e:
+    name: Artifact-backed three-signal E2E
+    needs: [plan, environment, images, reader]
+    uses: ./.github/workflows/ci-container.yml
+    with:
+      image: ${{ needs.environment.outputs.image }}
+      task: ${{ needs.plan.outputs.integration }}
+      key: loadtest-e2e
+      integration: true
+      image-refs: ${{ needs.plan.outputs.image_refs }}
+
+  verify:
+    name: Verify in source devcontainer
+    needs: [plan, environment, node, images, rust, reader, e2e]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every verification branch to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          node -e '
+            const jobs = JSON.parse(process.env.RESULTS);
+            const failed = Object.entries(jobs).filter(([, job]) => job.result !== "success");
+            if (failed.length) {
+              console.error("CI prerequisites did not succeed:", failed.map(([name, job]) => `${name}=${job.result}`).join(", "));
+              process.exit(1);
+            }
+          '

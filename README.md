@@ -72,6 +72,36 @@ Run all verification targets serially with:
 npx nx run-many -t verify --all --parallel=1
 ```
 
+## Parallel GitHub CI
+
+CI discovers the complete Nx verification graph, then fans out independent
+checks onto separate runners. Matrix concurrency is uncapped; dependencies,
+not a global serial queue, determine when work starts.
+
+```text
+                           +--> Node checks --------------------+
+  Nx task discovery -------+--> runtime image builds ---+        |
+                           |                            |        |
+                           +------------------------+   |        |
+                                                    |   |        |
+  locked source environment --> shared image -------+   |        |
+                                  |                     |        |
+                                  +--> Rust checks -----|--------+
+                                  +--> Delta reader ----+        |
+                                                       |        |
+                                                       v        |
+                                                artifact E2E ---+
+                                                                |
+                                               final CI gate <--+
+```
+
+Each Rust shard uses the same source-built tools, its own Cargo cache, and
+only its Nx prerequisite closure. E2E verifies the exported image identities
+and reader executable before running; it does not rebuild them or wait for
+unrelated checks. Every shard checks its worktree, scoped cleanup always runs,
+and the final `Verify in source devcontainer` check fails if any branch fails,
+is canceled, or is skipped. No runtime images are published by CI.
+
 ## Cleaning temporary state
 
 Every Nx project has an uncached `clean` target. The root `rust:clean` runs all

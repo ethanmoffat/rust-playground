@@ -417,11 +417,11 @@ test('post-create validates tools, installs pinned cargo-make, then runs npm ci'
 test('post-create replaces an unpinned cargo-make and fails wrong Rust early', () => {
   const executions: string[] = [];
   const dependencies: PostCreateDependencies = {
-    capture(command) {
+    capture(command, args) {
       if (command === 'rustc') {
         return 'rustc 1.96.1 (stable)\n';
       }
-      if (command === 'cargo-make') {
+      if (command === 'cargo' && args[0] === 'make') {
         return 'cargo-make 0.37.23\n';
       }
       if (command === 'id') {
@@ -460,6 +460,29 @@ test('post-create replaces an unpinned cargo-make and fails wrong Rust early', (
       ),
     /Expected Rust 1\.96\.1/u,
   );
+});
+
+test('post-create reuses a preinstalled pinned cargo plugin using cargo make, not the plugin binary directly', () => {
+  const captures: string[] = [];
+  const executions: string[] = [];
+  runPostCreate({ dryRun: false }, {
+    capture(command, args) {
+      const invocation = `${command} ${args.join(' ')}`;
+      captures.push(invocation);
+      if (invocation === 'rustc --version') return 'rustc 1.96.1 (stable)\n';
+      if (invocation === 'cargo make --version') return 'cargo-make 0.37.24\n';
+      if (invocation === 'rustfmt --version' || invocation === 'cargo clippy --version') return 'ok\n';
+      if (invocation === 'id -u' || invocation === 'id -g') return '1000\n';
+      throw new Error(`Unexpected tool probe: ${invocation}`);
+    },
+    commandExists() { return true; },
+    execute(command, args) { executions.push(`${command} ${args.join(' ')}`); },
+    nodeVersion: 'v24.0.0',
+    stdout() {},
+  }, '/repo');
+  assert.ok(captures.includes('cargo make --version'));
+  assert.ok(!executions.some((command) => command.startsWith('cargo install')));
+  assert.ok(executions.includes('npm ci'));
 });
 
 test('post-create dry-run is dependency-free and side-effect free', () => {

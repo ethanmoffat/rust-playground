@@ -6,13 +6,18 @@ import { fileURLToPath } from 'node:url';
 
 import {
   cleanupDevcontainer,
+  buildCiEnvironment,
   createCiLabel,
   extractContainerId,
+  exportImages,
+  exportReader,
+  importIntegrationArtifacts,
   normalizeComposeProject,
   prepareCiEnvironment,
   startDevcontainer,
   type CiFileSystem,
   verifyDevcontainer,
+  verifyHost,
 } from '../src/ci-lib.js';
 import {
   CommandError,
@@ -53,6 +58,8 @@ class FakeFileSystem implements CiFileSystem {
   readonly directories: string[] = [];
   readonly removed: string[] = [];
   readonly writes: Array<[string, string]> = [];
+  readonly contents = new Map<string, string>();
+  readonly entries = new Map<string, readonly string[]>();
 
   appendFile(filePath: string, contents: string): void {
     this.appends.push([filePath, contents]);
@@ -62,12 +69,25 @@ class FakeFileSystem implements CiFileSystem {
     this.directories.push(directoryPath);
   }
 
+  readDirectory(directoryPath: string): readonly string[] {
+    const entries = this.entries.get(directoryPath);
+    assert.ok(entries, `Unexpected directory read: ${directoryPath}`);
+    return entries;
+  }
+
+  readFile(filePath: string): string {
+    const contents = this.contents.get(filePath);
+    assert.ok(contents !== undefined, `Unexpected file read: ${filePath}`);
+    return contents;
+  }
+
   removeFile(filePath: string): void {
     this.removed.push(filePath);
   }
 
   writePrivateFile(filePath: string, contents: string): void {
     this.writes.push([filePath, contents]);
+    this.contents.set(filePath, contents);
   }
 }
 
@@ -389,10 +409,10 @@ test('startup rejects a container whose inspected CI label does not match', () =
   runner.assertComplete();
 });
 
-test('runs the full verification aggregation and clean-tree gate in the exact container', () => {
+test('runs parallel verification and the clean-tree gate in the exact container', () => {
   const runner = new FakeRunner([success(), success()]);
 
-  verifyDevcontainer({ containerId: sourceContainerId }, runner);
+  verifyDevcontainer({ containerId: sourceContainerId, parallel: 4 }, runner);
 
   assert.deepEqual(runner.calls, [
     {
@@ -420,7 +440,14 @@ test('runs the full verification aggregation and clean-tree gate in the exact co
         sourceContainerId,
         'bash',
         '-lc',
-        'npx nx run-many -t verify --all --parallel=1 && npx nx run tools-scripts:clean-worktree',
+        'npx --no-install nx "$@" && npx --no-install nx run tools-scripts:clean-worktree --outputStyle=static',
+        'ci-verify',
+        'run-many',
+        '-t',
+        'verify',
+        '--all',
+        '--parallel=4',
+        '--outputStyle=static',
       ],
       command: 'docker',
       options: undefined,
@@ -475,6 +502,8 @@ test('cleans only the recorded Compose project and its volumes', () => {
   ]);
   assert.deepEqual(fileSystem.removed, [
     join(workspace, '.devcontainer', '.env'),
+    join(workspace, '.temp', 'ci', 'devcontainer.json'),
+    join(workspace, '.temp', 'ci', 'compose.json'),
   ]);
   runner.assertComplete();
 });
@@ -530,6 +559,8 @@ test('discovers and deduplicates partial-startup projects by the unique label', 
   );
   assert.deepEqual(fileSystem.removed, [
     join(workspace, '.devcontainer', '.env'),
+    join(workspace, '.temp', 'ci', 'devcontainer.json'),
+    join(workspace, '.temp', 'ci', 'compose.json'),
   ]);
   runner.assertComplete();
 });
@@ -561,6 +592,8 @@ test('force-removes only a uniquely labeled non-Compose partial container', () =
   });
   assert.deepEqual(fileSystem.removed, [
     join(workspace, '.devcontainer', '.env'),
+    join(workspace, '.temp', 'ci', 'devcontainer.json'),
+    join(workspace, '.temp', 'ci', 'compose.json'),
   ]);
   runner.assertComplete();
 });
@@ -593,6 +626,8 @@ test('refuses to clean an exact container with a mismatched run label', () => {
   );
   assert.deepEqual(fileSystem.removed, [
     join(workspace, '.devcontainer', '.env'),
+    join(workspace, '.temp', 'ci', 'devcontainer.json'),
+    join(workspace, '.temp', 'ci', 'compose.json'),
   ]);
   runner.assertComplete();
 });
@@ -616,6 +651,8 @@ test('removes generated CI environment state even when Compose cleanup fails', (
   );
   assert.deepEqual(fileSystem.removed, [
     join(workspace, '.devcontainer', '.env'),
+    join(workspace, '.temp', 'ci', 'devcontainer.json'),
+    join(workspace, '.temp', 'ci', 'compose.json'),
   ]);
   runner.assertComplete();
 });
@@ -640,6 +677,13 @@ test('Nx targets expose CI lifecycle without adding verification recursion', () 
     'verify',
     'clean-worktree',
     'ci-prepare',
+    'ci-plan',
+    'ci-build-environment',
+    'ci-start-artifact',
+    'ci-verify-host',
+    'ci-export-images',
+    'ci-export-reader',
+    'ci-import-integration',
     'ci-start-source',
     'ci-start-published',
     'ci-verify',
@@ -661,4 +705,205 @@ test('Nx targets expose CI lifecycle without adding verification recursion', () 
     project.targets['ci-start-source']?.options?.command ?? '',
     /ci\.ts start-source$/u,
   );
+});
+
+test('runs a targeted container shard without replaying unrelated verification', () => {
+  const runner = new FakeRunner([success(), success()]);
+  verifyDevcontainer({
+    containerId: sourceContainerId,
+    task: 'arrow-deltalake:test',
+    parallel: 3,
+  }, runner);
+  assert.deepEqual(runner.calls[1]?.args.slice(-4), [
+    'run', 'arrow-deltalake:test', '--parallel=3', '--outputStyle=static',
+  ]);
+  assert.equal(runner.calls[1]?.args.includes('--excludeTaskDependencies'), false);
+  runner.assertComplete();
+});
+
+test('only artifact-backed E2E may skip Nx build dependencies', () => {
+  const runner = new FakeRunner([success(), success()]);
+  verifyDevcontainer({
+    containerId: sourceContainerId,
+    task: 'loadtest:e2e',
+    integration: true,
+  }, runner);
+  assert.equal(runner.calls[1]?.args.at(-1), '--excludeTaskDependencies');
+  runner.assertComplete();
+  const invalid = new FakeRunner([]);
+  assert.throws(() => verifyDevcontainer({
+    containerId: sourceContainerId,
+    task: 'arrow-deltalake:test',
+    integration: true,
+  }, invalid), /Only loadtest:e2e/u);
+  invalid.assertComplete();
+});
+
+test('host shards use argv and do not report clean-tree success after a failed check', () => {
+  const runner = new FakeRunner([success(), success()]);
+  verifyHost({ task: 'tools-scripts:typecheck', parallel: 4, workspace: '/checkout' }, runner);
+  assert.deepEqual(runner.calls[0]?.args, [
+    '--no-install', 'nx', 'run', 'tools-scripts:typecheck', '--parallel=4', '--outputStyle=static',
+  ]);
+  assert.equal(runner.calls[1]?.args.includes('tools-scripts:clean-worktree'), true);
+  runner.assertComplete();
+  const failed = new FakeRunner([failure(7)]);
+  assert.throws(() => verifyHost({ task: 'tools-scripts:test', workspace: '/checkout' }, failed), CommandError);
+  assert.equal(failed.calls.length, 1);
+  failed.assertComplete();
+});
+
+test('builds the frozen source environment once and exports it without registry publication', () => {
+  const runner = new FakeRunner([success(), success(), success(), success()]);
+  const fileSystem = new FakeFileSystem();
+  buildCiEnvironment({
+    baseImage: 'ghcr.io/mdrakiburrahman/rust-playground/devcontainer:abc',
+    githubOutput: '/output',
+    runAttempt: '2',
+    runId: '123',
+    workspace: '/checkout',
+  }, runner, fileSystem);
+  assert.deepEqual(runner.calls[0]?.args, [
+    '--no-install', 'nx', 'run', 'devcontainer:build', '--excludeTaskDependencies',
+  ]);
+  assert.deepEqual(runner.calls[1]?.args, [
+    'build', '--builder', 'default', '--file', '.github/ci/Dockerfile',
+    '--build-arg', 'SOURCE_DEVCONTAINER=ghcr.io/mdrakiburrahman/rust-playground/devcontainer:abc',
+    '--tag', 'rust-playground-ci:123-2', '.',
+  ]);
+  assert.deepEqual(runner.calls[2]?.args, [
+    'save', '--output', '/checkout/.temp/ci/environment/environment.tar', 'rust-playground-ci:123-2',
+  ]);
+  assert.deepEqual(runner.calls[3]?.args, [
+    '--fast', '--force', '/checkout/.temp/ci/environment/environment.tar',
+  ]);
+  assert.deepEqual(fileSystem.appends, [['/output', 'image=rust-playground-ci:123-2\n']]);
+  assert.doesNotMatch(JSON.stringify(runner.calls), /login|push|prune/u);
+  runner.assertComplete();
+});
+
+test('artifact startup refuses registry fallback and exposes cache directories as binds', () => {
+  const runner = new FakeRunner([
+    success(),
+    success(JSON.stringify({ containerId: sourceContainerId })),
+    success(sourceContainerId),
+    success('123-2-artifact'),
+    success('ci-project'),
+  ]);
+  const fileSystem = new FakeFileSystem();
+  fileSystem.contents.set('/checkout/.devcontainer/devcontainer.json', JSON.stringify({
+    service: 'workspace',
+    workspaceFolder: '/workspaces/rust-playground',
+    postCreateCommand: ['node', '.devcontainer/scripts/post-create.ts'],
+  }));
+  startDevcontainer({
+    githubOutput: '/output', kind: 'artifact', runAttempt: '2', runId: '123',
+    workspace: '/checkout', image: 'rust-playground-ci:123-1',
+  }, runner, fileSystem, () => undefined);
+  assert.deepEqual(runner.calls[0]?.args, ['image', 'inspect', 'rust-playground-ci:123-1']);
+  assert.ok(runner.calls[1]?.args.includes('/checkout/.temp/ci/devcontainer.json'));
+  const compose = JSON.parse(fileSystem.contents.get('/checkout/.temp/ci/compose.json') ?? '');
+  assert.equal(compose.services.workspace.pull_policy, 'never');
+  assert.equal(compose.services.workspace.image, 'rust-playground-ci:123-1');
+  assert.equal(compose.services.workspace.volumes.length, 3);
+  assert.ok(compose.services.workspace.volumes.every((volume: { type: string }) => volume.type === 'bind'));
+  const config = JSON.parse(fileSystem.contents.get('/checkout/.temp/ci/devcontainer.json') ?? '');
+  assert.deepEqual(config.dockerComposeFile, [
+    '/checkout/.devcontainer/docker-compose.yml', '/checkout/.temp/ci/compose.json',
+  ]);
+  assert.deepEqual(config.postCreateCommand, ['node', '.devcontainer/scripts/post-create.ts']);
+  runner.assertComplete();
+});
+
+test('missing source image stops artifact startup while retaining the cleanup label', () => {
+  const runner = new FakeRunner([failure(1)]);
+  const fileSystem = new FakeFileSystem();
+  assert.throws(() => startDevcontainer({
+    githubOutput: '/output', kind: 'artifact', runAttempt: '1', runId: '124',
+    workspace: '/checkout', image: 'rust-playground-ci:124-1',
+  }, runner, fileSystem), CommandError);
+  assert.equal(runner.calls.length, 1);
+  assert.equal(fileSystem.writes.length, 0);
+  assert.match(fileSystem.appends[0]?.[1] ?? '', /124-1-artifact/u);
+  runner.assertComplete();
+});
+
+test('artifact startup cannot substitute an image from another workflow run', () => {
+  const runner = new FakeRunner([]);
+  const fileSystem = new FakeFileSystem();
+  assert.throws(() => startDevcontainer({
+    githubOutput: '/output', kind: 'artifact', runAttempt: '1', runId: '124',
+    workspace: '/checkout', image: 'rust-playground-ci:123-1',
+  }, runner, fileSystem), /from this workflow run/u);
+  runner.assertComplete();
+});
+
+test('exports exact runtime image identities alongside the Docker archive', () => {
+  const id = `sha256:${'f'.repeat(64)}`;
+  const runner = new FakeRunner([success(id), success()]);
+  const fileSystem = new FakeFileSystem();
+  exportImages({
+    images: ['ghcr.io/example/collector:dev'], key: 'collector-image', workspace: '/checkout',
+  }, runner, fileSystem);
+  assert.deepEqual(runner.calls[1]?.args, [
+    'save', '--output', '/checkout/.temp/ci/images/collector-image.tar', 'ghcr.io/example/collector:dev',
+  ]);
+  assert.deepEqual(JSON.parse(fileSystem.writes[0]?.[1] ?? ''), {
+    images: [{ reference: 'ghcr.io/example/collector:dev', id }],
+  });
+  runner.assertComplete();
+});
+
+function integrationFileSystem(id: string): FakeFileSystem {
+  const fileSystem = new FakeFileSystem();
+  fileSystem.entries.set('/checkout/.temp/ci/images', ['collector.json', 'collector.tar']);
+  fileSystem.contents.set('/checkout/.temp/ci/images/collector.json', JSON.stringify({
+    images: [{ reference: 'ghcr.io/example/collector:dev', id }],
+  }));
+  return fileSystem;
+}
+
+test('imports complete artifacts, checks image identities, and retains executable reader permissions', () => {
+  const id = `sha256:${'f'.repeat(64)}`;
+  const runner = new FakeRunner([success(), success(id), success(), success()]);
+  const fileSystem = integrationFileSystem(id);
+  importIntegrationArtifacts({
+    images: ['ghcr.io/example/collector:dev'], workspace: '/checkout',
+  }, runner, fileSystem);
+  assert.deepEqual(runner.calls[0]?.args, ['load', '--input', '/checkout/.temp/ci/images/collector.tar']);
+  assert.deepEqual(runner.calls[2]?.args, [
+    '--extract', '--file', '/checkout/.temp/ci/reader.tar',
+    '--directory', '/checkout/target/ci/build/debug', 'delta-inspect',
+  ]);
+  assert.equal(runner.calls[3]?.command, 'test');
+  assert.deepEqual(runner.calls[3]?.args, ['-x', '/checkout/target/ci/build/debug/delta-inspect']);
+  runner.assertComplete();
+});
+
+test('integration artifacts fail on missing archives, wrong images, or mismatched identities', () => {
+  const id = `sha256:${'f'.repeat(64)}`;
+  const incomplete = integrationFileSystem(id);
+  incomplete.entries.set('/checkout/.temp/ci/images', ['collector.json']);
+  assert.throws(() => importIntegrationArtifacts({
+    images: ['ghcr.io/example/collector:dev'], workspace: '/checkout',
+  }, new FakeRunner([]), incomplete), /missing or incomplete/u);
+  assert.throws(() => importIntegrationArtifacts({
+    images: ['ghcr.io/example/other:dev'], workspace: '/checkout',
+  }, new FakeRunner([]), integrationFileSystem(id)), /Unexpected or duplicate/u);
+  const mismatched = new FakeRunner([success(), success(`sha256:${'a'.repeat(64)}`)]);
+  assert.throws(() => importIntegrationArtifacts({
+    images: ['ghcr.io/example/collector:dev'], workspace: '/checkout',
+  }, mismatched, integrationFileSystem(id)), /identity mismatch/u);
+  mismatched.assertComplete();
+});
+
+test('reader export preserves executable permissions inside a tar archive', () => {
+  const runner = new FakeRunner([success()]);
+  const fileSystem = new FakeFileSystem();
+  exportReader({ containerId: sourceContainerId, workspace: '/checkout' }, runner, fileSystem);
+  assert.deepEqual(runner.calls[0]?.args, [
+    'exec', '--user', 'vscode', '--workdir', '/workspaces/rust-playground', sourceContainerId,
+    'tar', '--create', '--file', '.temp/ci/reader.tar', '--directory', 'target/debug', 'delta-inspect',
+  ]);
+  runner.assertComplete();
 });
