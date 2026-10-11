@@ -72,6 +72,31 @@ Run all verification targets serially with:
 npx nx run-many -t verify --all --parallel=1
 ```
 
+## Cleaning temporary state
+
+Every Nx project has an uncached `clean` target. The root `rust:clean` runs all
+project cleanup targets, then cleans root-owned temporary state:
+
+```bash
+npx --no-install nx run rust:clean
+npx --no-install nx run loadtest:clean
+npx --no-install nx run greeting:clean
+```
+
+Cleanup removes only each project's `.temp/`, `.ci-logs/`, `logs/`, and
+`coverage/`. `loadtest:clean` also removes the root `onelake/` directory,
+including retained demo tables and E2E diagnostics. Missing state is a no-op;
+directory symlinks are removed without following their targets.
+
+Managed caches and build outputs are preserved: `node_modules/`, `.nx/`,
+Cargo caches and `target/`, Docker images/volumes/build caches, `dist/`, and
+`out/`. Configuration, credentials, and cached authentication profiles are
+not removed.
+
+These targets clean files only; they do not stop running processes or
+containers. Stop the demo with `npx --no-install nx run loadtest:down` before
+cleaning its state.
+
 ## Sample CLI and image
 
 Run the sample application:

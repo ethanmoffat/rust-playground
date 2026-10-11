@@ -4,6 +4,18 @@
   "projectType": "application",
   "implicitDependencies": ["otelcol-rust", "hello-world"],
   "targets": {
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/clean.ts projects/loadtest",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      },
+      "metadata": {
+        "description": "Remove local onelake demo/E2E output and project temporary state; stop running workloads first."
+      }
+    },
     "reader-build": {
       "executor": "nx:run-commands",
       "cache": false,

@@ -14,6 +14,35 @@
     "description": "Aggregate targets for the Rust workspace."
   },
   "targets": {
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        {
+          "projects": [
+            "arrow-lake",
+            "otel-deltalake-exporter",
+            "otelcol-rust",
+            "greeting",
+            "hello-world",
+            "loadtest",
+            "auth-automation",
+            "rust-playground-build",
+            "tools-scripts",
+            "devcontainer"
+          ],
+          "target": "clean"
+        }
+      ],
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/clean.ts .",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      },
+      "metadata": {
+        "description": "Clean all projects' temporary state without removing managed caches or build artifacts."
+      }
+    },
     "format": {
       "executor": "nx:run-commands",
       "cache": false,

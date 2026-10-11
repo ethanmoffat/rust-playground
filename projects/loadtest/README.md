@@ -11,6 +11,16 @@ npx --no-install nx run loadtest:inspect
 npx --no-install nx run loadtest:down
 ```
 
+To remove retained local telemetry after stopping the workload:
+
+```bash
+npx --no-install nx run loadtest:clean
+```
+
+This deletes `onelake/`, including demo tables and E2E diagnostics, plus this
+project's scratch, logs, and coverage. It preserves dependencies, Nx/Cargo
+caches, build artifacts, and Docker images/volumes. It does not stop containers.
+
 The demo greets once per interval until stopped. The root `onelake/demo/`
 bind mount is gitignored and preserved when containers stop. Collector writes
 use your non-root UID/GID, not privileged containers or checkout-wide chmod.

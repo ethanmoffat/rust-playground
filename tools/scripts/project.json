@@ -4,6 +4,15 @@
   "projectType": "application",
   "sourceRoot": "tools/scripts/src",
   "targets": {
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/clean.ts tools/scripts",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
     "typecheck": {
       "executor": "nx:run-commands",
       "options": {
