@@ -55,6 +55,22 @@
         "minLength": 1
       }
     },
+    "cacheFrom": {
+      "type": "array",
+      "description": "External BuildKit caches imported with --cache-from; supports executor tokens.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "cacheTo": {
+      "type": "array",
+      "description": "External BuildKit caches exported with --cache-to; supports executor tokens.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
     "platforms": {
       "type": "array",
       "minItems": 1,

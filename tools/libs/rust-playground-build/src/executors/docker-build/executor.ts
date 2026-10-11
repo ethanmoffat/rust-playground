@@ -313,6 +313,17 @@ export function createDockerBuildPlan(
   for (const buildArgument of buildArgs) {
     args.push('--build-arg', buildArgument);
   }
+  for (const [option, flag] of [
+    [options.cacheFrom, '--cache-from'],
+    [options.cacheTo, '--cache-to'],
+  ] as const) {
+    for (const [index, cache] of validateStringArray(option ?? [], flag, false).entries()) {
+      args.push(flag, validateNonBlank(
+        expandTokens(cache, `${flag}[${index}]`),
+        `${flag}[${index}]`,
+      ));
+    }
+  }
   if (platforms.length > 0) {
     args.push('--platform', platforms.join(','));
   }

@@ -44,6 +44,10 @@ export interface DockerBuildExecutorSchema {
    */
   readonly buildArgs?: readonly string[];
 
+  readonly cacheFrom?: readonly string[];
+
+  readonly cacheTo?: readonly string[];
+
   /**
    * Target platforms in `os/architecture[/variant]` form.
    */

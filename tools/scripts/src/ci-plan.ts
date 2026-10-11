@@ -28,10 +28,14 @@ export interface ImageShard extends VerificationShard {
   readonly image_refs: readonly string[];
 }
 
+export interface RustShard extends VerificationShard {
+  readonly tasks: readonly string[];
+}
+
 export interface VerificationPlan {
   readonly images: readonly ImageShard[];
   readonly node: readonly VerificationShard[];
-  readonly rust: readonly VerificationShard[];
+  readonly rust: readonly RustShard[];
   readonly materialTasks: readonly string[];
   readonly reader: string;
   readonly integration: string;
@@ -159,30 +163,58 @@ export function createVerificationPlan(graph: VerificationGraph): VerificationPl
   if (!sameSet(new Set(claimed.keys()), material)) {
     throw new Error('Parallel CI does not cover every material Nx verification task.');
   }
-  const keys = [...images, ...node, ...rust].map(({ key }) => key);
+  const rustProjects = new Map<string, string[]>();
+  for (const { task } of rust) {
+    const project = task.split(':')[0];
+    if (!project) throw new Error(`Invalid Rust task: ${task}`);
+    const targets = rustProjects.get(project) ?? [];
+    targets.push(task);
+    rustProjects.set(project, targets);
+  }
+  const rustShards = [...rustProjects].map(([project, tasks]) => {
+    const task = tasks[0];
+    if (!task) throw new Error(`Empty Rust shard: ${project}`);
+    return { key: `${project}-checks`, task, tasks };
+  });
+  const keys = [...images, ...node, ...rustShards].map(({ key }) => key);
   if (new Set(keys).size !== keys.length) throw new Error('CI shard keys collide.');
   if (node.length === 0 || rust.length === 0) throw new Error('CI verification matrices must not be empty.');
-  if (Math.max(node.length, rust.length, images.length) > 256) {
+  if (Math.max(node.length, rustShards.length, images.length) > 256) {
     throw new Error('CI exceeds the GitHub matrix limit of 256 jobs.');
   }
   return {
     images,
     node,
-    rust,
+    rust: rustShards,
     materialTasks: [...material].sort(),
     reader: readerTask,
     integration: integrationTask,
   };
 }
 
-export function verificationArguments(task?: string, parallel = availableParallelism()): string[] {
+export function verificationArguments(
+  task?: string | readonly string[],
+  parallel = availableParallelism(),
+): string[] {
   if (!Number.isSafeInteger(parallel) || parallel < 1) {
     throw new Error('Nx parallelism must be a positive integer.');
   }
+  let selection: string[];
+  if (task === undefined) {
+    selection = ['run-many', '-t', 'verify', '--all'];
+  } else if (typeof task === 'string') {
+    selection = ['run', requireVerificationTask(task)];
+  } else {
+    if (task.length === 0) throw new Error('An Nx task batch must not be empty.');
+    const parsed = task.map((id) => requireVerificationTask(id).split(':'));
+    const project = parsed[0]?.[0];
+    if (!project || parsed.some((parts) => parts.length !== 2 || parts[0] !== project)) {
+      throw new Error('An Nx task batch must contain unconfigured targets from one project.');
+    }
+    selection = ['run-many', `--projects=${project}`, `--targets=${parsed.map((parts) => parts[1]).join(',')}`];
+  }
   return [
-    ...(task === undefined
-      ? ['run-many', '-t', 'verify', '--all']
-      : ['run', requireVerificationTask(task)]),
+    ...selection,
     `--parallel=${parallel}`,
     '--outputStyle=static',
   ];

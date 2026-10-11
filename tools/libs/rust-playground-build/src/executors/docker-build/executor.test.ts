@@ -207,6 +207,33 @@ test('builds a load command as an argument array and writes a scan manifest', as
   assert.doesNotMatch(harness.information[0] ?? '', /PROJECT=hello-world/u);
 });
 
+test('imports and exports external BuildKit caches with token expansion and literal argv', async () => {
+  const context = createContext();
+  const harness = createHarness();
+  const result = await runDockerBuildExecutorWithDependencies(baseOptions({
+    cacheFrom: ['type=gha,version=2,scope={projectName}'],
+    cacheTo: ['type=local,dest={absWorkspaceRoot}/cache,mode=max', 'LITERAL=$(not-a-shell)'],
+  }), context, harness.dependencies);
+  assert.deepEqual(result, { success: true });
+  const args = harness.invocations[0]?.args ?? [];
+  const start = args.indexOf('--cache-from');
+  assert.deepEqual(args.slice(start, start + 6), [
+    '--cache-from', 'type=gha,version=2,scope=hello-world',
+    '--cache-to', `type=local,dest=${path.resolve(context.root)}/cache,mode=max`,
+    '--cache-to', 'LITERAL=$(not-a-shell)',
+  ]);
+});
+
+test('invalid external cache values are rejected before any Docker command', async () => {
+  const harness = createHarness();
+  const result = await runDockerBuildExecutorWithDependencies(
+    baseOptions({ cacheFrom: [' '] }), createContext(), harness.dependencies,
+  );
+  assert.deepEqual(result, { success: false });
+  assert.equal(harness.invocations.length, 0);
+  assert.ok(harness.errors.some((message) => /cache-from/u.test(message)));
+});
+
 test('pushes multiple platforms and expands sanitized CI Git tokens', async () => {
   const sha = 'ABCDEF0123456789ABCDEF0123456789ABCDEF01';
   const harness = createHarness(() => successfulCommand, {
@@ -922,6 +949,8 @@ test('publishes a complete strict executor schema', () => {
   assert.deepEqual(schema.required, ['file', 'image', 'tags', 'output']);
   assert.deepEqual(Object.keys(schema.properties ?? {}).sort(), [
     'buildArgs',
+    'cacheFrom',
+    'cacheTo',
     'context',
     'file',
     'image',

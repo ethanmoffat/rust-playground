@@ -1,11 +1,13 @@
 import {
   appendFileSync,
+  existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 import {
@@ -29,7 +31,7 @@ const containerIdPattern = /^[a-f0-9]{12,64}$/u;
 const containerWorkspace = '/workspaces/rust-playground';
 const ciLabelFormat = `{{ index .Config.Labels "${CI_LABEL_NAME}" }}`;
 const ciLabelValuePattern = /^\d+-\d+-(?:source|published|artifact)$/u;
-const artifactImagePattern = /^rust-playground-ci:(\d+)-\d+$/u;
+const artifactImagePattern = /^rust-playground-ci:env-[a-f0-9]{64}$/u;
 const artifactKeyPattern = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/u;
 const imageIdPattern = /^sha256:[a-f0-9]{64}$/u;
 
@@ -38,6 +40,7 @@ export type DevcontainerKind = 'artifact' | 'published' | 'source';
 export interface CiFileSystem {
   appendFile(filePath: string, contents: string): void;
   ensurePrivateDirectory(directoryPath: string): void;
+  fileExists(filePath: string): boolean;
   readDirectory(directoryPath: string): readonly string[];
   readFile(filePath: string): string;
   removeFile(filePath: string): void;
@@ -51,6 +54,7 @@ export const systemFileSystem: CiFileSystem = {
   ensurePrivateDirectory(directoryPath) {
     mkdirSync(directoryPath, { mode: 0o700, recursive: true });
   },
+  fileExists: existsSync,
   readDirectory(directoryPath) {
     return readdirSync(directoryPath);
   },
@@ -165,7 +169,7 @@ export function startDevcontainer(
 
 export interface VerifyOptions {
   readonly containerId: string;
-  readonly task?: string;
+  readonly task?: string | readonly string[];
   readonly parallel?: number;
   readonly integration?: boolean;
 }
@@ -209,10 +213,28 @@ export function verifyDevcontainer(
 }
 
 export function verifyHost(
-  options: { readonly task: string; readonly parallel?: number; readonly workspace: string },
+  options: {
+    readonly task: string;
+    readonly parallel?: number;
+    readonly workspace: string;
+    readonly dockerCache?: boolean;
+    readonly integration?: boolean;
+  },
   runner: CommandRunner,
 ): void {
   const args = verificationArguments(options.task, options.parallel);
+  if (options.integration) {
+    if (options.task !== 'loadtest:e2e') throw new Error('Only loadtest:e2e may use prebuilt integration artifacts.');
+    args.push('--excludeTaskDependencies');
+  }
+  if (options.dockerCache) {
+    if (!options.task.endsWith(':image')) throw new Error('BuildKit caching requires an image task.');
+    const scope = requireArtifactKey(options.task.replace(':', '-'));
+    args.push(
+      `--cacheFrom=type=gha,version=2,scope=${scope}`,
+      `--cacheTo=type=gha,version=2,scope=${scope},mode=max`,
+    );
+  }
   runChecked(runner, 'npx', ['--no-install', 'nx', ...args], { cwd: options.workspace });
   runChecked(runner, 'npx', [
     '--no-install', 'nx', 'run', 'tools-scripts:clean-worktree', '--outputStyle=static',
@@ -221,31 +243,69 @@ export function verifyHost(
 
 export function buildCiEnvironment(
   options: {
-    readonly baseImage: string;
     readonly githubOutput: string;
-    readonly runAttempt: string;
-    readonly runId: string;
     readonly workspace: string;
   },
   runner: CommandRunner,
   fileSystem: CiFileSystem,
 ): void {
-  const baseImage = requireImageReference(options.baseImage);
-  const image = `rust-playground-ci:${requireRunNumber('GITHUB_RUN_ID', options.runId)}-${requireRunNumber('GITHUB_RUN_ATTEMPT', options.runAttempt)}`;
+  const { baseImage, image, key } = identifyCiEnvironment(options.workspace, fileSystem);
   const directory = path.join(options.workspace, '.temp', 'ci', 'environment');
   fileSystem.ensurePrivateDirectory(directory);
-  runChecked(runner, 'npx', [
-    '--no-install', 'nx', 'run', 'devcontainer:build', '--excludeTaskDependencies',
-  ], { cwd: options.workspace });
-  runChecked(runner, 'docker', [
-    'build', '--builder', 'default', '--file', '.github/ci/Dockerfile',
-    '--build-arg', `SOURCE_DEVCONTAINER=${baseImage}`, '--tag', image, '.',
-  ], { cwd: options.workspace });
-  runChecked(runner, 'docker', [
-    'save', '--output', path.join(directory, 'environment.tar'), image,
-  ]);
-  runChecked(runner, 'gzip', ['--fast', '--force', path.join(directory, 'environment.tar')]);
-  appendStepOutputs(fileSystem, options.githubOutput, { image });
+  const archive = path.join(directory, 'environment.tar.zst');
+  const manifest = path.join(directory, 'environment.json');
+  if (fileSystem.fileExists(archive) || fileSystem.fileExists(manifest)) {
+    if (!fileSystem.fileExists(archive) || !fileSystem.fileExists(manifest)) {
+      throw new Error('The cached source environment is incomplete.');
+    }
+    const metadata = readEnvironmentManifest(manifest, fileSystem);
+    if (metadata.image !== image) throw new Error('Cached source environment fingerprint mismatch.');
+    runChecked(runner, 'docker', ['load', '--input', archive]);
+    verifyEnvironmentImage(image, metadata.id, runner);
+  } else {
+    runChecked(runner, 'npx', [
+      '--no-install', 'nx', 'run', 'devcontainer:build', '--excludeTaskDependencies',
+    ], { cwd: options.workspace });
+    runChecked(runner, 'docker', [
+      'build', '--builder', 'default', '--file', '.github/ci/Dockerfile',
+      '--build-arg', `SOURCE_DEVCONTAINER=${baseImage}`, '--tag', image, '.',
+    ], { cwd: options.workspace });
+    const id = requireImageId(runChecked(runner, 'docker', [
+      'image', 'inspect', '--format', '{{ .Id }}', image,
+    ], { stdout: 'capture' }).stdout);
+    const tar = path.join(directory, 'environment.tar');
+    runChecked(runner, 'docker', ['save', '--output', tar, image]);
+    runChecked(runner, 'zstd', ['--threads=0', '--fast=3', '--rm', '--force', tar, '-o', archive]);
+    fileSystem.writePrivateFile(manifest, JSON.stringify({ image, id }));
+  }
+  appendStepOutputs(fileSystem, options.githubOutput, { image, key });
+}
+
+export function identifyCiEnvironment(
+  workspace: string,
+  fileSystem: CiFileSystem,
+): { readonly baseImage: string; readonly image: string; readonly key: string } {
+  const hash = fileSystem.readFile(path.join(workspace, '.devcontainer', 'content-hash.txt')).trim();
+  if (!/^[a-f0-9]{64}$/u.test(hash)) throw new Error('Invalid source devcontainer content hash.');
+  const fingerprint = createHash('sha256');
+  for (const file of [
+    '.dockerignore',
+    '.devcontainer/Dockerfile',
+    '.devcontainer/devcontainer.build.json',
+    '.devcontainer/devcontainer-lock.json',
+    '.devcontainer/source/devcontainer.json',
+    '.devcontainer/source/devcontainer-lock.json',
+    '.github/ci/Dockerfile',
+  ]) {
+    fingerprint.update(file).update('\0').update(fileSystem.readFile(path.join(workspace, file))).update('\0');
+  }
+  fingerprint.update(hash);
+  const key = fingerprint.digest('hex');
+  return {
+    baseImage: `ghcr.io/mdrakiburrahman/rust-playground/devcontainer:${hash}`,
+    image: `rust-playground-ci:env-${key}`,
+    key,
+  };
 }
 
 export function exportImages(
@@ -274,7 +334,11 @@ export function exportImages(
 }
 
 export function importIntegrationArtifacts(
-  options: { readonly images: readonly string[]; readonly workspace: string },
+  options: {
+    readonly images: readonly string[];
+    readonly workspace: string;
+    readonly host?: boolean;
+  },
   runner: CommandRunner,
   fileSystem: CiFileSystem,
 ): void {
@@ -315,7 +379,9 @@ export function importIntegrationArtifacts(
     }
   }
   if (imported.size !== expected.size) throw new Error('A required runtime image artifact is missing.');
-  const target = path.join(options.workspace, 'target', 'ci', 'build', 'debug');
+  const target = options.host
+    ? path.join(options.workspace, 'target', 'debug')
+    : path.join(options.workspace, 'target', 'ci', 'build', 'debug');
   fileSystem.ensurePrivateDirectory(target);
   runChecked(runner, 'tar', [
     '--extract', '--file', path.join(options.workspace, '.temp', 'ci', 'reader.tar'),
@@ -484,12 +550,15 @@ function prepareArtifactRuntime(
   runner: CommandRunner,
   fileSystem: CiFileSystem,
 ): void {
-  if (options.image === undefined ||
-      artifactImagePattern.exec(options.image)?.[1] !== requireRunNumber('GITHUB_RUN_ID', options.runId)) {
-    throw new Error('CI artifact image must be a source-built tag from this workflow run.');
+  const expected = identifyCiEnvironment(options.workspace, fileSystem);
+  if (options.image === undefined || options.image !== expected.image) {
+    throw new Error('CI artifact image must match the source environment fingerprint of this checkout.');
   }
-  // An absent artifact must fail, never fall back to a registry image.
-  runChecked(runner, 'docker', ['image', 'inspect', options.image], { stdout: 'ignore' });
+  const metadata = readEnvironmentManifest(
+    path.join(options.workspace, '.temp', 'ci', 'environment', 'environment.json'), fileSystem,
+  );
+  if (metadata.image !== options.image) throw new Error('Source environment artifact manifest mismatch.');
+  verifyEnvironmentImage(options.image, metadata.id, runner);
   const base: unknown = JSON.parse(fileSystem.readFile(
     path.join(options.workspace, '.devcontainer', 'devcontainer.json'),
   ));
@@ -518,6 +587,25 @@ function prepareArtifactRuntime(
     ...base,
     dockerComposeFile: [path.join(options.workspace, '.devcontainer', 'docker-compose.yml'), compose],
   }));
+}
+
+function readEnvironmentManifest(
+  manifest: string,
+  fileSystem: CiFileSystem,
+): { readonly image: string; readonly id: string } {
+  const value: unknown = JSON.parse(fileSystem.readFile(manifest));
+  if (!isRecord(value) || typeof value.image !== 'string' || !artifactImagePattern.test(value.image) ||
+      typeof value.id !== 'string') {
+    throw new Error('Invalid source environment artifact manifest.');
+  }
+  return { image: value.image, id: requireImageId(value.id) };
+}
+
+function verifyEnvironmentImage(image: string, expectedId: string, runner: CommandRunner): void {
+  const actual = requireImageId(runChecked(runner, 'docker', [
+    'image', 'inspect', '--format', '{{ .Id }}', image,
+  ], { stdout: 'capture' }).stdout);
+  if (actual !== expectedId) throw new Error('Source environment image identity mismatch.');
 }
 
 function requireArtifactKey(key: string): string {

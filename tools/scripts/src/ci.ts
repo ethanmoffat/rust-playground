@@ -12,6 +12,7 @@ import {
   exportImages,
   exportReader,
   importIntegrationArtifacts,
+  identifyCiEnvironment,
   type DevcontainerKind,
   prepareCiEnvironment,
   startDevcontainer,
@@ -60,14 +61,22 @@ export function createCiProgram(dependencies: CiCliDependencies): Command {
   addStartCommand(program, 'artifact', dependencies);
 
   program
+    .command('environment-key')
+    .description('Fingerprint the exact source inputs for immutable CI environment reuse.')
+    .action(() => {
+      const definition = identifyCiEnvironment(workflowWorkspace(dependencies), dependencies.fileSystem);
+      dependencies.fileSystem.appendFile(
+        requiredEnvironment('GITHUB_OUTPUT', dependencies.env),
+        `key=${definition.key}\n`,
+      );
+    });
+
+  program
     .command('build-environment')
     .description('Build the locked source environment once and export it for CI shards.')
     .action(() => {
       buildCiEnvironment({
-        baseImage: requiredEnvironment('CI_BASE_IMAGE', dependencies.env),
         githubOutput: requiredEnvironment('GITHUB_OUTPUT', dependencies.env),
-        runAttempt: requiredEnvironment('GITHUB_RUN_ATTEMPT', dependencies.env),
-        runId: requiredEnvironment('GITHUB_RUN_ID', dependencies.env),
         workspace: workflowWorkspace(dependencies),
       }, dependencies.runner, dependencies.fileSystem);
     });
@@ -79,6 +88,8 @@ export function createCiProgram(dependencies: CiCliDependencies): Command {
       verifyHost({
         task: requiredEnvironment('CI_TASK', dependencies.env),
         workspace: workflowWorkspace(dependencies),
+        dockerCache: integrationEnabled(dependencies.env.CI_DOCKER_CACHE, 'CI_DOCKER_CACHE'),
+        integration: integrationEnabled(dependencies.env.CI_INTEGRATION),
       }, dependencies.runner);
     });
 
@@ -92,7 +103,7 @@ export function createCiProgram(dependencies: CiCliDependencies): Command {
             'CONTAINER_ID',
             dependencies.env,
           ),
-          task: normalizeOptional(dependencies.env.CI_TASK),
+          task: selectedTasks(dependencies.env),
           integration: integrationEnabled(dependencies.env.CI_INTEGRATION),
         },
         dependencies.runner,
@@ -127,6 +138,7 @@ export function createCiProgram(dependencies: CiCliDependencies): Command {
       importIntegrationArtifacts({
         images: imageReferences(dependencies.env.CI_IMAGE_REFS),
         workspace: workflowWorkspace(dependencies),
+        host: integrationEnabled(dependencies.env.CI_INTEGRATION_HOST, 'CI_INTEGRATION_HOST'),
       }, dependencies.runner, dependencies.fileSystem);
     });
 
@@ -234,10 +246,21 @@ function imageReferences(value: string | undefined): readonly string[] {
   return parsed.map(requireImageReference);
 }
 
-function integrationEnabled(value: string | undefined): boolean {
+function selectedTasks(env: Readonly<NodeJS.ProcessEnv>): string | readonly string[] | undefined {
+  const batch = normalizeOptional(env.CI_TASKS);
+  if (batch === undefined) return normalizeOptional(env.CI_TASK);
+  const parsed: unknown = JSON.parse(batch);
+  if (!Array.isArray(parsed) || parsed.length === 0 ||
+      !parsed.every((task: unknown): task is string => typeof task === 'string')) {
+    throw new Error('CI_TASKS must be a nonempty JSON array of Nx task IDs.');
+  }
+  return parsed;
+}
+
+function integrationEnabled(value: string | undefined, name = 'CI_INTEGRATION'): boolean {
   if (value === undefined || value === 'false') return false;
   if (value === 'true') return true;
-  throw new Error('CI_INTEGRATION must be true or false.');
+  throw new Error(`${name} must be true or false.`);
 }
 
 function workflowWorkspace(dependencies: CiCliDependencies): string {

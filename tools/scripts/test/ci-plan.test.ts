@@ -67,7 +67,7 @@ function addTask(
 test('fans out independent material checks, preserving prerequisite closures and artifact handoffs', () => {
   const plan = createVerificationPlan(fixture());
   assert.deepEqual(plan.node.map(({ task }) => task), ['scripts:test', 'scripts:typecheck']);
-  assert.deepEqual(plan.rust.map(({ task }) => task), [
+  assert.deepEqual(plan.rust.flatMap(({ tasks }) => tasks), [
     'collector:config-check', 'sdk:format-check', 'sdk:lint', 'sdk:test',
   ]);
   assert.deepEqual(plan.images.map(({ task }) => task), ['collector:image', 'sample:image']);
@@ -76,6 +76,7 @@ test('fans out independent material checks, preserving prerequisite closures and
   assert.equal(plan.integration, 'loadtest:e2e');
   assert.equal(plan.materialTasks.length, 11);
   assert.equal(plan.rust.some(({ task }) => task === 'collector:build'), false);
+  assert.equal(plan.rust.length, 2);
   assert.equal(plan.node.some(({ task }) => task === 'scripts:verify'), false);
 });
 
@@ -146,6 +147,14 @@ test('Nx arguments default to available CPUs and never interpolate task strings 
   }
 });
 
+test('same-project Cargo checks share compilation caches without dropping targets or creating a cross-product', () => {
+  assert.deepEqual(verificationArguments(['sdk:lint', 'sdk:test', 'sdk:build'], 4), [
+    'run-many', '--projects=sdk', '--targets=lint,test,build', '--parallel=4', '--outputStyle=static',
+  ]);
+  assert.throws(() => verificationArguments([]), /must not be empty/u);
+  assert.throws(() => verificationArguments(['sdk:lint', 'other:test']), /one project/u);
+  assert.throws(() => verificationArguments(['sdk:test:ci']), /unconfigured targets/u);
+});
 interface Workflow {
   jobs: Record<string, {
     name?: string;
@@ -172,9 +181,10 @@ test('workflow starts environment, Node checks, and image builds without unrelat
     assert.equal(jobs[name]?.strategy?.['max-parallel'], undefined);
     assert.equal(jobs[name]?.strategy?.['fail-fast'], false);
   }
-  assert.deepEqual(jobs.e2e?.needs, ['plan', 'environment', 'images', 'reader']);
+  assert.deepEqual(jobs.e2e?.needs, ['plan', 'images', 'reader']);
   assert.ok(!jobs.e2e?.needs?.includes('rust'));
   assert.ok(!jobs.e2e?.needs?.includes('node'));
+  assert.ok(!jobs.e2e?.steps?.some(({ with: options }) => options?.name === 'ci-source-environment'));
 });
 
 test('the stable final required check rejects failure, cancellation, and skipped branches', () => {
@@ -205,10 +215,15 @@ test('the reusable source shard loads artifacts before verification and always c
   const verify = steps.findIndex(({ run }) => run?.endsWith('tools-scripts:ci-verify'));
   const importArtifacts = steps.findIndex(({ run }) => run?.endsWith('tools-scripts:ci-import-integration'));
   assert.ok(importArtifacts >= 0 && importArtifacts < start && start < verify);
-  assert.ok(steps.some(({ run }) => run === 'docker load --input .temp/ci/environment/environment.tar.gz'));
+  assert.ok(steps.some(({ run }) => run === 'docker load --input .temp/ci/environment/environment.tar.zst'));
   const cleanup = steps.find(({ run }) => run?.endsWith('tools-scripts:ci-cleanup'));
   assert.equal(cleanup?.if, 'always()');
   assert.ok(steps.some(({ with: options }) => options?.name === 'ci-delta-reader'));
+  const compiledCache = steps.find(({ name }) => name === "Restore this shard's compiled Cargo cache");
+  assert.equal(compiledCache?.with?.path, 'target/ci/build');
+  assert.match(compiledCache?.if ?? '', /inputs\.tasks != ''/u);
+  const sourceSave = steps.find(({ name }) => name === 'Save the shared Cargo source cache once');
+  assert.match(sourceSave?.if ?? '', /inputs\.key == 'rust-checks'/u);
   for (const step of steps.filter(({ uses }) => uses)) {
     assert.match(step.uses ?? '', /^[A-Za-z0-9_/-]+@[a-f0-9]{40}$/u);
   }
@@ -220,4 +235,8 @@ test('the shared CI image and post-create use the same pinned cargo-make version
   const pin = postCreate.match(/const cargoMakeVersion = '([^']+)'/u)?.[1];
   assert.ok(pin);
   assert.ok(dockerfile.includes(`cargo install cargo-make --version ${pin} --locked`));
+  assert.match(dockerfile, /CARGO_INCREMENTAL=0/u);
+  assert.match(dockerfile, /CARGO_PROFILE_DEV_DEBUG=0/u);
+  assert.match(dockerfile, /CARGO_PROFILE_TEST_DEBUG=0/u);
+  assert.match(dockerfile, /-fuse-ld=mold/u);
 });

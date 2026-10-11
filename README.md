@@ -96,11 +96,18 @@ not a global serial queue, determine when work starts.
 ```
 
 Each Rust shard uses the same source-built tools, its own Cargo cache, and
-only its Nx prerequisite closure. E2E verifies the exported image identities
-and reader executable before running; it does not rebuild them or wait for
-unrelated checks. Every shard checks its worktree, scoped cleanup always runs,
-and the final `Verify in source devcontainer` check fails if any branch fails,
-is canceled, or is skipped. No runtime images are published by CI.
+only its Nx prerequisite closure. Same-project Rust checks share compiled
+dependencies instead of duplicating them across runners. The source image is
+cached by its exact build inputs, identity-verified, and transferred using
+multithreaded Zstandard. Native CI uses mold without debug/incremental cache
+bloat; application release builds are unchanged.
+
+Runtime images use separate persistent BuildKit caches. E2E verifies the
+exported image identities and reader executable before running; it does not
+rebuild them or wait for unrelated checks. Every shard checks its worktree,
+scoped cleanup always runs, and the final `Verify in source devcontainer`
+check fails if any branch fails, is canceled, or is skipped. No runtime images
+are published by CI.
 
 ## Cleaning temporary state
 

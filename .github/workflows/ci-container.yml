@@ -9,6 +9,9 @@ on:
       task:
         required: true
         type: string
+      tasks:
+        type: string
+        default: ""
       key:
         required: true
         type: string
@@ -42,35 +45,43 @@ jobs:
       - run: npm ci
 
       - name: Download the shared source environment
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ci-source-environment
           path: .temp/ci/environment
       - name: Load the source-built image
-        run: docker load --input .temp/ci/environment/environment.tar.gz
+        run: docker load --input .temp/ci/environment/environment.tar.zst
 
-      - name: Restore this shard's Cargo cache
-        if: ${{ !inputs.integration && !endsWith(inputs.task, ':format-check') && !endsWith(inputs.task, ':lockfile-check') }}
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Restore shared immutable Cargo sources
+        if: ${{ !inputs.integration && (inputs.tasks != '' || (!endsWith(inputs.task, ':format-check') && !endsWith(inputs.task, ':lockfile-check'))) }}
+        id: cargo-sources
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            target/ci/build
             target/ci/cargo-registry
             target/ci/cargo-git
-          key: cargo-${{ runner.os }}-${{ inputs.key }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.devcontainer/content-hash.txt', '.github/ci/Dockerfile') }}
+          key: cargo-sources-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ inputs.key }}-
+            cargo-sources-${{ runner.os }}-
+      - name: Restore this shard's compiled Cargo cache
+        if: ${{ !inputs.integration && (inputs.tasks != '' || (!endsWith(inputs.task, ':format-check') && !endsWith(inputs.task, ':lockfile-check'))) }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ci/build
+          key: cargo-${{ runner.os }}-${{ inputs.key }}-${{ hashFiles('rust-toolchain.toml', '.devcontainer/content-hash.txt', '.github/ci/Dockerfile') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ inputs.key }}-${{ hashFiles('rust-toolchain.toml', '.devcontainer/content-hash.txt', '.github/ci/Dockerfile') }}-
 
       - name: Download source-built runtime images
         if: inputs.integration
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: ci-image-*
           path: .temp/ci/images
           merge-multiple: true
       - name: Download the independent reader
         if: inputs.integration
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ci-delta-reader
           path: .temp/ci
@@ -91,8 +102,17 @@ jobs:
         env:
           CONTAINER_ID: ${{ steps.devcontainer.outputs.container_id }}
           CI_TASK: ${{ inputs.task }}
+          CI_TASKS: ${{ inputs.tasks }}
           CI_INTEGRATION: ${{ inputs.integration }}
         run: npx --no-install nx run tools-scripts:ci-verify
+      - name: Save the shared Cargo source cache once
+        if: ${{ inputs.key == 'rust-checks' && steps.cargo-sources.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/ci/cargo-registry
+            target/ci/cargo-git
+          key: ${{ steps.cargo-sources.outputs.cache-primary-key }}
 
       - name: Export the reader with executable permissions
         if: inputs.export-reader
@@ -101,7 +121,7 @@ jobs:
         run: npx --no-install nx run tools-scripts:ci-export-reader
       - name: Share the reader with E2E
         if: inputs.export-reader
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-delta-reader
           path: .temp/ci/reader.tar
@@ -119,7 +139,7 @@ jobs:
         run: npx --no-install nx run tools-scripts:ci-cleanup
       - name: Preserve failed integration diagnostics
         if: ${{ failure() && inputs.integration }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: telemetry-e2e-diagnostics-${{ inputs.key }}
           path: onelake/e2e/
