@@ -763,8 +763,8 @@ test('CI image jobs use persistent scoped BuildKit caching without injecting cre
   const runner = new FakeRunner([success(), success()]);
   verifyHost({ task: 'otelcol-rust:image', dockerCache: true, workspace: '/checkout' }, runner);
   const args = runner.calls[0]?.args ?? [];
-  assert.ok(args.includes('--cacheFrom=type=gha,version=2,scope=otelcol-rust-image'));
-  assert.ok(args.includes('--cacheTo=type=gha,version=2,scope=otelcol-rust-image,mode=max'));
+  assert.ok(args.includes('--configuration=ci-verify'));
+  assert.ok(!args.some((argument) => argument.startsWith('--cacheFrom') || argument.startsWith('--cacheTo')));
   assert.doesNotMatch(JSON.stringify(args), /token=|secret=/u);
   runner.assertComplete();
   assert.throws(() => verifyHost({

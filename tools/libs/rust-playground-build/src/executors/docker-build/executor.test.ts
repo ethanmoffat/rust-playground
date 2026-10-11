@@ -114,6 +114,10 @@ function baseOptions(
 
 interface RuntimeProjectConfiguration {
   readonly targets: {
+    readonly image: {
+      readonly options: DockerBuildExecutorSchema;
+      readonly configurations: Record<string, Partial<DockerBuildExecutorSchema>>;
+    };
     readonly build: { readonly cache?: boolean };
     readonly publish: {
       readonly configurations?: {
@@ -222,6 +226,25 @@ test('imports and exports external BuildKit caches with token expansion and lite
     '--cache-to', `type=local,dest=${path.resolve(context.root)}/cache,mode=max`,
     '--cache-to', 'LITERAL=$(not-a-shell)',
   ]);
+});
+
+test('actual CI image configuration retains dev tags and complete BuildKit cache specifications', async () => {
+  const image = readRuntimeProject().targets.image;
+  const configuration = image.configurations['ci-verify'];
+  assert.ok(configuration);
+  assert.equal(configuration.tags, undefined);
+  const harness = createHarness();
+  const result = await runDockerBuildExecutorWithDependencies(
+    { ...image.options, ...configuration }, createContext(), harness.dependencies,
+  );
+  assert.deepEqual(result, { success: true });
+  const args = harness.invocations[0]?.args ?? [];
+  assert.ok(args.includes('ghcr.io/mdrakiburrahman/rust-playground/hello-world:dev'));
+  assert.equal(args.filter((argument) => argument === '--cache-from').length, 1);
+  assert.equal(args.filter((argument) => argument === '--cache-to').length, 1);
+  assert.ok(args.includes('type=gha,version=2,scope=hello-world-image'));
+  assert.ok(args.includes('type=gha,version=2,scope=hello-world-image,mode=max'));
+  assert.ok(!args.includes('version=2'));
 });
 
 test('invalid external cache values are rejected before any Docker command', async () => {

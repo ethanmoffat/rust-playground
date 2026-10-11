@@ -47,6 +47,8 @@ interface CommandOptions {
   readonly image?: string;
   readonly output?: string;
   readonly tags?: readonly string[];
+  readonly cacheFrom?: readonly string[];
+  readonly cacheTo?: readonly string[];
 }
 
 const readerTask = 'loadtest:reader-build';
@@ -114,6 +116,10 @@ export function createVerificationPlan(graph: VerificationGraph): VerificationPl
       }
       if (closure(id).size !== 1) {
         throw new Error(`CI image task ${id} needs an explicit prerequisite handoff.`);
+      }
+      const cache = configurations.get(id)?.configurations?.['ci-verify'];
+      if (!cache?.cacheFrom?.length || !cache.cacheTo?.length || cache.tags !== undefined) {
+        throw new Error(`CI image task ${id} must provide a ci-verify cache configuration without changing tags.`);
       }
       return {
         key: shardKey(id),

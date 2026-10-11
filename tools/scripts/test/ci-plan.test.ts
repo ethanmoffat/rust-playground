@@ -33,6 +33,12 @@ function fixture(): VerificationGraph {
     addTask(graph, `${project}:image`, undefined, [], {
       executor: 'rust-playground-build:docker-build',
       options: { image: `ghcr.io/example/${project}`, tags: ['dev'], output: 'load' },
+      configurations: {
+        'ci-verify': {
+          cacheFrom: ['type=gha,version=2,scope=example'],
+          cacheTo: ['type=gha,version=2,scope=example,mode=max'],
+        },
+      },
     });
   }
   addTask(graph, 'loadtest:build', undefined, ['collector:image', 'sample:image', 'loadtest:reader-build']);
@@ -134,6 +140,13 @@ test('image jobs must load tagged images and cannot silently omit build prerequi
   assert.throws(() => createVerificationPlan(dependent), /explicit prerequisite handoff/u);
 });
 
+test('image caches use JSON configurations so Nx cannot split BuildKit comma parameters', () => {
+  const graph = fixture();
+  const image = graph.graph.nodes.collector?.data.targets?.image;
+  assert.ok(image);
+  image.configurations = {};
+  assert.throws(() => createVerificationPlan(graph), /ci-verify cache configuration/u);
+});
 test('Nx arguments default to available CPUs and never interpolate task strings into a shell command', () => {
   assert.deepEqual(verificationArguments('sdk:test', 8), [
     'run', 'sdk:test', '--parallel=8', '--outputStyle=static',

@@ -229,11 +229,7 @@ export function verifyHost(
   }
   if (options.dockerCache) {
     if (!options.task.endsWith(':image')) throw new Error('BuildKit caching requires an image task.');
-    const scope = requireArtifactKey(options.task.replace(':', '-'));
-    args.push(
-      `--cacheFrom=type=gha,version=2,scope=${scope}`,
-      `--cacheTo=type=gha,version=2,scope=${scope},mode=max`,
-    );
+    args.push('--configuration=ci-verify');
   }
   runChecked(runner, 'npx', ['--no-install', 'nx', ...args], { cwd: options.workspace });
   runChecked(runner, 'npx', [

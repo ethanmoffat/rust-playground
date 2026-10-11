@@ -47,6 +47,12 @@
         "tags": ["dev"],
         "platforms": ["linux/amd64"],
         "output": "load"
+      },
+      "configurations": {
+        "ci-verify": {
+          "cacheFrom": ["type=gha,version=2,scope={projectName}-image"],
+          "cacheTo": ["type=gha,version=2,scope={projectName}-image,mode=max"]
+        }
       }
     },
     "image-smoke": {
