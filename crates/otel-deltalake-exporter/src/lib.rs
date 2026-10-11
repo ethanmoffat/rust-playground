@@ -1,9 +1,9 @@
-//! OTEL-specific routing and joins; storage and Delta semantics live in arrow-lake.
+//! OTEL-specific routing and joins; storage and Delta semantics live in arrow-deltalake.
 
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow_lake::commit::{BatchedTable, CommitOptions};
-use arrow_lake::delta::{DeltaFileWriter, StagedAppend};
+use arrow_deltalake::commit::{BatchedTable, CommitOptions};
+use arrow_deltalake::delta::{DeltaFileWriter, StagedAppend};
 use async_trait::async_trait;
 use linkme::distributed_slice;
 use otel_arrow_dfe_config::node::NodeUserConfig;
@@ -634,7 +634,7 @@ mod tests {
                 .column_by_name(&format!(
                     "{}{suffix}",
                     consts::TIME_UNIX_NANO,
-                    suffix = arrow_lake::normalize::NANOS_SUFFIX
+                    suffix = arrow_deltalake::normalize::NANOS_SUFFIX
                 ))
                 .and_then(|column| column.as_any().downcast_ref::<arrow::array::Int64Array>())
                 .ok_or_else(|| anyhow::anyhow!("missing exact event timestamp"))?

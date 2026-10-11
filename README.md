@@ -165,10 +165,11 @@ rebuilds both local Dockerfiles, including uncommitted fork edits.
 See [loadtest](projects/loadtest/README.md) and
 [collector development](projects/otelcol-rust/README.md#editing-the-fork).
 
-The [arrow-lake SDK](crates/arrow-lake/README.md) accepts pure Arrow batches
-for Parquet-only or Delta writing. OTEL-specific routing and joins live in the
-separate [Delta adapter](crates/otel-deltalake-exporter/README.md). Writer-side
-Delta operations use Delta Kernel; delta-rs is confined to the loadtest reader.
+The [arrow-deltalake SDK](crates/arrow-deltalake/README.md) accepts pure Arrow
+batches for Parquet-only or Delta writing. OTEL-specific routing and joins
+live in the separate [Delta adapter](crates/otel-deltalake-exporter/README.md).
+Writer-side Delta operations use Delta Kernel; delta-rs is confined to the
+loadtest reader.
 
 ## Public GHCR images
 

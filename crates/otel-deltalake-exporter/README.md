@@ -3,8 +3,8 @@
 Registers `exporter:deltalake` in the rust-playground collector. The adapter
 reuses otel-arrow's Parquet exporter preparation, ID generation, file
 scheduling, age/row flushes, and child-before-parent completion. Its injected
-file backend calls the pure-Arrow `arrow-lake` SDK; no Delta writer code lives
-in otel-arrow and no delta-rs dependency enters the collector.
+file backend calls the pure-Arrow `arrow-deltalake` SDK; no Delta writer code
+lives in otel-arrow and no delta-rs dependency enters the collector.
 
 Each existing OTAP payload table becomes an independent Delta table.
 `_otel_join_namespace` is persisted on every parent and child row. Join
@@ -24,8 +24,9 @@ Delta commits as Parquet writes.
 
 Collector cores retain their own OTAP processing and streaming Parquet writers.
 They finalize private files concurrently, then submit eligible files to one
-shared `arrow-lake` commit worker per table. **One Delta data commit can publish
-many files from different cores.** Other tables have independent workers.
+shared `arrow-deltalake` commit worker per table. **One Delta data commit can
+publish many files from different cores.** Other tables have independent
+workers.
 
 Configure the adapter without adding Delta settings to the fork:
 

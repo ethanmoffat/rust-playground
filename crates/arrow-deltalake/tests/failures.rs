@@ -3,7 +3,7 @@
 use anyhow::Result;
 use arrow::array::{Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow_lake::delta::DeltaTable;
+use arrow_deltalake::delta::DeltaTable;
 use async_trait::async_trait;
 use delta_kernel::object_store::{
     self, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,

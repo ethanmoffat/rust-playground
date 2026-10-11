@@ -23,6 +23,9 @@ use url::Url;
 
 type LocalEngine = DefaultEngine<TokioBackgroundExecutor>;
 
+// Older and renamed writers must contend for the same persisted lock.
+const WRITER_LOCK: &str = ".arrow-lake-writer.lock";
+
 /// Local table ownership and Kernel engine. Hold one instance per table.
 pub struct DeltaTable {
     root: PathBuf,
@@ -109,7 +112,7 @@ impl DeltaTable {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(root.join(".arrow-lake-writer.lock"))?;
+            .open(root.join(WRITER_LOCK))?;
         lock.try_lock_exclusive()
             .with_context(|| format!("Delta table already has a writer: {}", root.display()))?;
         let url = Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table path"))?;
@@ -135,13 +138,13 @@ impl DeltaTable {
         if !self.root.join("_delta_log").exists() {
             for entry in fs::read_dir(&self.root)? {
                 let entry = entry?;
-                if entry.file_name() != ".arrow-lake-writer.lock" {
+                if entry.file_name() != WRITER_LOCK {
                     bail!("refusing to adopt non-Delta directory {}", self.root.display());
                 }
             }
             let schema = Arc::new(StructType::try_from_arrow(Arc::clone(&incoming))?);
             let transaction =
-                delta_kernel::transaction::create_table::create_table(self.url.as_str(), schema, "arrow-lake")
+                delta_kernel::transaction::create_table::create_table(self.url.as_str(), schema, "arrow-deltalake")
                     .build(&self.engine, Box::new(DurableCommitter))?;
             committed(transaction.commit(&self.engine)?)?;
         }
@@ -225,7 +228,7 @@ impl DeltaTable {
         let mut transaction = snapshot
             .transaction(Box::new(DurableCommitter), &self.engine)?
             .with_operation("INSERT".into())
-            .with_engine_info("arrow-lake")
+            .with_engine_info("arrow-deltalake")
             .with_data_change(true)
             .with_blind_append();
         for append in files {

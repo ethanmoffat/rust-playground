@@ -34,7 +34,7 @@ Delta table.
 ```text
 [1] Local source                         [2] Nx + Docker Compose
     bin/hello-world/ -------------------> builds hello-world image
-    crates/arrow-lake/ + adapter/ ------> builds otelcol-rust image
+    crates/arrow-deltalake/ + adapter/ --> builds otelcol-rust image
     submodules/otel-arrow/ -------------> shared collector and hooks
     (including uncommitted fork edits)            |
                                                   v

@@ -161,7 +161,7 @@ test('every project exposes clean and the root includes every child', () => {
     'project.json',
     '.devcontainer/project.json',
     'bin/hello-world/project.json',
-    'crates/arrow-lake/project.json',
+    'crates/arrow-deltalake/project.json',
     'crates/greeting/project.json',
     'crates/otel-deltalake-exporter/project.json',
     'projects/loadtest/project.json',

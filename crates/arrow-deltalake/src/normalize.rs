@@ -7,6 +7,7 @@ use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use std::sync::Arc;
 
 /// Metadata key recording the original logical Arrow type.
+/// Kept stable across crate renames for compatibility with existing Delta schemas.
 pub const ORIGINAL_TYPE: &str = "arrow_lake.original_type";
 /// Reserved suffix for an exact epoch-nanosecond timestamp companion.
 pub const NANOS_SUFFIX: &str = "__unix_nanos";

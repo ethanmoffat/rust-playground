@@ -407,6 +407,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-deltalake"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow 58.4.0",
+ "async-trait",
+ "delta_kernel",
+ "delta_kernel_default_engine",
+ "fs2",
+ "futures",
+ "parquet 58.4.0",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "arrow-ipc"
 version = "58.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -484,24 +502,6 @@ dependencies = [
  "serde_core",
  "serde_json",
  "simdutf8",
-]
-
-[[package]]
-name = "arrow-lake"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow 58.4.0",
- "async-trait",
- "delta_kernel",
- "delta_kernel_default_engine",
- "fs2",
- "futures",
- "parquet 58.4.0",
- "tempfile",
- "tokio",
- "url",
- "uuid",
 ]
 
 [[package]]
@@ -2086,7 +2086,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow 58.4.0",
- "arrow-lake",
+ "arrow-deltalake",
  "deltalake-core",
  "parquet 58.4.0",
  "serde_json",
@@ -4482,7 +4482,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow 58.4.0",
- "arrow-lake",
+ "arrow-deltalake",
  "async-trait",
  "humantime-serde",
  "linkme",

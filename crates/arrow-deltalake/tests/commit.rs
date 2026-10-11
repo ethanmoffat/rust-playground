@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use arrow::array::{Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow_lake::commit::{BatchedTable, CommitOptions};
-use arrow_lake::delta::{DeltaTable, StagedAppend};
+use arrow_deltalake::commit::{BatchedTable, CommitOptions};
+use arrow_deltalake::delta::{DeltaTable, StagedAppend};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;

@@ -14,7 +14,7 @@ url = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]
-arrow-lake = { path = "../../../crates/arrow-lake" }
+arrow-deltalake = { path = "../../../crates/arrow-deltalake" }
 arrow = { version = "58.3", default-features = false }
 tempfile = "3"
 

@@ -169,7 +169,7 @@ mod tests {
             array::{Int32Array, RecordBatch, StringArray},
             datatypes::{DataType, Field, Schema},
         };
-        use arrow_lake::delta::DeltaTableWriter;
+        use arrow_deltalake::delta::DeltaTableWriter;
         use std::sync::Arc;
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("generic");
@@ -216,7 +216,7 @@ mod tests {
             array::{ArrayRef, FixedSizeBinaryArray, RecordBatch, TimestampNanosecondArray, UInt64Array},
             datatypes::{DataType, Field, Schema, TimeUnit},
         };
-        use arrow_lake::delta::DeltaTableWriter;
+        use arrow_deltalake::delta::DeltaTableWriter;
         use std::sync::Arc;
         let directory = tempfile::tempdir()?;
         let mut writer = DeltaTableWriter::open(directory.path().join("generic"))?;
@@ -257,7 +257,7 @@ mod tests {
         use arrow::array::{ArrayRef, Float64Array, ListBuilder, RecordBatch, StructArray, UInt64Builder};
         use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
         use arrow::datatypes::{DataType, Field};
-        use arrow_lake::delta::DeltaTableWriter;
+        use arrow_deltalake::delta::DeltaTableWriter;
         use std::sync::Arc;
         let directory = tempfile::tempdir()?;
         let mut counts = ListBuilder::new(UInt64Builder::new());

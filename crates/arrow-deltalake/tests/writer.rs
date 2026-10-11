@@ -3,7 +3,7 @@ use anyhow::Result;
 use arrow::array::{Array, StringArray, TimestampNanosecondArray, UInt64Array};
 use arrow::array::{Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow_lake::ParquetFileWriter;
+use arrow_deltalake::ParquetFileWriter;
 use std::sync::Arc;
 
 fn batch() -> Result<RecordBatch> {
@@ -34,7 +34,7 @@ async fn parquet_preserves_schema() -> Result<()> {
 /// Guarantees: completion synchronizes the directory without requiring a writable checkout or changing other tests' working directory.
 #[tokio::test]
 async fn parquet_supports_relative_filename() -> Result<()> {
-    const CHILD: &str = "ARROW_LAKE_RELATIVE_TEST_CHILD";
+    const CHILD: &str = "ARROW_DELTALAKE_RELATIVE_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let directory = tempfile::tempdir()?;
         let output = std::process::Command::new(std::env::current_exe()?)
@@ -50,7 +50,7 @@ async fn parquet_supports_relative_filename() -> Result<()> {
         );
         return Ok(());
     }
-    let path = format!("arrow-lake-relative-{}.parquet", uuid::Uuid::new_v4());
+    let path = format!("arrow-deltalake-relative-{}.parquet", uuid::Uuid::new_v4());
     let _cleanup = tempfile::TempPath::try_from_path(&path)?;
     let input = batch()?;
     let mut writer = ParquetFileWriter::create(&path, input.schema())?;
@@ -78,7 +78,7 @@ fn lossless_normalization() -> Result<()> {
             Arc::new(TimestampNanosecondArray::from(vec![Some(-1), None])),
         ],
     )?;
-    let output = arrow_lake::normalize::batch(&input)?;
+    let output = arrow_deltalake::normalize::batch(&input)?;
     assert_eq!(output.column(0).data_type(), &DataType::Decimal128(20, 0));
     assert_eq!(
         output
@@ -122,8 +122,8 @@ fn dictionary_schemas_are_stable() -> Result<()> {
     let first = RecordBatch::try_from_iter(vec![("name", Arc::new(first) as arrow::array::ArrayRef)])?;
     let second = RecordBatch::try_from_iter(vec![("name", Arc::new(second) as arrow::array::ArrayRef)])?;
     assert_eq!(
-        arrow_lake::normalize::schema(first.schema_ref())?,
-        arrow_lake::normalize::schema(second.schema_ref())?
+        arrow_deltalake::normalize::schema(first.schema_ref())?,
+        arrow_deltalake::normalize::schema(second.schema_ref())?
     );
     Ok(())
 }
@@ -153,7 +153,7 @@ fn nested_values_preserve_nulls() -> Result<()> {
         Some(NullBuffer::from(vec![true, false])),
     )?;
     let input = RecordBatch::try_from_iter(vec![("items", Arc::new(list) as ArrayRef)])?;
-    let output = arrow_lake::normalize::batch(&input)?;
+    let output = arrow_deltalake::normalize::batch(&input)?;
     let list = output
         .column(0)
         .as_any()
@@ -175,7 +175,7 @@ fn nested_values_preserve_nulls() -> Result<()> {
 #[cfg(feature = "delta")]
 #[tokio::test]
 async fn rejects_incompatible_writes() -> Result<()> {
-    use arrow_lake::delta::DeltaTableWriter;
+    use arrow_deltalake::delta::DeltaTableWriter;
     let directory = tempfile::tempdir()?;
     let mut writer = DeltaTableWriter::open(directory.path())?;
     writer.write(&batch()?).await?;
@@ -186,12 +186,12 @@ async fn rejects_incompatible_writes() -> Result<()> {
     )])?;
     assert!(writer.write(&changed).await.is_err());
     let reserved = Schema::new(vec![Field::new("time__unix_nanos", DataType::Int64, true)]);
-    assert!(arrow_lake::normalize::schema(&reserved).is_err());
+    assert!(arrow_deltalake::normalize::schema(&reserved).is_err());
     let overflow = RecordBatch::try_from_iter(vec![(
         "time",
         Arc::new(arrow::array::TimestampSecondArray::from(vec![i64::MAX])) as arrow::array::ArrayRef,
     )])?;
-    assert!(arrow_lake::normalize::batch(&overflow).is_err());
+    assert!(arrow_deltalake::normalize::batch(&overflow).is_err());
     Ok(())
 }
 
@@ -200,7 +200,7 @@ async fn rejects_incompatible_writes() -> Result<()> {
 #[cfg(feature = "delta")]
 #[tokio::test]
 async fn rejects_corrupt_and_non_delta_tables() -> Result<()> {
-    use arrow_lake::delta::DeltaTableWriter;
+    use arrow_deltalake::delta::DeltaTableWriter;
     let directory = tempfile::tempdir()?;
     std::fs::write(directory.path().join("raw.parquet"), b"not delta")?;
     let mut writer = DeltaTableWriter::open(directory.path())?;
@@ -226,7 +226,7 @@ async fn rejects_corrupt_and_non_delta_tables() -> Result<()> {
 #[cfg(feature = "delta")]
 #[tokio::test]
 async fn kernel_append_and_evolution() -> Result<()> {
-    use arrow_lake::delta::{DeltaTable, DeltaTableWriter};
+    use arrow_deltalake::delta::{DeltaTable, DeltaTableWriter};
     let directory = tempfile::tempdir()?;
     let input = batch()?;
     let mut writer = DeltaTableWriter::open(directory.path())?;
@@ -277,7 +277,7 @@ async fn kernel_append_and_evolution() -> Result<()> {
 #[cfg(feature = "delta")]
 #[tokio::test]
 async fn failed_file_cannot_commit_partial_data() -> Result<()> {
-    use arrow_lake::delta::DeltaTable;
+    use arrow_deltalake::delta::DeltaTable;
     let directory = tempfile::tempdir()?;
     let table = DeltaTable::open(directory.path())?;
     let input = batch()?;
@@ -299,7 +299,7 @@ async fn failed_file_cannot_commit_partial_data() -> Result<()> {
 #[cfg(feature = "delta")]
 #[tokio::test]
 async fn missing_required_columns_do_not_evolve_table() -> Result<()> {
-    use arrow_lake::delta::DeltaTable;
+    use arrow_deltalake::delta::DeltaTable;
     let directory = tempfile::tempdir()?;
     let table = DeltaTable::open(directory.path())?;
     let input = batch()?;
@@ -317,7 +317,7 @@ async fn missing_required_columns_do_not_evolve_table() -> Result<()> {
 #[cfg(feature = "delta")]
 #[tokio::test]
 async fn empty_batches_do_not_create_tables() -> Result<()> {
-    use arrow_lake::delta::DeltaTableWriter;
+    use arrow_deltalake::delta::DeltaTableWriter;
     let directory = tempfile::tempdir()?;
     let mut writer = DeltaTableWriter::open(directory.path())?;
     writer.write(&RecordBatch::new_empty(batch()?.schema())).await?;
@@ -333,7 +333,7 @@ async fn empty_batches_do_not_create_tables() -> Result<()> {
 #[tokio::test]
 async fn maps_round_trip_through_kernel() -> Result<()> {
     use arrow::array::{ArrayRef, Decimal128Array, MapArray, MapBuilder, StringBuilder, UInt64Builder};
-    use arrow_lake::delta::DeltaTableWriter;
+    use arrow_deltalake::delta::DeltaTableWriter;
     let directory = tempfile::tempdir()?;
     let mut map = MapBuilder::new(None, StringBuilder::new(), UInt64Builder::new());
     map.keys().append_value("counter");
@@ -369,7 +369,7 @@ async fn maps_round_trip_through_kernel() -> Result<()> {
 #[tokio::test]
 async fn same_physical_type_does_not_hide_logical_changes() -> Result<()> {
     use arrow::array::{ArrayRef, UInt16Array};
-    use arrow_lake::delta::DeltaTable;
+    use arrow_deltalake::delta::DeltaTable;
     let directory = tempfile::tempdir()?;
     let input = RecordBatch::try_from_iter(vec![("value", Arc::new(UInt16Array::from(vec![1])) as ArrayRef)])?;
     let changed = RecordBatch::try_from_iter(vec![("value", Arc::new(Int32Array::from(vec![2])) as ArrayRef)])?;

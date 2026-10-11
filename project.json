@@ -3,7 +3,7 @@
   "$schema": "./node_modules/nx/schemas/project-schema.json",
   "projectType": "library",
   "implicitDependencies": [
-    "arrow-lake",
+    "arrow-deltalake",
     "otel-deltalake-exporter",
     "otelcol-rust",
     "greeting",
@@ -20,7 +20,7 @@
       "dependsOn": [
         {
           "projects": [
-            "arrow-lake",
+            "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
             "greeting",
@@ -49,7 +49,7 @@
       "dependsOn": [
         {
           "projects": [
-            "arrow-lake",
+            "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
             "greeting",
@@ -72,7 +72,7 @@
       "dependsOn": [
         {
           "projects": [
-            "arrow-lake",
+            "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
             "greeting",
@@ -95,7 +95,7 @@
       "dependsOn": [
         {
           "projects": [
-            "arrow-lake",
+            "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
             "greeting",
@@ -118,7 +118,7 @@
       "dependsOn": [
         {
           "projects": [
-            "arrow-lake",
+            "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
             "greeting",
@@ -144,7 +144,7 @@
       "dependsOn": [
         {
           "projects": [
-            "arrow-lake",
+            "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
             "greeting",

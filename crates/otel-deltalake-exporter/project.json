@@ -3,7 +3,7 @@
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
   "projectType": "library",
   "sourceRoot": "crates/otel-deltalake-exporter/src",
-  "implicitDependencies": ["arrow-lake"],
+  "implicitDependencies": ["arrow-deltalake"],
   "namedInputs": {
     "default": ["{projectRoot}/**/*", "{workspaceRoot}/Cargo.toml", "{workspaceRoot}/Cargo.lock", "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/**/*.rs", "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/**/Cargo.toml"]
   },

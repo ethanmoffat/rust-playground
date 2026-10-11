@@ -8,7 +8,7 @@ description = "Delta file backend for the OTEL Arrow Parquet exporter"
 
 [dependencies]
 anyhow.workspace = true
-arrow-lake = { path = "../arrow-lake", features = ["delta"] }
+arrow-deltalake = { path = "../arrow-deltalake", features = ["delta"] }
 arrow = { version = "58.3", default-features = false }
 async-trait = "0.1"
 linkme = "0.3"
