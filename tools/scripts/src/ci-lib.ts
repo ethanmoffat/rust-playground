@@ -421,6 +421,7 @@ export function cleanupDevcontainer(
         new Set([recordedProject]),
         options.workspace,
         runner,
+        fileSystem,
       );
       return;
     }
@@ -462,7 +463,7 @@ export function cleanupDevcontainer(
       }
     }
 
-    removeComposeProjects(projects, options.workspace, runner);
+    removeComposeProjects(projects, options.workspace, runner, fileSystem);
     for (const containerId of standaloneContainers) {
       runChecked(runner, 'docker', ['rm', '--force', containerId]);
     }
@@ -562,7 +563,7 @@ function prepareArtifactRuntime(
   const directory = path.join(options.workspace, '.temp', 'ci');
   fileSystem.ensurePrivateDirectory(directory);
   const cache = path.join(options.workspace, 'target', 'ci');
-  for (const name of ['build', 'cargo-registry', 'cargo-git']) {
+  for (const name of ['build', 'cargo']) {
     fileSystem.ensurePrivateDirectory(path.join(cache, name));
   }
   const compose = path.join(directory, 'compose.json');
@@ -573,11 +574,12 @@ function prepareArtifactRuntime(
         pull_policy: 'never',
         volumes: [
           { type: 'bind', source: path.join(cache, 'build'), target: `${containerWorkspace}/target` },
-          { type: 'bind', source: path.join(cache, 'cargo-registry'), target: '/usr/local/cargo/registry' },
-          { type: 'bind', source: path.join(cache, 'cargo-git'), target: '/usr/local/cargo/git' },
+          { type: 'bind', source: path.join(cache, 'cargo'), target: '/usr/local/cargo' },
+          { type: 'volume', source: 'cargo_bins', target: '/usr/local/cargo/bin', read_only: true },
         ],
       },
     },
+    volumes: { cargo_bins: {} },
   }));
   fileSystem.writePrivateFile(path.join(directory, 'devcontainer.json'), JSON.stringify({
     ...base,
@@ -731,11 +733,13 @@ function removeComposeProjects(
   projects: ReadonlySet<string>,
   workspace: string,
   runner: CommandRunner,
+  fileSystem: CiFileSystem,
 ): void {
   const devcontainerDirectory = path.join(workspace, '.devcontainer');
   const composeFile = path.join(devcontainerDirectory, 'docker-compose.yml');
+  const runtimeFile = path.join(workspace, '.temp', 'ci', 'compose.json');
   for (const project of projects) {
-    runChecked(runner, 'docker', [
+    const args = [
       'compose',
       '--project-name',
       project,
@@ -743,10 +747,12 @@ function removeComposeProjects(
       devcontainerDirectory,
       '--file',
       composeFile,
+      ...(fileSystem.fileExists(runtimeFile) ? ['--file', runtimeFile] : []),
       'down',
       '--volumes',
       '--remove-orphans',
-    ]);
+    ];
+    runChecked(runner, 'docker', args);
   }
 }
 

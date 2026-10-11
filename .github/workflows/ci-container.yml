@@ -58,8 +58,8 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            target/ci/cargo-registry
-            target/ci/cargo-git
+            target/ci/cargo/registry
+            target/ci/cargo/git
           key: cargo-sources-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-sources-${{ runner.os }}-
@@ -110,8 +110,8 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            target/ci/cargo-registry
-            target/ci/cargo-git
+            target/ci/cargo/registry
+            target/ci/cargo/git
           key: ${{ steps.cargo-sources.outputs.cache-primary-key }}
 
       - name: Export the reader with executable permissions

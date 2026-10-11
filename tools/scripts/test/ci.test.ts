@@ -514,6 +514,18 @@ test('cleans only the recorded Compose project and its volumes', () => {
   runner.assertComplete();
 });
 
+test('artifact cleanup includes its override so image-populated Cargo binary volumes do not leak', () => {
+  const fileSystem = new FakeFileSystem();
+  fileSystem.contents.set('/checkout/.temp/ci/compose.json', '{"volumes":{"cargo_bins":{}}}');
+  const runner = new FakeRunner([success()]);
+  cleanupDevcontainer({ composeProject: 'recorded-project', workspace: '/checkout' }, runner, fileSystem);
+  assert.deepEqual(runner.calls[0]?.args, [
+    'compose', '--project-name', 'recorded-project', '--project-directory', '/checkout/.devcontainer',
+    '--file', '/checkout/.devcontainer/docker-compose.yml',
+    '--file', '/checkout/.temp/ci/compose.json', 'down', '--volumes', '--remove-orphans',
+  ]);
+  runner.assertComplete();
+});
 test('discovers and deduplicates partial-startup projects by the unique label', () => {
   const workspace = join('C:\\', 'checkout');
   const secondContainerId = 'c'.repeat(64);
@@ -853,7 +865,12 @@ test('artifact startup refuses registry fallback and exposes cache directories a
   assert.equal(compose.services.workspace.pull_policy, 'never');
   assert.equal(compose.services.workspace.image, image);
   assert.equal(compose.services.workspace.volumes.length, 3);
-  assert.ok(compose.services.workspace.volumes.every((volume: { type: string }) => volume.type === 'bind'));
+  assert.deepEqual(compose.services.workspace.volumes, [
+    { type: 'bind', source: '/checkout/target/ci/build', target: '/workspaces/rust-playground/target' },
+    { type: 'bind', source: '/checkout/target/ci/cargo', target: '/usr/local/cargo' },
+    { type: 'volume', source: 'cargo_bins', target: '/usr/local/cargo/bin', read_only: true },
+  ]);
+  assert.deepEqual(compose.volumes, { cargo_bins: {} });
   const config = JSON.parse(fileSystem.contents.get('/checkout/.temp/ci/devcontainer.json') ?? '');
   assert.deepEqual(config.dockerComposeFile, [
     '/checkout/.devcontainer/docker-compose.yml', '/checkout/.temp/ci/compose.json',

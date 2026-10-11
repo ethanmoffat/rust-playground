@@ -237,6 +237,7 @@ test('the reusable source shard loads artifacts before verification and always c
   assert.match(compiledCache?.if ?? '', /inputs\.tasks != ''/u);
   const sourceSave = steps.find(({ name }) => name === 'Save the shared Cargo source cache once');
   assert.match(sourceSave?.if ?? '', /inputs\.key == 'rust-checks'/u);
+  assert.equal(sourceSave?.with?.path, 'target/ci/cargo/registry\ntarget/ci/cargo/git\n');
   for (const step of steps.filter(({ uses }) => uses)) {
     assert.match(step.uses ?? '', /^[A-Za-z0-9_/-]+@[a-f0-9]{40}$/u);
   }
