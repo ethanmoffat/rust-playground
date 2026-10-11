@@ -31,9 +31,25 @@ async fn parquet_preserves_schema() -> Result<()> {
 }
 
 /// Scenario: a caller writes a standalone Parquet file using a bare relative filename.
-/// Guarantees: completion synchronizes the current directory and succeeds.
+/// Guarantees: completion synchronizes the directory without requiring a writable checkout or changing other tests' working directory.
 #[tokio::test]
 async fn parquet_supports_relative_filename() -> Result<()> {
+    const CHILD: &str = "ARROW_LAKE_RELATIVE_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let directory = tempfile::tempdir()?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "parquet_supports_relative_filename", "--nocapture"])
+            .env(CHILD, "1")
+            .current_dir(directory.path())
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "relative filename subprocess failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
     let path = format!("arrow-lake-relative-{}.parquet", uuid::Uuid::new_v4());
     let _cleanup = tempfile::TempPath::try_from_path(&path)?;
     let input = batch()?;
