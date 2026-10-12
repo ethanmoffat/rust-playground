@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Arrow load generator | One batch. Two collector paths.</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0b1220; color: #ecf3ff; font-family: system-ui, sans-serif; }
+    main { max-width: 1360px; margin: auto; padding: 38px 32px 24px; }
+    header { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 22px; }
+    .eyebrow { color: #76dccb; font-size: 11px; font-weight: 650; letter-spacing: 2px; margin-bottom: 10px; }
+    h1 { font-size: clamp(30px, 3.8vw, 46px); line-height: 1.15; letter-spacing: -1.5px; margin: 0 0 10px; }
+    header p { margin: 0; color: #b1bfd4; font-size: 16px; }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .setting { color: #b8c7dd; font-size: 12px; padding: 9px 13px; border: 1px solid #35465f; border-radius: 8px; white-space: nowrap; }
+    .canvas { overflow-x: auto; border: 1px solid #304159; border-radius: 18px; background: #101b2c; }
+    svg { display: block; width: 100%; min-width: 980px; }
+    svg text { font-family: system-ui, sans-serif; }
+    svg .label { fill: #edf4ff; font-size: 20px; font-weight: 700; text-anchor: middle; }
+    svg .small { fill: #b1bfd4; font-size: 13px; text-anchor: middle; }
+    svg .tiny { fill: #91a7c4; font-size: 11px; text-anchor: middle; }
+    svg .flow { font-size: 13px; font-weight: 650; text-anchor: middle; }
+    svg .lane { fill: #d8e9ff; font-size: 12px; font-weight: 650; }
+    .note { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; padding: 17px 4px; font-size: 13px; color: #b1bfd4; }
+    .note strong { color: #80e2b6; }
+    .warning { color: #edc58b; }
+    footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; color: #859bb9; font-size: 11px; }
+    a { color: #9cb5d4; text-underline-offset: 3px; }
+    a:focus-visible, .canvas:focus-visible { outline: 3px solid #73d5f7; outline-offset: 4px; }
+    @media (max-width: 700px) {
+      main { padding: 24px 16px; }
+      header { align-items: start; flex-direction: column; gap: 14px; }
+      header p { font-size: 14px; }
+    }
+    @media print {
+      body { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+      main { padding: 10px; }
+      svg { min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <div class="eyebrow">SCHEMA-GENERATED ARROW LOAD TEST</div>
+      <h1>One logical batch. Two collector paths.</h1>
+      <p>Generate once, route twice, validate every published table.</p>
+    </div>
+    <code class="setting">13 tables &middot; 3 direct + 3 DFE</code>
+  </header>
+
+  <div class="canvas" tabindex="0" role="region" aria-label="Load generator architecture diagram; scroll horizontally on small screens">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 710" role="img" aria-labelledby="diagram-title diagram-description">
+      <title id="diagram-title">Arrow load generator architecture</title>
+      <desc id="diagram-description">Flight SQL registers thirteen schemas in the catalog. The SDK generator exports immutable descriptors and generated Rust and TypeScript SDKs. A deterministic scheduler creates record batches and sends the same logical batches through a Pingora router to three direct collectors and three Data Flow Engine collectors. Direct receipts are polled until Delta publication, while the Data Flow Engine reports best-effort admission. Independent Delta roots are compared by a validator, and platform metrics flow to LGTM.</desc>
+      <defs>
+        <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+          <circle cx="1" cy="1" r=".7" fill="#23354c"/>
+        </pattern>
+        <marker id="blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0 10 5 0 10Z" fill="#79d6fa"/>
+        </marker>
+        <marker id="green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0 10 5 0 10Z" fill="#80e2b6"/>
+        </marker>
+        <marker id="orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0 10 5 0 10Z" fill="#f3bd75"/>
+        </marker>
+        <marker id="purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0 10 5 0 10Z" fill="#bca8f7"/>
+        </marker>
+        <symbol id="ddl-icon" viewBox="0 0 64 64">
+          <path d="M14 9h27l9 9v37H14Z"/>
+          <path d="M41 9v10h9M21 28h22M21 36h22M21 44h14"/>
+        </symbol>
+        <symbol id="catalog-icon" viewBox="0 0 64 64">
+          <ellipse cx="32" cy="13" rx="23" ry="8"/>
+          <path d="M9 13v36c0 11 46 11 46 0V13M9 31c0 11 46 11 46 0M9 45c0 11 46 11 46 0"/>
+        </symbol>
+        <symbol id="sdk-icon" viewBox="0 0 64 64">
+          <path d="M32 7 55 19v27L32 58 9 46V19Z"/>
+          <path d="M9 19l23 13 23-13M32 32v26M21 15l23 13"/>
+        </symbol>
+        <symbol id="schedule-icon" viewBox="0 0 64 64">
+          <rect x="10" y="12" width="44" height="42" rx="7"/>
+          <path d="M10 24h44M21 8v10M43 8v10M20 34h7M36 34h8M20 44h7M36 44h8"/>
+        </symbol>
+        <symbol id="router-icon" viewBox="0 0 64 64">
+          <circle cx="32" cy="32" r="10"/>
+          <path d="M32 8v14M32 42v14M8 32h14M42 32h14M15 15l10 10M39 39l10 10M49 15 39 25M25 39 15 49"/>
+        </symbol>
+        <symbol id="collector-icon" viewBox="0 0 64 64">
+          <rect x="8" y="10" width="48" height="13" rx="4"/>
+          <rect x="8" y="27" width="48" height="13" rx="4"/>
+          <rect x="8" y="44" width="48" height="10" rx="4"/>
+          <path d="M17 16h2M17 33h2M17 49h2M28 16h18M28 33h18M28 49h18"/>
+        </symbol>
+        <symbol id="delta-icon" viewBox="0 0 64 64">
+          <path d="M32 7 56 55H8Z"/>
+          <path d="M32 20 44 45H20Z"/>
+        </symbol>
+        <symbol id="validate-icon" viewBox="0 0 64 64">
+          <path d="M32 7 53 15v16c0 14-9 23-21 28C20 54 11 45 11 31V15Z"/>
+          <path d="m21 32 7 7 15-17"/>
+        </symbol>
+        <symbol id="chart-icon" viewBox="0 0 64 64">
+          <path d="M10 54V10M10 54h44"/>
+          <path d="m17 44 10-12 9 7 12-20"/>
+          <circle cx="17" cy="44" r="2"/><circle cx="27" cy="32" r="2"/><circle cx="36" cy="39" r="2"/><circle cx="48" cy="19" r="2"/>
+        </symbol>
+      </defs>
+
+      <rect width="1240" height="710" fill="url(#grid)"/>
+
+      <!-- Catalog and generated artifacts. -->
+      <rect x="32" y="34" width="1176" height="142" rx="20" fill="#122137" stroke="#354b67"/>
+      <text x="58" y="60" fill="#8ca5c7" font-size="11" font-weight="650" letter-spacing="2">CATALOG + SDK CONTROL PLANE</text>
+
+      <rect x="56" y="78" width="190" height="76" rx="13" fill="#1b2d45" stroke="#567393"/>
+      <use href="#ddl-icon" x="72" y="88" width="52" height="52" fill="none" stroke="#79d6fa" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="190" y="108" class="label" style="font-size:16px">Flight SQL DDL</text>
+      <text x="190" y="132" class="small" style="font-size:12px">CREATE + nullable ADD</text>
+
+      <path d="M246 116H296" stroke="#79d6fa" stroke-width="3" marker-end="url(#blue)"/>
+
+      <rect x="296" y="78" width="210" height="76" rx="13" fill="#1b2d45" stroke="#567393"/>
+      <use href="#catalog-icon" x="311" y="91" width="46" height="46" fill="none" stroke="#bca8f7" stroke-width="2.4"/>
+      <text x="435" y="108" class="label" style="font-size:16px">Hive + SQL catalog</text>
+      <text x="435" y="132" class="small" style="font-size:12px">Immutable schema versions</text>
+
+      <path d="M506 116H555" stroke="#bca8f7" stroke-width="3" marker-end="url(#purple)"/>
+
+      <rect x="555" y="78" width="202" height="76" rx="13" fill="#1b2d45" stroke="#567393"/>
+      <use href="#sdk-icon" x="571" y="88" width="52" height="52" fill="none" stroke="#bca8f7" stroke-width="2.4" stroke-linejoin="round"/>
+      <text x="692" y="108" class="label" style="font-size:16px">SDK generator</text>
+      <text x="692" y="132" class="small" style="font-size:12px">Rust + TypeScript</text>
+
+      <path d="M757 116H806" stroke="#bca8f7" stroke-width="3" marker-end="url(#purple)"/>
+
+      <rect x="806" y="78" width="374" height="76" rx="13" fill="#17343e" stroke="#76dccb"/>
+      <text x="993" y="104" class="label" style="font-size:17px">Generated artifact bundle</text>
+      <text x="993" y="129" class="small"><tspan font-family="ui-monospace, SFMono-Regular, Consolas, monospace">manifest.json</tspan> &middot; Arrow schema &middot; descriptor &middot; clients</text>
+
+      <path d="M924 154V212H175V248" fill="none" stroke="#bca8f7" stroke-width="3" marker-end="url(#purple)"/>
+      <text x="548" y="202" class="flow" fill="#bca8f7">schema identity + generated builders</text>
+
+      <!-- Deterministic scheduler. -->
+      <rect x="42" y="248" width="270" height="240" rx="18" fill="#1b2d45" stroke="#567393"/>
+      <use href="#schedule-icon" x="60" y="267" width="58" height="58" fill="none" stroke="#79d6fa" stroke-width="2.5" stroke-linecap="round"/>
+      <text x="190" y="292" class="label">Load generator</text>
+      <text x="190" y="317" class="small">Deterministic global scheduler</text>
+      <rect x="65" y="346" width="224" height="116" rx="12" fill="#14263b" stroke="#415d7d"/>
+      <text x="84" y="370" class="lane">13 exact schemas</text>
+      <text x="84" y="394" class="lane">seed + round-robin table order</text>
+      <text x="84" y="418" class="lane">configurable lanes + batch rows</text>
+      <text x="84" y="442" class="lane">direct / DFE / paired manifests</text>
+
+      <!-- Router. -->
+      <path d="M312 366H373" stroke="#79d6fa" stroke-width="3" marker-end="url(#blue)"/>
+      <text x="343" y="346" class="flow" fill="#79d6fa">DoPut</text>
+      <text x="343" y="385" class="tiny">table + pool metadata</text>
+
+      <rect x="373" y="285" width="190" height="162" rx="18" fill="#183249" stroke="#79d6fa" stroke-width="2"/>
+      <use href="#router-icon" x="438" y="304" width="60" height="60" fill="none" stroke="#79d6fa" stroke-width="2.5" stroke-linecap="round"/>
+      <text x="468" y="393" class="label">Pingora router</text>
+      <text x="468" y="417" class="small">One owner / pool / table</text>
+
+      <!-- Direct pool. -->
+      <path d="M563 335H622" stroke="#80e2b6" stroke-width="3" marker-end="url(#green)"/>
+      <text x="592" y="317" class="flow" fill="#80e2b6">direct</text>
+      <rect x="622" y="216" width="286" height="196" rx="18" fill="#173a35" stroke="#80e2b6" stroke-width="2"/>
+      <text x="765" y="245" class="label">Direct pool</text>
+      <text x="765" y="268" class="small">SQL receipts + bounded Arrow buffers</text>
+      <g fill="#1a2e40" stroke="#628b82">
+        <rect x="646" y="289" width="72" height="70" rx="11"/>
+        <rect x="729" y="289" width="72" height="70" rx="11"/>
+        <rect x="812" y="289" width="72" height="70" rx="11"/>
+      </g>
+      <g fill="none" stroke="#80e2b6" stroke-width="2">
+        <use href="#collector-icon" x="659" y="299" width="45" height="45"/>
+        <use href="#collector-icon" x="742" y="299" width="45" height="45"/>
+        <use href="#collector-icon" x="825" y="299" width="45" height="45"/>
+      </g>
+      <text x="682" y="380" class="tiny">receipt 1</text>
+      <text x="765" y="380" class="tiny">receipt 2</text>
+      <text x="848" y="380" class="tiny">receipt 3</text>
+
+      <!-- DFE pool. -->
+      <path d="M563 397H600Q614 397 614 411V511Q614 526 628 526" fill="none" stroke="#f3bd75" stroke-width="3" marker-end="url(#orange)"/>
+      <text x="587" y="466" class="flow" fill="#f3bd75" transform="rotate(-90 587 466)">dataflow</text>
+      <rect x="622" y="453" width="286" height="196" rx="18" fill="#3a3025" stroke="#f3bd75" stroke-width="2"/>
+      <text x="765" y="482" class="label">DFE pool</text>
+      <text x="765" y="505" class="small">Bounded channels + best-effort admission</text>
+      <g fill="#1a2e40" stroke="#8c714a">
+        <rect x="646" y="526" width="72" height="70" rx="11"/>
+        <rect x="729" y="526" width="72" height="70" rx="11"/>
+        <rect x="812" y="526" width="72" height="70" rx="11"/>
+      </g>
+      <g fill="none" stroke="#f3bd75" stroke-width="2">
+        <use href="#collector-icon" x="659" y="536" width="45" height="45"/>
+        <use href="#collector-icon" x="742" y="536" width="45" height="45"/>
+        <use href="#collector-icon" x="825" y="536" width="45" height="45"/>
+      </g>
+      <text x="682" y="617" class="tiny">admit 1</text>
+      <text x="765" y="617" class="tiny">admit 2</text>
+      <text x="848" y="617" class="tiny">admit 3</text>
+
+      <!-- Direct receipt result back to the generator. -->
+      <path d="M671 412V438Q671 450 659 450H328Q316 450 316 438V417" fill="none" stroke="#80e2b6" stroke-width="3" marker-end="url(#green)"/>
+      <text x="497" y="471" class="flow" fill="#80e2b6">poll receipt until published</text>
+
+      <!-- Delta roots and validator. -->
+      <path d="M908 315H963" stroke="#80e2b6" stroke-width="3" marker-end="url(#green)"/>
+      <rect x="963" y="226" width="226" height="116" rx="16" fill="#173a35" stroke="#80e2b6"/>
+      <use href="#delta-icon" x="980" y="246" width="54" height="54" fill="none" stroke="#80e2b6" stroke-width="2.5" stroke-linejoin="round"/>
+      <text x="1110" y="268" class="label" style="font-size:18px">Direct Delta root</text>
+      <text x="1110" y="293" class="small">published receipt = purge</text>
+      <text x="1110" y="316" class="tiny">adaptive Parquet files</text>
+
+      <path d="M908 552H963" stroke="#f3bd75" stroke-width="3" marker-end="url(#orange)"/>
+      <rect x="963" y="510" width="226" height="116" rx="16" fill="#3a3025" stroke="#f3bd75"/>
+      <use href="#delta-icon" x="980" y="530" width="54" height="54" fill="none" stroke="#f3bd75" stroke-width="2.5" stroke-linejoin="round"/>
+      <text x="1110" y="552" class="label" style="font-size:18px">DFE Delta root</text>
+      <text x="1110" y="577" class="small">independent output</text>
+      <text x="1110" y="600" class="tiny">no durable client receipt</text>
+
+      <path d="M1076 342V379" stroke="#80e2b6" stroke-width="3" marker-end="url(#green)"/>
+      <path d="M1076 510V474" stroke="#f3bd75" stroke-width="3" marker-end="url(#orange)"/>
+      <rect x="963" y="379" width="226" height="95" rx="16" fill="#1b2d45" stroke="#567393"/>
+      <use href="#validate-icon" x="980" y="397" width="52" height="52" fill="none" stroke="#b5d9ff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="1110" y="411" class="label" style="font-size:18px">Independent validator</text>
+      <text x="1110" y="436" class="small">schema + rows + paired parity</text>
+      <text x="1110" y="458" class="tiny">snapshot-selected Delta files</text>
+
+      <!-- LGTM receives observability, not payload ownership. -->
+      <path d="M468 447V528" stroke="#bca8f7" stroke-width="2.5" stroke-dasharray="6 5" marker-end="url(#purple)"/>
+      <rect x="350" y="528" width="216" height="121" rx="16" fill="#272944" stroke="#8f81c5"/>
+      <use href="#chart-icon" x="368" y="551" width="53" height="53" fill="none" stroke="#bca8f7" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="487" y="566" class="label" style="font-size:18px">LGTM</text>
+      <text x="487" y="591" class="small">router + collector pressure</text>
+      <text x="458" y="627" class="tiny">Grafana &middot; Prometheus &middot; Loki &middot; Tempo</text>
+    </svg>
+  </div>
+
+  <div class="note">
+    <strong>Paired mode sends the same logical batch to both implementations.</strong>
+    <span class="warning">Direct waits for <code>published</code>; DFE records <code>best_effort_admission</code>.</span>
+  </div>
+  <footer>
+    <span>Source: e6b4f6a &middot; production load qualification &middot; October 12, 2026</span>
+    <span>
+      <a href="../load-generator.md">Runbook</a>
+      &middot; <a href="../../../projects/loadtest/README.md">Loadtest guide</a>
+      &middot; <a href="../../../projects/loadtest/schemas/sqlserver.sql">Schema fixture</a>
+      &middot; <a href="../../../projects/loadtest/loadgen/src/runner.rs">Runner</a>
+    </span>
+  </footer>
+</main>
+</body>
+</html>

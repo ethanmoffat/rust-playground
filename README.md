@@ -140,6 +140,8 @@ npx --no-install nx run loadtest:clean
 ```
 
 See the [loadtest guide](projects/loadtest/README.md) for diagnostics and the
+[load generator diagram and runbook](docs/architecture/load-generator.md) for
+the generated-schema data path and exact run commands. See the
 [delivery and verification matrix](docs/delivery-verification.md) for issue
 coverage, exact qualification evidence, and intentional limitations.
 
