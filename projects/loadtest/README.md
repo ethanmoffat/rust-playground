@@ -86,6 +86,11 @@ scanning the entire accumulated Delta history. The finite benchmark, chaos, and
 `e2e` commands run the independent Delta validator; use those for bounded
 acceptance.
 
+Reusing a continuous run ID archives stale output beneath
+`onelake/benchmark/archive/` when no matching Compose stack exists. If the
+stack still exists, stop it with `benchmark-down` before restarting. Finite
+benchmark IDs continue to fail rather than overwrite prior evidence.
+
 Scenarios are explicit:
 
 | Scenario | Delivery |

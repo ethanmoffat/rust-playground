@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import {
-  chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync,
+  chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync,
 } from 'node:fs';
 import { hostname } from 'node:os';
 import path from 'node:path';
@@ -265,6 +265,45 @@ function benchmarkProject(runId: string): string {
   return `rust-playground-loadtest-${safe}`.slice(0, 63);
 }
 
+function benchmarkProjectHasContainers(project: string): boolean {
+  return run('docker', [
+    'ps', '--all', '--quiet', '--filter', `label=com.docker.compose.project=${project}`,
+  ]).trim().length > 0;
+}
+
+function archiveTimestamp(now: Date): string {
+  return now.toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z');
+}
+
+export function prepareBenchmarkDirectory(
+  benchmarkRoot: string,
+  runId: string,
+  continuous: boolean,
+  projectHasContainers: () => boolean,
+  now = new Date(),
+): { directory: string; archived?: string } {
+  const directory = path.join(benchmarkRoot, runId);
+  if (!existsSync(directory) || readdirSync(directory).length === 0) return { directory };
+  if (!continuous) {
+    throw new Error(`Benchmark run directory already contains data: ${path.relative(workspace, directory)}`);
+  }
+  if (projectHasContainers()) {
+    throw new Error(
+      `Benchmark stack for run '${runId}' still exists. Stop it first with: ` +
+      `npx --no-install tsx projects/loadtest/src/main.ts benchmark-down --run-id ${runId}`,
+    );
+  }
+  const archiveRoot = path.join(benchmarkRoot, 'archive');
+  mkdirSync(archiveRoot, { recursive: true });
+  const prefix = `${runId}-${archiveTimestamp(now)}`;
+  let archived = path.join(archiveRoot, prefix);
+  for (let suffix = 2; existsSync(archived); suffix++) {
+    archived = path.join(archiveRoot, `${prefix}-${suffix}`);
+  }
+  renameSync(directory, archived);
+  return { directory, archived };
+}
+
 function writeBenchmarkSecrets(runId: string): { edge: string; internal: string } {
   const root = path.join(workspace, 'projects/loadtest/.temp/secrets', runId);
   mkdirSync(root, { recursive: true });
@@ -522,9 +561,16 @@ function runLocalLoadgen(
 
 function benchmark(options: BenchmarkOptions): BenchmarkContext {
   run(path.join(workspace, 'projects/arrowcol-infra/scripts/bootstrap-secrets.sh'), []);
-  const directory = path.join(workspace, 'onelake/benchmark', options.runId);
-  if (existsSync(directory) && readdirSync(directory).length > 0) {
-    throw new Error(`Benchmark run directory already contains data: ${path.relative(workspace, directory)}`);
+  const project = benchmarkProject(options.runId);
+  const prepared = prepareBenchmarkDirectory(
+    path.join(workspace, 'onelake/benchmark'),
+    options.runId,
+    options.continuous,
+    () => benchmarkProjectHasContainers(project),
+  );
+  const directory = prepared.directory;
+  if (prepared.archived) {
+    console.log(`Archived previous benchmark output: ${path.relative(workspace, prepared.archived)}`);
   }
   for (const child of [
     'direct', 'dataflow', 'otel', 'results', 'router-state',
@@ -537,7 +583,6 @@ function benchmark(options: BenchmarkOptions): BenchmarkContext {
   writeRuntimeConfigs(directory, network);
   writeFileSync(path.join(directory, 'router-state/network.json'), `${JSON.stringify(network, null, 2)}\n`);
   const env = benchmarkEnvironment(directory, options, network, stageHelperBinaries(options.runId));
-  const project = benchmarkProject(options.runId);
   const services = [
     'sqlserver', 'database-bootstrap', 'arrowcol-migrate', 'hive-schema', 'hive-metastore',
     'direct-1', 'direct-2', 'direct-3', 'dataflow-1', 'dataflow-2', 'dataflow-3', 'router',
