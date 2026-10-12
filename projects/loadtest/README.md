@@ -130,6 +130,12 @@ Applications may export traces to `http://tempo:4318` (override
 `LOADTEST_TRACES_ENDPOINT`). The base benchmark does not own the overlay's
 configuration files.
 
+Artifact-backed CI sets `CI_INTEGRATION=true`, so the finite E2E omits those
+runtime observability containers to preserve memory for SQL/Hive and the six
+collectors. CI validates the complete overlay separately. Set
+`LOADTEST_OBSERVABILITY=true` to force the runtime stack in that environment,
+or `false` to omit it from any benchmark run.
+
 For retained runs, open Grafana at `http://127.0.0.1:3000` and Prometheus at
 `http://127.0.0.1:9090`. Grafana keeps the arbitrary-Arrow comparison in the
 **Arrow Flight** folder and the optional OTEL collector in the separate

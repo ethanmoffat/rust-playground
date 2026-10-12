@@ -94,7 +94,7 @@
     "integration-verify": {
       "executor": "nx:run-commands",
       "cache": false,
-      "dependsOn": ["config-check"],
+      "dependsOn": ["bootstrap", "config-check"],
       "options": {
         "command": "projects/arrowcol-infra/scripts/verify-integration.sh",
         "cwd": "{workspaceRoot}",

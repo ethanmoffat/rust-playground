@@ -18,6 +18,16 @@ export function shouldRunIndependentValidation(options: Pick<BenchmarkOptions, '
   return !options.continuous;
 }
 
+export function shouldStartRuntimeObservability(environment: NodeJS.ProcessEnv = process.env): boolean {
+  const configured = environment.LOADTEST_OBSERVABILITY;
+  if (configured !== undefined && configured !== '') {
+    if (configured.toLowerCase() === 'true') return true;
+    if (configured.toLowerCase() === 'false') return false;
+    throw new Error('LOADTEST_OBSERVABILITY must be true or false');
+  }
+  return environment.CI_INTEGRATION !== 'true';
+}
+
 const MAX_DURATION_SECONDS = 2_147_483_647;
 
 export function parseDuration(value: string, name: string, allowZero: boolean): number {

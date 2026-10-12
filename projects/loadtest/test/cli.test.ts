@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { parseBenchmarkOptions, parseDuration, shouldRunIndependentValidation } from '../src/cli.js';
+import {
+  parseBenchmarkOptions,
+  parseDuration,
+  shouldRunIndependentValidation,
+  shouldStartRuntimeObservability,
+} from '../src/cli.js';
 
 test('duration parsing accepts documented whole-number units', () => {
   assert.equal(parseDuration('30', 'duration', false), 30);
@@ -61,4 +66,15 @@ test('environment overrides defaults and malformed options fail closed', () => {
 test('continuous UI runs defer the unbounded historical Delta scan', () => {
   assert.equal(shouldRunIndependentValidation({ continuous: true }), false);
   assert.equal(shouldRunIndependentValidation({ continuous: false }), true);
+});
+
+test('CI integration omits the heavy runtime observability stack unless explicitly requested', () => {
+  assert.equal(shouldStartRuntimeObservability({ CI_INTEGRATION: 'true' }), false);
+  assert.equal(shouldStartRuntimeObservability({ CI_INTEGRATION: 'false' }), true);
+  assert.equal(shouldStartRuntimeObservability({ CI_INTEGRATION: 'true', LOADTEST_OBSERVABILITY: 'true' }), true);
+  assert.equal(shouldStartRuntimeObservability({ LOADTEST_OBSERVABILITY: 'false' }), false);
+  assert.throws(
+    () => shouldStartRuntimeObservability({ LOADTEST_OBSERVABILITY: 'sometimes' }),
+    /must be true or false/u,
+  );
 });

@@ -5,6 +5,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
+cleanup() {
+  "$SCRIPT_DIR/stack.sh" down >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
 require_runtime_configuration
 "$SCRIPT_DIR/config-check.sh"
 "$SCRIPT_DIR/stack.sh" up

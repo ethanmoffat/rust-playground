@@ -13,6 +13,7 @@ import {
   benchmarkUsage,
   parseBenchmarkOptions,
   shouldRunIndependentValidation,
+  shouldStartRuntimeObservability,
   type BenchmarkOptions,
 } from './cli.js';
 import { commitSpansCores, parseInspection, signalsReady, validateSignals, type Inspection } from './validate.js';
@@ -541,7 +542,7 @@ function benchmark(options: BenchmarkOptions): BenchmarkContext {
     'sqlserver', 'database-bootstrap', 'arrowcol-migrate', 'hive-schema', 'hive-metastore',
     'direct-1', 'direct-2', 'direct-3', 'dataflow-1', 'dataflow-2', 'dataflow-3', 'router',
   ];
-  if (existsSync(observabilityComposeFile)) {
+  if (existsSync(observabilityComposeFile) && shouldStartRuntimeObservability()) {
     services.push(
       'prometheus', 'grafana', 'loki', 'tempo', 'alloy', 'cadvisor',
       'sql-exporter', 'json-exporter', 'blackbox-exporter',
