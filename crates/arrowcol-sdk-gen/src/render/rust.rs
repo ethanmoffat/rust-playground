@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fmt::Write,
     io::Write as IoWrite,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Stdio},
 };
 
@@ -11,6 +11,17 @@ use arrowcol_catalog::{CatalogField, CatalogType, ListKind, TimeUnit};
 use crate::{SdkGenError, SdkGenResult};
 
 use super::{NamedKind, RenderContext, rust_identifier};
+
+const RUSTFMT_ARGUMENTS: [&str; 8] = [
+    "--emit",
+    "stdout",
+    "--edition",
+    "2024",
+    "--config",
+    "max_width=120,use_field_init_shorthand=true",
+    "--quiet",
+    "--",
+];
 
 pub(super) fn render(context: &RenderContext<'_>) -> SdkGenResult<BTreeMap<PathBuf, Vec<u8>>> {
     let mut files = BTreeMap::new();
@@ -702,10 +713,8 @@ fn format_rust(source: &str) -> SdkGenResult<String> {
     let syntax = syn::parse_file(source)
         .map_err(|error| SdkGenError::Artifact(format!("generated Rust did not parse before formatting: {error}")))?;
     let source = prettyplease::unparse(&syntax);
-    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("generated-rustfmt.toml");
     let mut child = Command::new("rustfmt")
-        .args(["--emit", "stdout", "--edition", "2024", "--config-path"])
-        .arg(&config)
+        .args(RUSTFMT_ARGUMENTS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -730,4 +739,15 @@ fn format_rust(source: &str) -> SdkGenResult<String> {
     }
     String::from_utf8(output.stdout)
         .map_err(|error| SdkGenError::Artifact(format!("rustfmt emitted non-UTF-8 output: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RUSTFMT_ARGUMENTS;
+
+    #[test]
+    fn generated_rustfmt_arguments_are_relocatable() {
+        assert!(!RUSTFMT_ARGUMENTS.iter().any(|argument| argument.starts_with('/')));
+        assert!(!RUSTFMT_ARGUMENTS.contains(&"--config-path"));
+    }
 }
