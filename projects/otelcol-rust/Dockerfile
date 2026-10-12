@@ -30,6 +30,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --no-create-home --no-log-init --home-dir /nonexistent --shell /usr/sbin/nologin app \
+    && install -d --owner root --group root --mode 0755 /etc/otelcol-rust \
     && install -d --owner app --group app --mode 0750 /onelake
 COPY --from=builder --chmod=0555 /usr/local/bin/otelcol-rust /usr/local/bin/otelcol-rust
 COPY --chmod=0444 projects/otelcol-rust/config.yaml /etc/otelcol-rust/config.yaml
