@@ -1,0 +1,44 @@
+[package]
+name = "arrowcol-router-rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Production Pingora HTTP/2 router for Arrow Flight collectors"
+readme = "README.md"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
+arrowcol-receipts = { path = "../../crates/arrowcol-receipts" }
+arrowcol-routing = { path = "../../crates/arrowcol-routing" }
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+clap = { workspace = true, features = ["derive"] }
+hmac = "0.12"
+http = "1"
+pingora = { version = "=0.9.0", features = ["proxy"] }
+prometheus = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+arrow = { version = "58.4", default-features = false, features = ["ipc"] }
+arrow-flight = "58.4"
+futures = "0.3"
+tokio-stream = "0.1"
+tonic = "0.14"
+
+[lints]
+workspace = true

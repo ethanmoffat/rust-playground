@@ -1,0 +1,37 @@
+[package]
+name = "arrowcol-flight"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reusable Arrow Flight ingress runtime for Arrow collectors"
+readme = "README.md"
+
+[dependencies]
+arrow-array = { version = "58.3", default-features = false }
+arrow-flight = { version = "58.3", default-features = false, features = ["flight-sql"] }
+arrow-ipc = { version = "58.3", default-features = false }
+arrow-schema = { version = "58.3", default-features = false }
+arrowcol-catalog = { path = "../arrowcol-catalog" }
+arrowcol-protocol = { path = "../arrowcol-protocol" }
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+prost = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+tonic = "0.14"
+
+[dev-dependencies]
+anyhow.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["v5"] }
+
+[lints]
+workspace = true

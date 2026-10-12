@@ -1,0 +1,18 @@
+global:
+  scrape_timeout: 1500ms
+  scrape_timeout_offset: 100ms
+  min_interval: 0s
+  max_connections: 3
+  max_idle_connections: 3
+  max_connection_lifetime: 5m
+  enable_query_metrics: true
+
+target:
+  name: arrowcol
+  data_source_name: sqlserver://arrowcol_app:unused@sqlserver:1433/arrowcol
+  collectors:
+    - arrowcol_control_plane
+    - arrowcol_receipt_analytics
+
+collector_files:
+  - /etc/sql-exporter/collectors/*.collector.yml

@@ -1,0 +1,95 @@
+logging {
+	level  = "warn"
+	format = "logfmt"
+}
+
+discovery.docker "loadtest" {
+	host             = "unix:///var/run/docker.sock"
+	refresh_interval = "2s"
+}
+
+discovery.relabel "loadtest_logs" {
+	targets = []
+
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+		action        = "keep"
+		regex         = "(router|direct-[123]|dataflow-[123]|load-driver|sqlserver|hive-metastore|otelcol-rust|prometheus|grafana|loki|tempo|alloy|cadvisor|sql-exporter|json-exporter|blackbox-exporter)"
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+		target_label  = "service_name"
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+		target_label  = "compose_project"
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "/(.*)"
+		target_label  = "container_name"
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_log_stream"]
+		target_label  = "stream"
+	}
+}
+
+loki.source.docker "loadtest" {
+	host             = "unix:///var/run/docker.sock"
+	targets          = discovery.docker.loadtest.targets
+	labels           = {platform = "docker"}
+	relabel_rules    = discovery.relabel.loadtest_logs.rules
+	refresh_interval = "2s"
+	forward_to       = [loki.process.loadtest.receiver]
+}
+
+loki.process "loadtest" {
+	stage.json {
+		expressions = {
+			level  = "level",
+			target = "target",
+		}
+	}
+
+	stage.regex {
+		expression = "(?i)(?:trace[_\\.]?id)[\\\"=: ]+\\\"?(?P<trace_id>[0-9a-f]{32})"
+	}
+
+	stage.regex {
+		expression = "(?i)(?:span[_\\.]?id)[\\\"=: ]+\\\"?(?P<span_id>[0-9a-f]{16})"
+	}
+
+	stage.labels {
+		values = {
+			level = "",
+		}
+	}
+
+	stage.structured_metadata {
+		values = {
+			span_id  = "",
+			target   = "",
+			trace_id = "",
+		}
+	}
+
+	stage.static_labels {
+		values = {
+			run_id   = sys.env("LOADTEST_RUN_ID"),
+			scenario = sys.env("LOADTEST_OBSERVABILITY_SCENARIO"),
+		}
+	}
+
+	forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+	endpoint {
+		url = "http://loki:3100/loki/api/v1/push"
+	}
+}

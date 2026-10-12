@@ -72,7 +72,10 @@ function addTask(
 
 test('fans out independent material checks, preserving prerequisite closures and artifact handoffs', () => {
   const plan = createVerificationPlan(fixture());
-  assert.deepEqual(plan.node.map(({ task }) => task), ['scripts:test', 'scripts:typecheck']);
+  assert.deepEqual(plan.node.flatMap(({ tasks }) => tasks), [
+    'scripts:test',
+    'scripts:typecheck',
+  ]);
   assert.deepEqual(plan.rust.flatMap(({ tasks }) => tasks), [
     'collector:config-check', 'sdk:format-check', 'sdk:lint', 'sdk:test',
   ]);
@@ -89,20 +92,31 @@ test('fans out independent material checks, preserving prerequisite closures and
 test('new projects are discovered without editing a hard-coded CI project list', () => {
   const graph = fixture();
   addTask(graph, 'new-package:test', 'tsx --test another.ts');
-  assert.ok(createVerificationPlan(graph).node.some(({ task }) => task === 'new-package:test'));
+  assert.ok(
+    createVerificationPlan(graph).node.some(({ tasks }) =>
+      tasks.includes('new-package:test'),
+    ),
+  );
 });
 
 test('Rust commands with environment assignments still use the pinned source environment', () => {
   const graph = fixture();
   addTask(graph, 'new-rust:test', 'RUST_TEST_THREADS=1 cargo test --locked');
   assert.ok(createVerificationPlan(graph).rust.some(({ task }) => task === 'new-rust:test'));
-  assert.ok(!createVerificationPlan(graph).node.some(({ task }) => task === 'new-rust:test'));
+  assert.ok(
+    !createVerificationPlan(graph).node.some(({ tasks }) =>
+      tasks.includes('new-rust:test'),
+    ),
+  );
 });
 
 test('nonempty verify targets retain their commands and dependent checks', () => {
   const graph = fixture();
   addTask(graph, 'scripts:verify', 'node -e "console.log(\'verified\')"', ['scripts:typecheck', 'scripts:test']);
-  assert.deepEqual(createVerificationPlan(graph).node.map(({ task }) => task), ['scripts:verify']);
+  assert.deepEqual(
+    createVerificationPlan(graph).node.flatMap(({ tasks }) => tasks),
+    ['scripts:verify'],
+  );
 });
 
 test('missing and cyclic prerequisites fail even behind empty aggregation nodes', () => {
@@ -114,9 +128,27 @@ test('missing and cyclic prerequisites fail even behind empty aggregation nodes'
   assert.throws(() => createVerificationPlan(cycle), /Cyclic Nx prerequisites/u);
 });
 
-test('shared mutable prerequisites require an explicit artifact handoff rather than duplicate execution', () => {
+test('same-project Cargo roots batch shared prerequisites instead of rebuilding them', () => {
   const graph = fixture();
   addTask(graph, 'collector:other-check', 'target/debug/collector --other', ['collector:build']);
+  const plan = createVerificationPlan(graph);
+  const collector = plan.rust.find(
+    ({ key }) => key === 'collector-checks',
+  );
+  assert.deepEqual(collector?.tasks, [
+    'collector:config-check',
+    'collector:other-check',
+  ]);
+});
+
+test('cross-project shared prerequisites still require an artifact handoff', () => {
+  const graph = fixture();
+  addTask(
+    graph,
+    'other:check',
+    'target/debug/other --check',
+    ['collector:build'],
+  );
   assert.throws(() => createVerificationPlan(graph), /shared by/u);
 });
 
@@ -175,7 +207,14 @@ interface Workflow {
     if?: string;
     strategy?: { 'fail-fast'?: boolean; 'max-parallel'?: number };
     uses?: string;
-    steps?: Array<{ name?: string; if?: string; run?: string; uses?: string; with?: Record<string, unknown> }>;
+    steps?: Array<{
+      env?: Record<string, string>;
+      name?: string;
+      if?: string;
+      run?: string;
+      uses?: string;
+      with?: Record<string, unknown>;
+    }>;
   }>;
 }
 
@@ -198,6 +237,10 @@ test('workflow starts environment, Node checks, and image builds without unrelat
   assert.ok(!jobs.e2e?.needs?.includes('rust'));
   assert.ok(!jobs.e2e?.needs?.includes('node'));
   assert.ok(!jobs.e2e?.steps?.some(({ with: options }) => options?.name === 'ci-source-environment'));
+  const nodeVerify = jobs.node?.steps?.find(
+    ({ run }) => run?.endsWith('tools-scripts:ci-verify-host'),
+  );
+  assert.match(nodeVerify?.env?.CI_TASKS ?? '', /matrix\.tasks/u);
 });
 
 test('the stable final required check rejects failure, cancellation, and skipped branches', () => {

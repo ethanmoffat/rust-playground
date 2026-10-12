@@ -20,6 +20,7 @@ npx nx run tools-scripts:registry-manifest -- \
   --owner OWNER --repository rust-playground --image hello-world --tag TAG
 npx nx run tools-scripts:registry-public -- \
   --owner OWNER --repository rust-playground --image hello-world
+npx nx run tools-scripts:image-publish-plan
 ```
 
 In CI, `registry-login` uses `GHCR_TOKEN` and then `GITHUB_TOKEN`. Locally it
@@ -28,10 +29,15 @@ publication; `read:packages` supports downloads only. The selected token is
 supplied only to `docker login ghcr.io --username OWNER --password-stdin`; it
 is not placed in argv, emitted by the CLI, or written to repository files.
 
-Tag metadata contains a sanitized mutable branch tag, an immutable
-`sha-FULL_GIT_SHA` tag, and structured `latest` metadata only for the default
-branch. Later image targets can import the same helpers or consume the JSON
-CLI output.
+Tag metadata contains a collision-resistant mutable
+`branch-SANITIZED_BRANCH` tag, an immutable `sha-FULL_GIT_SHA` tag, and
+structured `latest` metadata only for the default branch. Image targets and
+workflows consume the JSON CLI output.
+
+`image-publish-plan` reads the Nx graph, fails closed unless the four production
+runtime images and retained `hello-world` sample expose the complete image,
+smoke, cached CI build, guarded publish, and manifest contract, then emits the
+GitHub Actions matrix through `GITHUB_OUTPUT`.
 
 `registry-manifest` checks the exact remote reference with
 `docker manifest inspect` while suppressing the manifest body.

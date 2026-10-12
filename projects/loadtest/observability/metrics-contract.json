@@ -1,0 +1,58 @@
+{
+  "router": {
+    "source": "projects/arrowcol-router-rust/src/metrics.rs",
+    "metrics": [
+      "arrowcol_router_decisions_total",
+      "arrowcol_router_failures_total",
+      "arrowcol_router_cache_refresh_total",
+      "arrowcol_router_lease_events_total",
+      "arrowcol_router_upstream_connections_total",
+      "arrowcol_router_active_streams",
+      "arrowcol_router_cached_leases",
+      "arrowcol_router_maximum_collector_pressure_bps"
+    ]
+  },
+  "direct": {
+    "source": "projects/arrowcol-rust/src/metrics.rs",
+    "metrics": [
+      "arrowcol_direct_active_streams",
+      "arrowcol_direct_decoded_channel_bytes",
+      "arrowcol_direct_received_batches_total",
+      "arrowcol_direct_received_rows_total",
+      "arrowcol_direct_received_bytes_total",
+      "arrowcol_direct_stream_outcomes_total",
+      "arrowcol_direct_control_failures_total",
+      "arrowcol_direct_reconciled_receipts_total",
+      "arrowcol_direct_incomplete_shutdown_groups"
+    ]
+  },
+  "dataflow": {
+    "source": "crates/arrowcol-dataflow-components/src/metrics.rs",
+    "metrics": [
+      "arrowcol_flight_active_streams",
+      "arrowcol_received_batches_total",
+      "arrowcol_received_rows_total",
+      "arrowcol_received_bytes_total",
+      "arrowcol_dfe_buffered_batches",
+      "arrowcol_dfe_buffered_bytes",
+      "arrowcol_delta_pending_commits",
+      "arrowcol_delta_files_total",
+      "arrowcol_delta_rows_total",
+      "arrowcol_delta_bytes_total",
+      "arrowcol_delta_failures_total",
+      "arrowcol_downstream_acks_total",
+      "arrowcol_downstream_nacks_total",
+      "arrowcol_delivery_guarantee_info"
+    ]
+  },
+  "otelBaseline": {
+    "source": "submodules/otel-arrow/rust/otap-dataflow/crates/engine/telemetry.md",
+    "contracts": [
+      "messages_total",
+      "memory.rss",
+      "cpu.utilization",
+      "channel.receiver.queue.depth",
+      "exporter.attempted.duration"
+    ]
+  }
+}

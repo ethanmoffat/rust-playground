@@ -1,0 +1,134 @@
+{
+  "name": "arrowcol-sdk-gen",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "crates/arrowcol-sdk-gen/src",
+  "namedInputs": {
+    "default": [
+      "{projectRoot}/**/*",
+      "{workspaceRoot}/Cargo.toml",
+      "{workspaceRoot}/Cargo.lock",
+      "{workspaceRoot}/rust-toolchain.toml",
+      "{workspaceRoot}/tools/libs/arrowcol-sdk-gen/**/*",
+      "{workspaceRoot}/package.json",
+      "{workspaceRoot}/package-lock.json"
+    ]
+  },
+  "targets": {
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/clean.ts crates/arrowcol-sdk-gen",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "format": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo fmt --package arrowcol-sdk-gen"
+      }
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo fmt --package arrowcol-sdk-gen -- --check"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo clippy --locked --package arrowcol-sdk-gen --all-targets -- -D warnings"
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo build --locked --package arrowcol-sdk-gen"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo test --locked --package arrowcol-sdk-gen"
+      }
+    },
+    "doc": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "RUSTDOCFLAGS='-D warnings' cargo doc --locked --package arrowcol-sdk-gen --no-deps"
+      }
+    },
+    "generate": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/libs/arrowcol-sdk-gen/src/cli.ts generate-fixture",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "check": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["generate"],
+      "options": {
+        "command": "npx --no-install tsx tools/libs/arrowcol-sdk-gen/src/cli.ts check",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "compatibility": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["generate"],
+      "options": {
+        "command": "npx --no-install tsx tools/libs/arrowcol-sdk-gen/src/cli.ts compatibility",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "generated-test": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["check"],
+      "options": {
+        "command": "npx --no-install tsx tools/libs/arrowcol-sdk-gen/src/cli.ts test",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "package-artifact": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["generated-test"],
+      "options": {
+        "command": "npx --no-install tsx tools/libs/arrowcol-sdk-gen/src/cli.ts package-artifact",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        "format-check",
+        "lint",
+        "build",
+        "test",
+        "doc",
+        "compatibility",
+        "package-artifact",
+        {
+          "projects": ["arrowcol-sdk-gen-tool"],
+          "target": "verify"
+        }
+      ],
+      "options": {
+        "commands": []
+      }
+    }
+  },
+  "tags": ["scope:rust", "scope:tools", "type:generator"]
+}

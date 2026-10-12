@@ -24,18 +24,18 @@ export interface VerificationShard {
   readonly task: string;
 }
 
+export interface VerificationBatchShard extends VerificationShard {
+  readonly tasks: readonly string[];
+}
+
 export interface ImageShard extends VerificationShard {
   readonly image_refs: readonly string[];
 }
 
-export interface RustShard extends VerificationShard {
-  readonly tasks: readonly string[];
-}
-
 export interface VerificationPlan {
   readonly images: readonly ImageShard[];
-  readonly node: readonly VerificationShard[];
-  readonly rust: readonly RustShard[];
+  readonly node: readonly VerificationBatchShard[];
+  readonly rust: readonly VerificationBatchShard[];
   readonly materialTasks: readonly string[];
   readonly reader: string;
   readonly integration: string;
@@ -149,49 +149,74 @@ export function createVerificationPlan(graph: VerificationGraph): VerificationPl
   }
   const roots = remaining.filter((id) => !prerequisites.has(id)).sort();
   const claimed = new Map([...special].map((id) => [id, id]));
-  const node: VerificationShard[] = [];
-  const rust: VerificationShard[] = [];
+  const nodeRoots: VerificationShard[] = [];
+  const rustRoots: VerificationShard[] = [];
+  const rootUsesCargo = new Map<string, boolean>();
   for (const id of roots) {
     const covered = closure(id);
-    for (const prerequisite of covered) {
-      const owner = claimed.get(prerequisite);
-      if (owner !== undefined) {
-        throw new Error(`Nx prerequisite ${prerequisite} is shared by ${owner} and ${id}; add an artifact handoff.`);
-      }
-      claimed.set(prerequisite, id);
-    }
+    const project = id.split(':')[0];
+    if (!project) throw new Error(`Invalid verification root: ${id}`);
     const usesCargo = [...covered].some((task) =>
       commands(configurations.get(task)).some((command) =>
         /(?:^|[\s"';&])(?:cargo|rustc|rustfmt|rustup|cargo-make|makers)(?:\s|$)/u.test(command)),
     );
-    (usesCargo ? rust : node).push({ key: shardKey(id), task: id });
+    for (const prerequisite of covered) {
+      const owner = claimed.get(prerequisite);
+      if (owner !== undefined) {
+        const ownerProject = owner.split(':')[0];
+        if (
+          ownerProject === project &&
+          rootUsesCargo.get(owner) === usesCargo
+        ) {
+          continue;
+        }
+        throw new Error(`Nx prerequisite ${prerequisite} is shared by ${owner} and ${id}; add an artifact handoff.`);
+      }
+      claimed.set(prerequisite, id);
+    }
+    rootUsesCargo.set(id, usesCargo);
+    (usesCargo ? rustRoots : nodeRoots).push({
+      key: shardKey(id),
+      task: id,
+    });
   }
   if (!sameSet(new Set(claimed.keys()), material)) {
     throw new Error('Parallel CI does not cover every material Nx verification task.');
   }
-  const rustProjects = new Map<string, string[]>();
-  for (const { task } of rust) {
-    const project = task.split(':')[0];
-    if (!project) throw new Error(`Invalid Rust task: ${task}`);
-    const targets = rustProjects.get(project) ?? [];
-    targets.push(task);
-    rustProjects.set(project, targets);
-  }
-  const rustShards = [...rustProjects].map(([project, tasks]) => {
-    const task = tasks[0];
-    if (!task) throw new Error(`Empty Rust shard: ${project}`);
-    return { key: `${project}-checks`, task, tasks };
-  });
-  const keys = [...images, ...node, ...rustShards].map(({ key }) => key);
+  const batchByProject = (
+    shards: readonly VerificationShard[],
+    keySuffix: string,
+  ): VerificationBatchShard[] => {
+    const projects = new Map<string, string[]>();
+    for (const { task } of shards) {
+      const project = task.split(':')[0];
+      if (!project) throw new Error(`Invalid verification task: ${task}`);
+      const targets = projects.get(project) ?? [];
+      targets.push(task);
+      projects.set(project, targets);
+    }
+    return [...projects].map(([project, tasks]) => {
+      const task = tasks[0];
+      if (!task) throw new Error(`Empty verification shard: ${project}`);
+      return {
+        key: `${project}-${keySuffix}`,
+        task,
+        tasks,
+      };
+    });
+  };
+  const rust = batchByProject(rustRoots, 'checks');
+  const node = batchByProject(nodeRoots, 'node-checks');
+  const keys = [...images, ...node, ...rust].map(({ key }) => key);
   if (new Set(keys).size !== keys.length) throw new Error('CI shard keys collide.');
   if (node.length === 0 || rust.length === 0) throw new Error('CI verification matrices must not be empty.');
-  if (Math.max(node.length, rustShards.length, images.length) > 256) {
+  if (Math.max(node.length, rust.length, images.length) > 256) {
     throw new Error('CI exceeds the GitHub matrix limit of 256 jobs.');
   }
   return {
     images,
     node,
-    rust: rustShards,
+    rust,
     materialTasks: [...material].sort(),
     reader: readerTask,
     integration: integrationTask,

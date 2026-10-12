@@ -2,7 +2,15 @@
   "name": "loadtest",
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
   "projectType": "application",
-  "implicitDependencies": ["otelcol-rust", "hello-world"],
+  "implicitDependencies": [
+    "otelcol-rust",
+    "arrowcol-rust",
+    "arrowcol-dataflow-rust",
+    "arrowcol-router-rust",
+    "arrowcol-infra",
+    "arrowcol-sdk-gen",
+    "hello-world"
+  ],
   "targets": {
     "clean": {
       "executor": "nx:run-commands",
@@ -19,25 +27,34 @@
     "reader-build": {
       "executor": "nx:run-commands",
       "cache": false,
-      "options": {"command": "cargo build --locked --package delta-inspect"}
+      "options": {
+        "command": "projects/loadtest/scripts/build-reader-bundle.sh"
+      }
     },
     "format": {
       "executor": "nx:run-commands",
-      "options": {"command": "cargo fmt --package delta-inspect"}
+      "options": {"command": "cargo fmt --package delta-inspect --package arrowcol-loadgen"}
     },
     "format-check": {
       "executor": "nx:run-commands",
-      "options": {"command": "cargo fmt --package delta-inspect -- --check"}
+      "options": {"command": "cargo fmt --package delta-inspect --package arrowcol-loadgen -- --check"}
     },
     "lint": {
       "executor": "nx:run-commands",
-      "options": {"command": "cargo clippy --locked --package delta-inspect --all-targets -- -D warnings"}
+      "options": {
+        "commands": [
+          "cargo clippy --locked --package delta-inspect --all-targets -- -D warnings",
+          "cargo clippy --locked --package arrowcol-loadgen --all-targets -- -D warnings"
+        ],
+        "parallel": false
+      }
     },
     "test": {
       "executor": "nx:run-commands",
       "options": {
         "commands": [
           "cargo test --locked --package delta-inspect",
+          "cargo test --locked --package arrowcol-loadgen",
           "npx --no-install tsx --test projects/loadtest/test/*.test.ts"
         ],
         "parallel": false
@@ -47,11 +64,28 @@
       "executor": "nx:run-commands",
       "options": {"command": "npx --no-install tsc --project projects/loadtest/tsconfig.json"}
     },
+    "compose-check": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx projects/loadtest/src/compose-check.ts",
+        "forwardAllArgs": false
+      }
+    },
     "build": {
       "executor": "nx:run-commands",
       "cache": false,
       "dependsOn": [
-        {"projects": ["otelcol-rust", "hello-world"], "target": "image"},
+        {
+          "projects": [
+            "otelcol-rust",
+            "arrowcol-rust",
+            "arrowcol-dataflow-rust",
+            "arrowcol-router-rust",
+            "hello-world"
+          ],
+          "target": "image"
+        },
         "reader-build"
       ],
       "options": {"commands": []}
@@ -59,6 +93,7 @@
     "up": {
       "executor": "nx:run-commands",
       "cache": false,
+      "dependsOn": ["build"],
       "options": {"command": "npx --no-install tsx projects/loadtest/src/main.ts up", "forwardAllArgs": false}
     },
     "down": {
@@ -83,10 +118,43 @@
       "dependsOn": ["build"],
       "options": {"command": "npx --no-install tsx projects/loadtest/src/main.ts e2e", "forwardAllArgs": false}
     },
+    "otel-e2e": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build"],
+      "options": {"command": "npx --no-install tsx projects/loadtest/src/main.ts otel-e2e", "forwardAllArgs": false}
+    },
+    "benchmark": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build"],
+      "options": {
+        "command": "npx --no-install tsx projects/loadtest/src/main.ts benchmark",
+        "forwardAllArgs": true
+      }
+    },
+    "run": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build"],
+      "options": {
+        "command": "npx --no-install tsx projects/loadtest/src/main.ts run",
+        "forwardAllArgs": true
+      }
+    },
+    "chaos": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build"],
+      "options": {
+        "command": "npx --no-install tsx projects/loadtest/src/main.ts chaos",
+        "forwardAllArgs": true
+      }
+    },
     "verify": {
       "executor": "nx:run-commands",
       "cache": false,
-      "dependsOn": ["format-check", "lint", "typecheck", "test", "e2e"],
+      "dependsOn": ["format-check", "lint", "typecheck", "compose-check", "test", "e2e"],
       "options": {"commands": []}
     }
   },

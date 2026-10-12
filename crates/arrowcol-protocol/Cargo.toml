@@ -1,0 +1,22 @@
+[package]
+name = "arrowcol-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Versioned, storage-independent contracts for Arrow collectors"
+readme = "README.md"
+
+[dependencies]
+arrow-schema = { version = "58.3", default-features = false }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror.workspace = true
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

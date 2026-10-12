@@ -1,0 +1,117 @@
+{
+  "name": "arrowcol-infra",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "metadata": {
+    "description": "Local SQL Server and Apache Hive Metastore infrastructure for Arrowcol."
+  },
+  "targets": {
+    "bootstrap": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "projects/arrowcol-infra/scripts/bootstrap-secrets.sh",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": true
+      },
+      "metadata": {
+        "description": "Create the local .env and Docker secret files without printing secret values."
+      }
+    },
+    "config-check": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "projects/arrowcol-infra/scripts/config-check.sh",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      },
+      "metadata": {
+        "description": "Validate Compose rendering, scripts, migrations, secret hygiene, and image pins."
+      }
+    },
+    "up": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["config-check"],
+      "options": {
+        "command": "projects/arrowcol-infra/scripts/stack.sh up",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": true
+      },
+      "metadata": {
+        "description": "Build and start the stack, waiting for deterministic service health."
+      }
+    },
+    "down": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "projects/arrowcol-infra/scripts/stack.sh down",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": true
+      },
+      "metadata": {
+        "description": "Stop only this Compose project with a bounded shutdown timeout."
+      }
+    },
+    "logs": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "projects/arrowcol-infra/scripts/stack.sh logs",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": true
+      },
+      "metadata": {
+        "description": "Follow this stack's recent service logs."
+      }
+    },
+    "reset": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "projects/arrowcol-infra/scripts/stack.sh reset",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": true
+      },
+      "metadata": {
+        "description": "Remove only this stack's containers, network, and named data volumes."
+      }
+    },
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "projects/arrowcol-infra/scripts/stack.sh clean",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": true
+      },
+      "metadata": {
+        "description": "Reset this stack and remove only its locally built Compose images."
+      }
+    },
+    "integration-verify": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["config-check"],
+      "options": {
+        "command": "projects/arrowcol-infra/scripts/verify-integration.sh",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      },
+      "metadata": {
+        "description": "Start the stack and verify health, databases, migrations, Hive schema, and rerunnable initialization."
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["config-check", "integration-verify"],
+      "options": {
+        "commands": []
+      }
+    }
+  },
+  "tags": ["scope:infra", "type:application"]
+}

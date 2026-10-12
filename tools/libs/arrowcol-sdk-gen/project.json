@@ -1,0 +1,46 @@
+{
+  "name": "arrowcol-sdk-gen-tool",
+  "$schema": "../../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "tools/libs/arrowcol-sdk-gen/src",
+  "tags": ["scope:tools", "type:automation"],
+  "targets": {
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/clean.ts tools/libs/arrowcol-sdk-gen",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsc --project tools/libs/arrowcol-sdk-gen/tsconfig.json --noEmit --noUnusedLocals --noUnusedParameters",
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsc --project tools/libs/arrowcol-sdk-gen/tsconfig.json --noEmit",
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsx --test tools/libs/arrowcol-sdk-gen/test/**/*.test.ts",
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["lint", "typecheck", "test"],
+      "options": {
+        "commands": []
+      }
+    }
+  }
+}

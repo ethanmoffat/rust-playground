@@ -3,9 +3,13 @@
 use anyhow::{Context, Result};
 use arrow::array::{Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow_deltalake::commit::{BatchedTable, CommitOptions};
-use arrow_deltalake::delta::{DeltaTable, StagedAppend};
-use std::sync::Arc;
+use arrow_deltalake::commit::{BatchedTable, CommitOptions, CommitReceiptError};
+use arrow_deltalake::delta::{
+    DeltaTable, PublicationFence, PublicationFenceContext, PublicationFenceError, PublicationFenceErrorKind,
+    StagedAppend,
+};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -24,6 +28,44 @@ fn options() -> CommitOptions {
         max_files_per_commit: 2,
         max_pending_files: 2,
         ..Default::default()
+    }
+}
+
+struct ToggleFence {
+    current: AtomicBool,
+    calls: AtomicUsize,
+    contexts: Mutex<Vec<(u64, u64, usize)>>,
+}
+
+impl ToggleFence {
+    fn new() -> Self {
+        Self {
+            current: AtomicBool::new(true),
+            calls: AtomicUsize::new(0),
+            contexts: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn make_stale(&self) {
+        self.current.store(false, Ordering::Release);
+    }
+}
+
+impl PublicationFence for ToggleFence {
+    fn check_before_commit(
+        &self,
+        context: &PublicationFenceContext<'_>,
+    ) -> std::result::Result<(), PublicationFenceError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.contexts
+            .lock()
+            .map_err(|_| PublicationFenceError::check_failed("test fence context lock poisoned"))?
+            .push((context.read_version(), context.proposed_version(), context.file_count()));
+        if self.current.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(PublicationFenceError::stale("test owner generation is stale"))
+        }
     }
 }
 
@@ -129,6 +171,77 @@ async fn commit_failure_reaches_all_waiters() -> Result<()> {
     assert!(timeout(Duration::from_secs(3), b.wait()).await?.is_err());
     let input = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     assert!(table.new_file(input).await.is_err());
+    assert!(!directory.path().join("_delta_log/00000000000000000001.json").exists());
+    Ok(())
+}
+
+/// Scenario: ownership becomes stale after a durable file is prepared but before its Delta commit.
+/// Guarantees: the hook sees the final commit context and rejects before the file becomes visible.
+#[tokio::test]
+async fn stale_fence_rejects_before_delta_visibility() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let fence = Arc::new(ToggleFence::new());
+    let table = DeltaTable::open_with_fence(directory.path(), Arc::<ToggleFence>::clone(&fence))?;
+    let input = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )?;
+    let mut writer = table.new_file(input.schema())?;
+    writer.write(&input).await?;
+    fence.make_stale();
+    let error = writer
+        .finish()
+        .await
+        .err()
+        .context("stale publication unexpectedly succeeded")?;
+    let fence_error = error
+        .downcast_ref::<PublicationFenceError>()
+        .context("missing structured fence error")?;
+    assert_eq!(fence_error.kind(), PublicationFenceErrorKind::StaleOwnership);
+    assert_eq!(fence.calls.load(Ordering::Relaxed), 1);
+    let contexts = fence
+        .contexts
+        .lock()
+        .map_err(|_| anyhow::anyhow!("test fence context lock poisoned"))?;
+    assert_eq!(contexts.as_slice(), &[(0, 1, 1)]);
+    assert_eq!(table.version()?, 0);
+    assert!(!directory.path().join("_delta_log/00000000000000000001.json").exists());
+    Ok(())
+}
+
+/// Scenario: one stale fence rejects a transaction containing two independently submitted files.
+/// Guarantees: both waiters receive the same typed rejection and the worker never retries blindly.
+#[tokio::test]
+async fn batched_fence_rejection_reaches_every_waiter_once() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let fence = Arc::new(ToggleFence::new());
+    let table = BatchedTable::open_with_fence(directory.path(), options(), Arc::<ToggleFence>::clone(&fence)).await?;
+    let left = file(&table, 1).await?;
+    let right = file(&table, 2).await?;
+    assert_eq!(left.observation().input_bytes, 4);
+    assert_eq!(right.observation().rows, 1);
+    assert_eq!(fence.calls.load(Ordering::Relaxed), 0);
+    fence.make_stale();
+    let a = table.submit(left, false).await?;
+    let b = table.submit(right, false).await?;
+    let a = timeout(Duration::from_secs(3), a.wait_typed())
+        .await?
+        .err()
+        .context("first stale publication unexpectedly succeeded")?;
+    let b = timeout(Duration::from_secs(3), b.wait_typed())
+        .await?
+        .err()
+        .context("second stale publication unexpectedly succeeded")?;
+    assert_eq!(a, b);
+    assert!(matches!(
+        a,
+        CommitReceiptError::PublicationFenced(ref error)
+            if error.kind() == PublicationFenceErrorKind::StaleOwnership
+    ));
+    assert_eq!(fence.calls.load(Ordering::Relaxed), 1);
+    table.flush_pending();
+    tokio::task::yield_now().await;
+    assert_eq!(fence.calls.load(Ordering::Relaxed), 1);
     assert!(!directory.path().join("_delta_log/00000000000000000001.json").exists());
     Ok(())
 }

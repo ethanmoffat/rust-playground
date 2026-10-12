@@ -1,6 +1,8 @@
 .git
 .github
+.devcontainer
 .nx
+autonomous-delivery
 dev
 docs
 node_modules
@@ -10,4 +12,9 @@ tools
 .temp
 onelake
 **/.git
+**/.diagnostics
+**/.state
+**/.temp
+**/coverage
+**/secrets
 **/target

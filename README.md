@@ -49,6 +49,100 @@ inside it. Stop only this workspace's Compose project when finished:
 npx nx run devcontainer:down -- --volumes
 ```
 
+## Arrow collector platform
+
+The repository contains a complete local Arrow Flight collection platform:
+
+```text
+Flight SQL DDL
+      |
+      v
+SQL Server application catalog + Apache Hive Metastore
+      |
+      +--> immutable manifest.json / schema.arrow / descriptor.pb
+      |         |
+      |         +--> generated Rust and TypeScript SDKs
+      |
+generated clients
+      |
+      v
+Pingora router -- one fenced owner per implementation pool and table
+      |                                      |
+      +--> 3 direct collectors               +--> 3 DFE collectors
+      |      SQL receipts                         best-effort admission
+      |      bounded Arrow buffers                bounded DFE channels
+      |                                      |
+      +--> shared direct Delta root           +--> shared DFE Delta root
+                         |
+                         +--> independent validation and Grafana
+```
+
+The direct pool returns a server-generated receipt for each `RecordBatch`.
+That initial Flight result is **not purge permission**. A client may purge its
+source copy only after the receipt HTTP API reports `published` and
+`purge_allowed: true`, after the fenced Delta commit is durable. The DFE pool
+honestly reports only best-effort admission and has no receipt polling or
+at-least-once claim. See the
+[platform architecture](docs/architecture/arrowcol-platform.md) for the full
+catalog, router, receipt, fencing, buffering, and capability contracts.
+
+### Finite qualification quick start
+
+Run from the repository root in the source devcontainer:
+
+```bash
+git submodule update --init --recursive
+npm ci
+
+# Bootstrap and verify the standalone SQL Server + Hive control plane.
+npx --no-install nx run arrowcol-infra:bootstrap
+npx --no-install nx run arrowcol-infra:integration-verify
+npx --no-install nx run arrowcol-infra:down
+
+# Verify deterministic catalog artifact and Rust/TypeScript SDK generation.
+npx --no-install nx run arrowcol-sdk-gen:verify
+
+# Run OTEL acceptance, then the finite Arrow platform and chaos qualification.
+npx --no-install nx run loadtest:e2e
+```
+
+The Arrow phase registers
+[`projects/loadtest/schemas/sqlserver.sql`](projects/loadtest/schemas/sqlserver.sql)
+through Flight SQL, exports the immutable catalog artifacts, generates and
+checks both SDK packages, starts the router with three direct and three DFE
+collectors, and validates both Delta roots. It also exercises schema rejection,
+duplicate direct deliveries, lease expiry, owner restart, stale fencing,
+graceful drain, and SQL interruption/recovery.
+
+Finite runs stop their scoped Compose stack and retain diagnostics beneath
+`onelake/e2e/` and `onelake/benchmark/<run-id>/results/`. The run prints its
+exact output directory. Focused collector live E2Es retain their own evidence
+under `projects/arrowcol-rust/.diagnostics/<run-id>/` and
+`projects/arrowcol-dataflow-rust/.diagnostics/<run-id>/`.
+
+### Continuous comparison and dashboards
+
+```bash
+npx --no-install nx run loadtest:run -- \
+  --run-id live --warmup 2m --continuous --keep-stack
+```
+
+The retained stack exposes Grafana at `http://127.0.0.1:3000` and Prometheus
+at `http://127.0.0.1:9090`. Grafana provisions separate **Arrow Flight** and
+**OTEL Collector Baseline** folders; the OTEL dashboard is intentionally
+separate and has data only when `--otel-baseline` is requested.
+
+Stop and remove the retained stack before deleting its output:
+
+```bash
+npx --no-install tsx projects/loadtest/src/main.ts benchmark-down --run-id live
+npx --no-install nx run loadtest:clean
+```
+
+See the [loadtest guide](projects/loadtest/README.md) for diagnostics and the
+[delivery and verification matrix](docs/delivery-verification.md) for issue
+coverage, exact qualification evidence, and intentional limitations.
+
 ## Nx targets
 
 Run repository targets inside the devcontainer:
@@ -176,7 +270,7 @@ docker run --rm --platform linux/amd64 \
 - `tools/` - TypeScript CLIs, lifecycle helpers, and the local Nx Docker build
   plugin.
 - `projects/otelcol-rust/` - Nx build/configuration and Docker image for the
-  editable otel-arrow fork at `submodules/otel-arrow`.
+  pinned, editable otel-arrow submodule at `submodules/otel-arrow`.
 - `projects/loadtest/` - Two-service Compose demo and content-verified Delta
   E2E; generated telemetry lives in gitignored `onelake/`.
 - `.devcontainer/` - Reproducible source-built and immutable prebuilt
@@ -198,9 +292,9 @@ npx --no-install nx run loadtest:e2e
 The sample sends logs, metrics, and traces to the Rust collector and writes
 readable local Delta tables containing Parquet. Multiple collector cores stream
 files concurrently and share batched Delta commits per table. `loadtest:up`
-rebuilds both local Dockerfiles, including uncommitted fork edits.
+rebuilds both local Dockerfiles, including uncommitted submodule edits.
 See [loadtest](projects/loadtest/README.md) and
-[collector development](projects/otelcol-rust/README.md#editing-the-fork).
+[collector development](projects/otelcol-rust/README.md#editing-the-submodule).
 
 The [arrow-deltalake SDK](crates/arrow-deltalake/README.md) accepts pure Arrow
 batches for Parquet-only or Delta writing. OTEL-specific routing and joins
@@ -216,7 +310,26 @@ available only after its manifest and public visibility have been verified:
 | Image | Tags | Purpose |
 | --- | --- | --- |
 | `ghcr.io/mdrakiburrahman/rust-playground/devcontainer` | immutable content hash, branch alias, and `latest` from `main` | Development environment |
-| `ghcr.io/mdrakiburrahman/rust-playground/hello-world` | sanitized branch, `sha-<full-git-sha>`, and `latest` from `main` | Sample runtime image |
+| `ghcr.io/mdrakiburrahman/rust-playground/otelcol-rust` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | OTLP-to-Delta collector |
+| `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-rust` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | Direct Arrow Flight collector |
+| `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | DFE-native Arrow Flight collector |
+| `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-router-rust` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | Pingora Arrow Flight router |
+| `ghcr.io/mdrakiburrahman/rust-playground/hello-world` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | Retained sample runtime image |
+
+Local image qualification uses `:dev` and does not publish:
+
+```bash
+npx --no-install nx run otelcol-rust:image-smoke
+npx --no-install nx run arrowcol-rust:image-smoke
+npx --no-install nx run arrowcol-dataflow-rust:image-smoke
+npx --no-install nx run arrowcol-router-rust:image-smoke
+```
+
+No GHCR image is published merely by adding these targets, building locally,
+or changing documentation. This uncommitted workspace has not published an
+image. In the repository release path, publication begins only when
+`.github/workflows/publish-images.yml` runs on GitHub and verifies the pushed
+manifests.
 
 See [container publishing](docs/containers/publishing.md) for login,
 publication, visibility, and manifest verification. These documents describe

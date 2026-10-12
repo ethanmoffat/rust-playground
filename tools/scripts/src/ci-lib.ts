@@ -214,7 +214,7 @@ export function verifyDevcontainer(
 
 export function verifyHost(
   options: {
-    readonly task: string;
+    readonly task: string | readonly string[];
     readonly parallel?: number;
     readonly workspace: string;
     readonly dockerCache?: boolean;
@@ -228,7 +228,12 @@ export function verifyHost(
     args.push('--excludeTaskDependencies');
   }
   if (options.dockerCache) {
-    if (!options.task.endsWith(':image')) throw new Error('BuildKit caching requires an image task.');
+    if (
+      typeof options.task !== 'string' ||
+      !options.task.endsWith(':image')
+    ) {
+      throw new Error('BuildKit caching requires an image task.');
+    }
     args.push('--configuration=ci-verify');
   }
   runChecked(runner, 'npx', ['--no-install', 'nx', ...args], { cwd: options.workspace });
@@ -381,9 +386,18 @@ export function importIntegrationArtifacts(
   fileSystem.ensurePrivateDirectory(target);
   runChecked(runner, 'tar', [
     '--extract', '--file', path.join(options.workspace, '.temp', 'ci', 'reader.tar'),
-    '--directory', target, 'delta-inspect',
+    '--directory', target,
+    'delta-inspect',
+    'arrowcol-loadgen',
+    'arrowcol-sdk-gen',
   ]);
-  runChecked(runner, 'test', ['-x', path.join(target, 'delta-inspect')]);
+  for (const binary of [
+    'delta-inspect',
+    'arrowcol-loadgen',
+    'arrowcol-sdk-gen',
+  ]) {
+    runChecked(runner, 'test', ['-x', path.join(target, binary)]);
+  }
 }
 
 export function exportReader(
@@ -396,7 +410,10 @@ export function exportReader(
   runChecked(runner, 'docker', [
     'exec', '--user', 'vscode', '--workdir', containerWorkspace, containerId,
     'tar', '--create', '--file', '.temp/ci/reader.tar',
-    '--directory', 'target/debug', 'delta-inspect',
+    '--directory', 'target/debug',
+    'delta-inspect',
+    'arrowcol-loadgen',
+    'arrowcol-sdk-gen',
   ]);
 }
 

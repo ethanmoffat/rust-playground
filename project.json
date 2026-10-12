@@ -3,6 +3,17 @@
   "$schema": "./node_modules/nx/schemas/project-schema.json",
   "projectType": "library",
   "implicitDependencies": [
+    "arrowcol-buffer",
+    "arrowcol-receipts",
+    "arrowcol-catalog",
+    "arrowcol-protocol",
+    "arrowcol-flight",
+    "arrowcol-routing",
+    "arrowcol-dataflow-components",
+    "arrowcol-dataflow-rust",
+    "arrowcol-router-rust",
+    "arrowcol-rust",
+    "arrowcol-sdk-gen",
     "arrow-deltalake",
     "otel-deltalake-exporter",
     "otelcol-rust",
@@ -20,6 +31,17 @@
       "dependsOn": [
         {
           "projects": [
+            "arrowcol-buffer",
+            "arrowcol-receipts",
+            "arrowcol-catalog",
+            "arrowcol-protocol",
+            "arrowcol-flight",
+            "arrowcol-routing",
+            "arrowcol-dataflow-components",
+            "arrowcol-dataflow-rust",
+            "arrowcol-router-rust",
+            "arrowcol-rust",
+            "arrowcol-sdk-gen",
             "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
@@ -27,6 +49,7 @@
             "hello-world",
             "loadtest",
             "auth-automation",
+            "arrowcol-sdk-gen-tool",
             "rust-playground-build",
             "tools-scripts",
             "devcontainer"
@@ -49,6 +72,17 @@
       "dependsOn": [
         {
           "projects": [
+            "arrowcol-buffer",
+            "arrowcol-receipts",
+            "arrowcol-catalog",
+            "arrowcol-protocol",
+            "arrowcol-flight",
+            "arrowcol-routing",
+            "arrowcol-dataflow-components",
+            "arrowcol-dataflow-rust",
+            "arrowcol-router-rust",
+            "arrowcol-rust",
+            "arrowcol-sdk-gen",
             "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
@@ -72,6 +106,17 @@
       "dependsOn": [
         {
           "projects": [
+            "arrowcol-buffer",
+            "arrowcol-receipts",
+            "arrowcol-catalog",
+            "arrowcol-protocol",
+            "arrowcol-flight",
+            "arrowcol-routing",
+            "arrowcol-dataflow-components",
+            "arrowcol-dataflow-rust",
+            "arrowcol-router-rust",
+            "arrowcol-rust",
+            "arrowcol-sdk-gen",
             "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
@@ -95,6 +140,17 @@
       "dependsOn": [
         {
           "projects": [
+            "arrowcol-buffer",
+            "arrowcol-receipts",
+            "arrowcol-catalog",
+            "arrowcol-protocol",
+            "arrowcol-flight",
+            "arrowcol-routing",
+            "arrowcol-dataflow-components",
+            "arrowcol-dataflow-rust",
+            "arrowcol-router-rust",
+            "arrowcol-rust",
+            "arrowcol-sdk-gen",
             "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
@@ -118,6 +174,17 @@
       "dependsOn": [
         {
           "projects": [
+            "arrowcol-buffer",
+            "arrowcol-receipts",
+            "arrowcol-catalog",
+            "arrowcol-protocol",
+            "arrowcol-flight",
+            "arrowcol-routing",
+            "arrowcol-dataflow-components",
+            "arrowcol-dataflow-rust",
+            "arrowcol-router-rust",
+            "arrowcol-rust",
+            "arrowcol-sdk-gen",
             "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
@@ -127,7 +194,9 @@
           "target": "build"
         },
         {
-          "projects": ["loadtest"],
+          "projects": [
+            "loadtest"
+          ],
           "target": "reader-build"
         }
       ],
@@ -144,6 +213,17 @@
       "dependsOn": [
         {
           "projects": [
+            "arrowcol-buffer",
+            "arrowcol-receipts",
+            "arrowcol-catalog",
+            "arrowcol-protocol",
+            "arrowcol-flight",
+            "arrowcol-routing",
+            "arrowcol-dataflow-components",
+            "arrowcol-dataflow-rust",
+            "arrowcol-router-rust",
+            "arrowcol-rust",
+            "arrowcol-sdk-gen",
             "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
@@ -169,7 +249,10 @@
         "{workspaceRoot}/Cargo.lock",
         "{workspaceRoot}/crates/*/Cargo.toml",
         "{workspaceRoot}/bin/*/Cargo.toml",
+        "{workspaceRoot}/projects/arrowcol-dataflow-rust/Cargo.toml",
+        "{workspaceRoot}/projects/loadtest/loadgen/Cargo.toml",
         "{workspaceRoot}/projects/loadtest/reader/Cargo.toml",
+        "{workspaceRoot}/projects/arrowcol-rust/Cargo.toml",
         "{workspaceRoot}/projects/otelcol-rust/Cargo.toml",
         "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/**/Cargo.toml"
       ],
@@ -192,8 +275,14 @@
         "{workspaceRoot}/crates/*/src/**/*",
         "{workspaceRoot}/bin/*/Cargo.toml",
         "{workspaceRoot}/bin/*/src/**/*",
+        "{workspaceRoot}/projects/arrowcol-dataflow-rust/Cargo.toml",
+        "{workspaceRoot}/projects/arrowcol-dataflow-rust/src/**/*",
+        "{workspaceRoot}/projects/loadtest/loadgen/Cargo.toml",
+        "{workspaceRoot}/projects/loadtest/loadgen/src/**/*",
         "{workspaceRoot}/projects/loadtest/reader/Cargo.toml",
         "{workspaceRoot}/projects/loadtest/reader/src/**/*",
+        "{workspaceRoot}/projects/arrowcol-rust/Cargo.toml",
+        "{workspaceRoot}/projects/arrowcol-rust/src/**/*",
         "{workspaceRoot}/projects/otelcol-rust/Cargo.toml",
         "{workspaceRoot}/projects/otelcol-rust/src/**/*",
         "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/**/*.rs",

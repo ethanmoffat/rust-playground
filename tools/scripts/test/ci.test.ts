@@ -771,6 +771,25 @@ test('host shards use argv and do not report clean-tree success after a failed c
   failed.assertComplete();
 });
 
+test('host Node batches run every selected project target with one dependency graph', () => {
+  const runner = new FakeRunner([success(), success()]);
+  verifyHost({
+    task: ['scripts:typecheck', 'scripts:test'],
+    parallel: 4,
+    workspace: '/checkout',
+  }, runner);
+  assert.deepEqual(runner.calls[0]?.args, [
+    '--no-install',
+    'nx',
+    'run-many',
+    '--projects=scripts',
+    '--targets=typecheck,test',
+    '--parallel=4',
+    '--outputStyle=static',
+  ]);
+  runner.assertComplete();
+});
+
 test('CI image jobs use persistent scoped BuildKit caching without injecting credentials into argv', () => {
   const runner = new FakeRunner([success(), success()]);
   verifyHost({ task: 'otelcol-rust:image', dockerCache: true, workspace: '/checkout' }, runner);
@@ -1001,9 +1020,16 @@ function integrationFileSystem(id: string): FakeFileSystem {
   return fileSystem;
 }
 
-test('imports complete artifacts, checks image identities, and retains executable reader permissions', () => {
+test('imports complete artifacts, checks image identities, and retains executable integration binaries', () => {
   const id = `sha256:${'f'.repeat(64)}`;
-  const runner = new FakeRunner([success(), success(id), success(), success()]);
+  const runner = new FakeRunner([
+    success(),
+    success(id),
+    success(),
+    success(),
+    success(),
+    success(),
+  ]);
   const fileSystem = integrationFileSystem(id);
   importIntegrationArtifacts({
     images: ['ghcr.io/example/collector:dev'], workspace: '/checkout',
@@ -1011,22 +1037,53 @@ test('imports complete artifacts, checks image identities, and retains executabl
   assert.deepEqual(runner.calls[0]?.args, ['load', '--input', '/checkout/.temp/ci/images/collector.tar']);
   assert.deepEqual(runner.calls[2]?.args, [
     '--extract', '--file', '/checkout/.temp/ci/reader.tar',
-    '--directory', '/checkout/target/ci/build/debug', 'delta-inspect',
+    '--directory', '/checkout/target/ci/build/debug',
+    'delta-inspect',
+    'arrowcol-loadgen',
+    'arrowcol-sdk-gen',
   ]);
-  assert.equal(runner.calls[3]?.command, 'test');
-  assert.deepEqual(runner.calls[3]?.args, ['-x', '/checkout/target/ci/build/debug/delta-inspect']);
+  assert.deepEqual(
+    runner.calls.slice(3).map(({ args, command }) => ({
+      args,
+      command,
+    })),
+    [
+      {
+        args: ['-x', '/checkout/target/ci/build/debug/delta-inspect'],
+        command: 'test',
+      },
+      {
+        args: ['-x', '/checkout/target/ci/build/debug/arrowcol-loadgen'],
+        command: 'test',
+      },
+      {
+        args: ['-x', '/checkout/target/ci/build/debug/arrowcol-sdk-gen'],
+        command: 'test',
+      },
+    ],
+  );
   runner.assertComplete();
 });
 
 test('host E2E imports the same executable into the standard Nx reader path without a tooling container', () => {
   const id = `sha256:${'f'.repeat(64)}`;
-  const runner = new FakeRunner([success(), success(id), success(), success()]);
+  const runner = new FakeRunner([
+    success(),
+    success(id),
+    success(),
+    success(),
+    success(),
+    success(),
+  ]);
   importIntegrationArtifacts({
     images: ['ghcr.io/example/collector:dev'], workspace: '/checkout', host: true,
   }, runner, integrationFileSystem(id));
   assert.deepEqual(runner.calls[2]?.args, [
     '--extract', '--file', '/checkout/.temp/ci/reader.tar',
-    '--directory', '/checkout/target/debug', 'delta-inspect',
+    '--directory', '/checkout/target/debug',
+    'delta-inspect',
+    'arrowcol-loadgen',
+    'arrowcol-sdk-gen',
   ]);
   runner.assertComplete();
 });
@@ -1047,13 +1104,16 @@ test('integration artifacts fail on missing archives, wrong images, or mismatche
   mismatched.assertComplete();
 });
 
-test('reader export preserves executable permissions inside a tar archive', () => {
+test('integration binary export preserves executable permissions inside a tar archive', () => {
   const runner = new FakeRunner([success()]);
   const fileSystem = new FakeFileSystem();
   exportReader({ containerId: sourceContainerId, workspace: '/checkout' }, runner, fileSystem);
   assert.deepEqual(runner.calls[0]?.args, [
     'exec', '--user', 'vscode', '--workdir', '/workspaces/rust-playground', sourceContainerId,
-    'tar', '--create', '--file', '.temp/ci/reader.tar', '--directory', 'target/debug', 'delta-inspect',
+    'tar', '--create', '--file', '.temp/ci/reader.tar', '--directory', 'target/debug',
+    'delta-inspect',
+    'arrowcol-loadgen',
+    'arrowcol-sdk-gen',
   ]);
   runner.assertComplete();
 });

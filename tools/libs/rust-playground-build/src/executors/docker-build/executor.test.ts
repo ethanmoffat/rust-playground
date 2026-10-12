@@ -113,10 +113,14 @@ function baseOptions(
 }
 
 interface RuntimeProjectConfiguration {
+  readonly tags?: readonly string[];
   readonly targets: {
     readonly image: {
       readonly options: DockerBuildExecutorSchema;
       readonly configurations: Record<string, Partial<DockerBuildExecutorSchema>>;
+    };
+    readonly 'image-smoke'?: {
+      readonly dependsOn?: readonly string[];
     };
     readonly build: { readonly cache?: boolean };
     readonly publish: {
@@ -128,11 +132,17 @@ interface RuntimeProjectConfiguration {
   };
 }
 
-function readRuntimeProject(): RuntimeProjectConfiguration {
+function readRuntimeProject(
+  project = 'hello-world',
+): RuntimeProjectConfiguration {
+  const projectPath =
+    project === 'hello-world'
+      ? 'bin/hello-world'
+      : `projects/${project}`;
   return JSON.parse(
     readFileSync(
       new URL(
-        '../../../../../../bin/hello-world/project.json',
+        `../../../../../../${projectPath}/project.json`,
         import.meta.url,
       ),
       'utf8',
@@ -1016,10 +1026,77 @@ test('configures runtime publication namespaces, immutability, and uncached Carg
   );
   assert.deepEqual(
     helloWorldProject.targets.publish.configurations?.main?.tags,
-    ['sha-{gitSha}', 'latest'],
+    ['{gitBranchTag}', 'sha-{gitSha}', 'latest'],
   );
   assert.equal(helloWorldProject.targets.build.cache, false);
   assert.equal(greetingProject.targets.build.cache, false);
+});
+
+test('all production runtime projects expose cached image, smoke, and guarded publish targets', () => {
+  for (const project of [
+    'otelcol-rust',
+    'arrowcol-rust',
+    'arrowcol-dataflow-rust',
+    'arrowcol-router-rust',
+  ]) {
+    const configuration = readRuntimeProject(project);
+    assert.ok(
+      configuration.tags?.includes('type:runtime-image'),
+      project,
+    );
+    assert.deepEqual(
+      configuration.targets.image.options.platforms,
+      ['linux/amd64'],
+      project,
+    );
+    assert.equal(
+      configuration.targets.image.options.output,
+      'load',
+      project,
+    );
+    assert.ok(
+      configuration.targets.image.options.manifestFile?.endsWith(
+        `${project}-load.txt`,
+      ),
+      project,
+    );
+    assert.ok(
+      configuration.targets.image.configurations['ci-verify']
+        ?.cacheFrom?.length,
+      project,
+    );
+    assert.deepEqual(
+      configuration.targets['image-smoke']?.dependsOn,
+      ['image'],
+      project,
+    );
+    assert.equal(
+      configuration.targets.publish.options.output,
+      'push',
+      project,
+    );
+    assert.equal(
+      configuration.targets.publish.options.requireCleanWorktree,
+      true,
+      project,
+    );
+    assert.deepEqual(
+      configuration.targets.publish.options.immutableTags,
+      ['sha-{gitSha}'],
+      project,
+    );
+    assert.ok(
+      configuration.targets.publish.options.manifestFile?.endsWith(
+        `${project}-publish.txt`,
+      ),
+      project,
+    );
+    assert.deepEqual(
+      configuration.targets.publish.configurations?.main?.tags,
+      ['{gitBranchTag}', 'sha-{gitSha}', 'latest'],
+      project,
+    );
+  }
 });
 
 test('actual runtime publish target bounds very long branch tags without collisions', async () => {

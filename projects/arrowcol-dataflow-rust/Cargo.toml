@@ -1,0 +1,16 @@
+[package]
+name = "arrowcol-dataflow-rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DFE-based arbitrary Arrow Flight collector"
+
+[dependencies]
+arrowcol-dataflow-components = { path = "../../crates/arrowcol-dataflow-components" }
+otel-arrow-dfe = { path = "../../submodules/otel-arrow/rust/otap-dataflow", default-features = false, features = ["durable-buffer", "crypto-ring"] }
+
+[lints]
+workspace = true

@@ -1,5 +1,188 @@
 # loadtest
 
+This project contains two deliberately separate local validation paths:
+
+1. the existing three-signal OTEL demo/E2E; and
+2. a production many-table Arrow Flight benchmark for the direct and DFE
+   collectors behind the production router.
+
+## Production Arrow benchmark
+
+The benchmark registers the exact ordered, non-nullable schemas in
+[`schemas/sqlserver.sql`](schemas/sqlserver.sql) through the running Flight SQL
+DataFusion DDL subset. It then exports the catalog's immutable
+`manifest.json`, `schema.arrow`, and `descriptor.pb`, invokes
+`arrowcol-sdk-gen generate` plus `check`, and constructs load exclusively from
+the generated SDK manifest and Arrow schema descriptor. The client does not
+maintain a second hand-written Arrow schema.
+
+For run `<run-id>`, the host-side gitignored SDK workspace is:
+
+```text
+projects/loadtest/.temp/loadgen/<run-id>/artifacts/<table>/
+projects/loadtest/.temp/loadgen/<run-id>/generated/<table>/
+```
+
+Each generated table directory contains `sdk-manifest.json`, `descriptors/`,
+`rust/`, and `typescript/`. The run results retain the normalized public schema
+contract in `onelake/benchmark/<run-id>/results/schema-contracts.json`; the
+generated source packages remain disposable and are removed by
+`loadtest:clean`.
+
+The 13 public tables are:
+
+```text
+sqlserver_active_sessions
+sqlserver_availability_group_states
+sqlserver_availability_replica_states
+sqlserver_client_connections
+sqlserver_cpu_utilization
+sqlserver_database_properties
+sqlserver_database_replica_states
+sqlserver_database_storage_utilization
+sqlserver_memory_utilization
+sqlserver_performance_counters_common
+sqlserver_performance_counters_detailed
+sqlserver_storage_io
+sqlserver_wait_stats
+```
+
+Fields preserve their checked-in order, natural Arrow scalar type, UTC
+nanosecond timestamps, and required status. Synthetic values are deterministic:
+one seed-derived schema-valid row is repeated to the requested batch size,
+matching SQL integer widths, stable UUID text, timestamp offsets, booleans,
+floating-point counters, and string values. A single atomic scheduler rotates
+by seed and then round-robins globally across all tables, so every finite phase
+sends every table even when its requested duration is very short.
+
+### Run commands
+
+```bash
+# Finite direct, dataflow, then paired scenarios.
+npx --no-install nx run loadtest:benchmark -- \
+  --run-id bench-1 --warmup 2m --measure 5m
+
+# Live paired comparison; Ctrl+C stops load but retains the stack.
+npx --no-install nx run loadtest:run -- \
+  --run-id live --warmup 2m --continuous --keep-stack
+
+# Stop a retained stack by using its Compose project name shown at startup.
+npx --no-install tsx projects/loadtest/src/main.ts benchmark-down --run-id live
+```
+
+Supported benchmark flags are `--run-id`, `--warmup`, `--measure`,
+`--capture-settle`, `--drain-timeout`, `--request-timeout`, `--continuous`,
+`--keep-stack`, `--lanes`, `--batch-rows`, `--seed`, `--scenarios`, and
+`--otel-baseline`. Durations accept integer seconds, `30s`, `2m`, or `1h`.
+CLI values override `LOADTEST_*` environment values, which override built-in
+defaults. Continuous mode always selects only `paired` and ignores the measure
+duration. On Ctrl+C it drains direct receipts and retains the stack without
+scanning the entire accumulated Delta history. The finite benchmark, chaos, and
+`e2e` commands run the independent Delta validator; use those for bounded
+acceptance.
+
+Scenarios are explicit:
+
+| Scenario | Delivery |
+| --- | --- |
+| `direct` | Arrow to the durable direct pool; every receipt is polled until `published`, a known failure, uncertainty, or the bounded drain timeout. |
+| `dataflow` | Arrow to the DFE pool; the manifest records only honest `best_effort_admission`, never a receipt or at-least-once claim. |
+| `paired` | One encoded logical batch is sent concurrently to both pools with the same logical ID, rows, schema, and payload digest. |
+| `--otel-baseline` | Also starts the existing OTEL workload; its three-signal validation remains separate from arbitrary Arrow validation. |
+
+Retries retain the logical batch ID but create a new physical attempt. Direct
+collectors intentionally generate a distinct receipt for every byte-identical
+delivery. Validation therefore requires at least one published copy for a
+logical direct batch, not exactly one physical copy.
+
+### Compose topology
+
+The `benchmark` profile starts SQL Server, the official Hive Metastore, the
+production router, three direct collectors, three DFE collectors, the load
+driver, and the independent validator. Direct collectors share one host Delta
+root and DFE collectors share another; the two pools never share a root.
+Routing still assigns one fenced owner per pool/table. The validator requires
+all 13 tables, all six collectors to own traffic, no cross-table routes, and
+the DFE capability document to retain its durable-receipt gap.
+
+```text
+Flight SQL + generated SDK artifacts
+                  |
+             load driver
+                  |
+          production router
+             /          \
+  3 x direct pool      3 x DFE pool
+         |                   |
+ shared direct Delta   shared dataflow Delta
+             \          /
+       independent snapshots
+              validator
+```
+
+If `compose.observability.yaml` exists, the CLI automatically layers it over
+the base Compose file and starts its Prometheus, Grafana, Loki, Tempo, Alloy,
+cAdvisor, SQL exporter, JSON exporter, and blackbox exporter services in the
+same Compose project. The overlay retains `10.89.0.100` through
+`10.89.0.108`; the base services use the lower addresses in the same
+`10.89.0.0/24` network. `LOADTEST_RUN_ID` labels dashboards and scrapes.
+Applications may export traces to `http://tempo:4318` (override
+`LOADTEST_TRACES_ENDPOINT`). The base benchmark does not own the overlay's
+configuration files.
+
+For retained runs, open Grafana at `http://127.0.0.1:3000` and Prometheus at
+`http://127.0.0.1:9090`. Grafana keeps the arbitrary-Arrow comparison in the
+**Arrow Flight** folder and the optional OTEL collector in the separate
+**OTEL Collector Baseline** folder.
+
+Each run is retained under `onelake/benchmark/<run-id>/`:
+
+- `results/sent-batches.jsonl`: logical ID, table, schema, rows, Arrow bytes,
+  payload digest, lane, pool, attempt, receipt, and acknowledgement outcome;
+- `results/receipts.jsonl`: terminal direct receipt/publication evidence;
+- `results/schema-contracts.json`: ordered schemas loaded from generated SDK
+  artifacts;
+- `results/routing.json`: collector registrations and pool/table lease owners;
+- `results/capabilities.json`: direct versus DFE delivery claims;
+- `results/validation.json`: independent Delta versions, active files, sizes,
+  row counts/hashes, schema checks, parity, routing, and delivery results; and
+- Compose logs/PS diagnostics.
+
+The default finite run always removes its scoped Compose resources after
+capturing diagnostics. `--keep-stack` is the only option that retains them.
+
+### Production E2E
+
+```bash
+npx --no-install nx run loadtest:e2e
+```
+
+The target first runs the existing isolated OTEL three-signal acceptance, then
+runs a finite Arrow benchmark with small batches and its chaos qualification.
+The load driver first proves breaking-schema rejection before receipt,
+byte-identical deliveries receiving distinct published receipts, bounded
+in-flight backpressure, and honest DFE admission. The host harness then kills a
+direct owner, waits for lease expiry, resends identical logical batches,
+restarts it with a greater generation, pauses another owner through a lease
+transfer to prove stale fencing, gracefully drains/restarts direct and DFE
+collectors, and stops/restarts SQL Server to prove bounded failure and recovery.
+Final routing evidence requires all six collectors across the 13 tables.
+
+Run only that production qualification with:
+
+```bash
+npx --no-install nx run loadtest:chaos -- \
+  --run-id chaos-1 --warmup 0 --measure 3s --batch-rows 64
+```
+
+Both E2E paths retain diagnostics and stop their stacks unless `--keep-stack`
+is explicitly supplied. Focused Rust/TypeScript tests cover CLI precedence and
+duration bounds, exact schema fixtures, deterministic generation, global
+scheduling, manifests, Compose topology, snapshot validation, and bounded
+request/receipt timeouts.
+
+## Existing OTEL demo and validation
+
 Two Docker Compose services: the locally built Rust collector and the existing
 hello-world app emitting OTLP logs, metrics, and traces. No external backend or
 cloud credentials are needed. Nothing is exposed on host ports.
@@ -61,8 +244,9 @@ Delta table.
         schemas, row counts, sample rows / content assertions + PASS
 ```
 
-1. Edit the app or collector fork. Local edits enter the build without first
-   publishing a package; see [collector development](../otelcol-rust/README.md).
+1. Edit the app or collector submodule. Local edits enter the build without first
+   publishing a package; see
+   [collector development](../otelcol-rust/README.md#editing-the-submodule).
 2. `loadtest:up` builds both Dockerfiles and waits for collector readiness.
 3. `loadtest:logs` shows repeated `Hello, World!` greetings and collector
    listener startup. The app exports a log, counter datapoint, and span.

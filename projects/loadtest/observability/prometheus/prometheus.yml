@@ -1,0 +1,285 @@
+global:
+  scrape_interval: 2s
+  evaluation_interval: 2s
+  scrape_timeout: 1800ms
+  scrape_native_histograms: true
+  convert_classic_histograms_to_nhcb: true
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: [prometheus:9090]
+        labels:
+          implementation_pool: observability
+          instance: prometheus
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+
+  - job_name: arrow-router
+    static_configs:
+      - targets: [router:50050]
+        labels:
+          implementation_pool: router
+          instance: router
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+
+  - job_name: arrow-direct
+    static_configs:
+      - targets: [direct-1:8081]
+        labels:
+          implementation_pool: direct
+          instance: direct-1
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+      - targets: [direct-2:8081]
+        labels:
+          implementation_pool: direct
+          instance: direct-2
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+      - targets: [direct-3:8081]
+        labels:
+          implementation_pool: direct
+          instance: direct-3
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+
+  - job_name: arrow-dataflow
+    static_configs:
+      - targets: [dataflow-1:32011]
+        labels:
+          implementation_pool: dataflow
+          instance: dataflow-1
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+      - targets: [dataflow-2:32011]
+        labels:
+          implementation_pool: dataflow
+          instance: dataflow-2
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+      - targets: [dataflow-3:32011]
+        labels:
+          implementation_pool: dataflow
+          instance: dataflow-3
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+
+  - job_name: otel-baseline
+    metrics_path: /api/v1/metrics
+    static_configs:
+      - targets: [otelcol-rust:8080]
+        labels:
+          implementation_pool: otel
+          instance: otelcol-rust
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+
+  - job_name: arrow-sql-control-plane
+    honor_labels: true
+    static_configs:
+      - targets: [sql-exporter:9399]
+        labels:
+          implementation_pool: control-plane
+          instance: sql-exporter
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+
+  - job_name: dfe-capabilities
+    metrics_path: /probe
+    params:
+      module: [dfe_capabilities]
+    static_configs:
+      - targets: [http://dataflow-1:32011/v1/capabilities]
+        labels:
+          implementation_pool: dataflow
+          instance: dataflow-1
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+      - targets: [http://dataflow-2:32011/v1/capabilities]
+        labels:
+          implementation_pool: dataflow
+          instance: dataflow-2
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+      - targets: [http://dataflow-3:32011/v1/capabilities]
+        labels:
+          implementation_pool: dataflow
+          instance: dataflow-3
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - target_label: __address__
+        replacement: json-exporter:7979
+
+  - job_name: dfe-pressure
+    metrics_path: /probe
+    params:
+      module: [dfe_pressure]
+    static_configs:
+      - targets: [http://dataflow-1:32011/v1/pressure]
+        labels:
+          implementation_pool: dataflow
+          instance: dataflow-1
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+      - targets: [http://dataflow-2:32011/v1/pressure]
+        labels:
+          implementation_pool: dataflow
+          instance: dataflow-2
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+      - targets: [http://dataflow-3:32011/v1/pressure]
+        labels:
+          implementation_pool: dataflow
+          instance: dataflow-3
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - target_label: __address__
+        replacement: json-exporter:7979
+
+  - job_name: service-readiness
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets: [http://router:50050/readyz]
+        labels:
+          component: router
+          implementation_pool: router
+          instance: router
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+      - targets: [http://direct-1:8081/readyz]
+        labels:
+          component: direct-1
+          implementation_pool: direct
+          instance: direct-1
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+      - targets: [http://direct-2:8081/readyz]
+        labels:
+          component: direct-2
+          implementation_pool: direct
+          instance: direct-2
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+      - targets: [http://direct-3:8081/readyz]
+        labels:
+          component: direct-3
+          implementation_pool: direct
+          instance: direct-3
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+      - targets: [http://dataflow-1:32011/readyz]
+        labels:
+          component: dataflow-1
+          implementation_pool: dataflow
+          instance: dataflow-1
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+      - targets: [http://dataflow-2:32011/readyz]
+        labels:
+          component: dataflow-2
+          implementation_pool: dataflow
+          instance: dataflow-2
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+      - targets: [http://dataflow-3:32011/readyz]
+        labels:
+          component: dataflow-3
+          implementation_pool: dataflow
+          instance: dataflow-3
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: probe_target
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  - job_name: dependency-tcp
+    metrics_path: /probe
+    params:
+      module: [tcp_connect]
+    static_configs:
+      - targets: [sqlserver:1433]
+        labels:
+          component: sqlserver
+          implementation_pool: infrastructure
+          instance: sqlserver
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+      - targets: [hive-metastore:9083]
+        labels:
+          component: hive-metastore
+          implementation_pool: infrastructure
+          instance: hive-metastore
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: probe_target
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  - job_name: cadvisor
+    static_configs:
+      - targets: [cadvisor:8080]
+        labels:
+          implementation_pool: infrastructure
+          instance: cadvisor
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__
+    metric_relabel_configs:
+      - source_labels: [container_label_com_docker_compose_service]
+        regex: router
+        target_label: implementation_pool
+        replacement: router
+      - source_labels: [container_label_com_docker_compose_service]
+        regex: direct-[123]
+        target_label: implementation_pool
+        replacement: direct
+      - source_labels: [container_label_com_docker_compose_service]
+        regex: dataflow-[123]
+        target_label: implementation_pool
+        replacement: dataflow
+      - source_labels: [container_label_com_docker_compose_service]
+        regex: load-driver
+        target_label: implementation_pool
+        replacement: driver
+      - source_labels: [container_label_com_docker_compose_service]
+        regex: otelcol-rust
+        target_label: implementation_pool
+        replacement: otel
+      - source_labels: [container_label_com_docker_compose_service]
+        regex: (router|direct-[123]|dataflow-[123]|load-driver|sqlserver|hive-metastore|otelcol-rust)
+        target_label: instance
+        replacement: $1
+
+  - job_name: observability-stack
+    static_configs:
+      - targets:
+          - loki:3100
+          - tempo:3200
+          - alloy:12345
+          - json-exporter:7979
+          - blackbox-exporter:9115
+        labels:
+          implementation_pool: observability
+          instance: observability-stack
+          run_id: __RUN_ID__
+          scenario: __SCENARIO__

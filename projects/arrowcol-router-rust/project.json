@@ -1,0 +1,174 @@
+{
+  "name": "arrowcol-router-rust",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "projects/arrowcol-router-rust/src",
+  "implicitDependencies": [
+    "arrowcol-routing",
+    "arrowcol-receipts",
+    "arrowcol-protocol",
+    "arrowcol-infra"
+  ],
+  "namedInputs": {
+    "default": [
+      "{projectRoot}/**/*",
+      "!{projectRoot}/spike/target/**/*",
+      "{workspaceRoot}/Cargo.toml",
+      "{workspaceRoot}/Cargo.lock",
+      "{workspaceRoot}/rust-toolchain.toml",
+      "{workspaceRoot}/projects/arrowcol-infra/migrations/**/*"
+    ]
+  },
+  "targets": {
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/clean.ts projects/arrowcol-router-rust",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "format": {
+      "executor": "nx:run-commands",
+      "options": {"command": "cargo fmt --package arrowcol-router-rust"}
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "options": {"command": "cargo fmt --package arrowcol-router-rust -- --check"}
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {"command": "cargo clippy --locked --package arrowcol-router-rust --all-targets -- -D warnings"}
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {"command": "cargo build --locked --package arrowcol-router-rust"}
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {"command": "cargo test --locked --package arrowcol-router-rust"}
+    },
+    "doc": {
+      "executor": "nx:run-commands",
+      "options": {"command": "RUSTDOCFLAGS='-D warnings' cargo doc --locked --package arrowcol-router-rust --no-deps"}
+    },
+    "config-check": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build"],
+      "options": {
+        "command": "target/debug/arrowcol-router-rust --validate-and-exit --config projects/arrowcol-router-rust/config.yaml",
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "image": {
+      "executor": "rust-playground-build:docker-build",
+      "cache": false,
+      "inputs": [
+        "default",
+        "^default",
+        "{projectRoot}/Dockerfile",
+        "{workspaceRoot}/.dockerignore",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/rust-toolchain.toml",
+        "{workspaceRoot}/submodules/otel-arrow/**/*"
+      ],
+      "outputs": [
+        "{workspaceRoot}/target/images/arrowcol-router-rust-load.txt"
+      ],
+      "options": {
+        "file": "{absProjectRoot}/Dockerfile",
+        "context": "{absWorkspaceRoot}",
+        "image": "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-router-rust",
+        "tags": ["dev"],
+        "platforms": ["linux/amd64"],
+        "output": "load",
+        "manifestFile": "{absWorkspaceRoot}/target/images/arrowcol-router-rust-load.txt"
+      },
+      "configurations": {
+        "ci-verify": {
+          "cacheFrom": ["type=gha,version=2,scope={projectName}-image"],
+          "cacheTo": ["type=gha,version=2,scope={projectName}-image,mode=max"]
+        }
+      }
+    },
+    "image-smoke": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["image"],
+      "options": {
+        "command": "bash projects/arrowcol-router-rust/scripts/image-smoke.sh",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "publish": {
+      "executor": "rust-playground-build:docker-build",
+      "cache": false,
+      "inputs": [
+        "default",
+        "^default",
+        "{projectRoot}/Dockerfile",
+        "{workspaceRoot}/.dockerignore",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/rust-toolchain.toml",
+        "{workspaceRoot}/submodules/otel-arrow/**/*"
+      ],
+      "outputs": [
+        "{workspaceRoot}/target/images/arrowcol-router-rust-publish.txt"
+      ],
+      "options": {
+        "file": "{absProjectRoot}/Dockerfile",
+        "context": "{absWorkspaceRoot}",
+        "image": "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-router-rust",
+        "tags": ["{gitBranchTag}", "sha-{gitSha}"],
+        "immutableTags": ["sha-{gitSha}"],
+        "requireCleanWorktree": true,
+        "buildArgs": ["VCS_REF={gitSha}"],
+        "platforms": ["linux/amd64"],
+        "output": "push",
+        "manifestFile": "{absWorkspaceRoot}/target/images/arrowcol-router-rust-publish.txt"
+      },
+      "configurations": {
+        "main": {
+          "tags": ["{gitBranchTag}", "sha-{gitSha}", "latest"]
+        }
+      }
+    },
+    "pingora-integration": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo test --locked --package arrowcol-router-rust --test pingora_integration -- --ignored --nocapture --test-threads=1"
+      }
+    },
+    "rss-regression": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo run --locked --manifest-path projects/arrowcol-router-rust/spike/Cargo.toml --bin arrowcol-driver -- --profile quick",
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "live-integration": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "crates/arrowcol-routing/scripts/live-integration.sh",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["config-check", "format-check", "lint", "test", "doc"],
+      "options": {"commands": []}
+    }
+  },
+  "tags": ["scope:rust", "type:application", "type:runtime-image"]
+}

@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Quiver | ACK early. Deliver later.</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0b1220; color: #ecf3ff; font-family: system-ui, sans-serif; }
+    main { max-width: 1360px; margin: auto; padding: 38px 32px 26px; }
+    header { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 24px; }
+    .eyebrow { color: #76dccb; font-size: 11px; font-weight: 650; letter-spacing: 2px; margin-bottom: 10px; }
+    h1 { font-size: clamp(30px, 3.8vw, 46px); line-height: 1.15; letter-spacing: -1.5px; margin: 0 0 10px; }
+    header p { margin: 0; color: #b1bfd4; font-size: 16px; }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .setting { color: #b8c7dd; font-size: 12px; padding: 9px 13px; border: 1px solid #35465f; border-radius: 8px; white-space: nowrap; }
+    .canvas { overflow-x: auto; border: 1px solid #304159; border-radius: 18px; background: #101b2c; }
+    svg { display: block; width: 100%; min-width: 940px; }
+    svg text { font-family: system-ui, sans-serif; }
+    svg .label { fill: #edf4ff; font-size: 21px; font-weight: 700; text-anchor: middle; }
+    svg .small { fill: #b1bfd4; font-size: 14px; text-anchor: middle; }
+    svg .flow { font-size: 15px; font-weight: 600; text-anchor: middle; }
+    .note { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; padding: 18px 4px; font-size: 13px; color: #b1bfd4; }
+    .note strong { color: #80e2b6; }
+    .warning { color: #edc58b; }
+    footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; color: #859bb9; font-size: 11px; }
+    a { color: #9cb5d4; text-underline-offset: 3px; }
+    a:focus-visible, .canvas:focus-visible { outline: 3px solid #73d5f7; outline-offset: 4px; }
+    @media (max-width: 700px) {
+      main { padding: 24px 16px; }
+      header { align-items: start; flex-direction: column; gap: 14px; }
+      header p { font-size: 14px; }
+    }
+    @media print {
+      body { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+      main { padding: 10px; }
+      svg { min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <div class="eyebrow">QUIVER + DURABLE BUFFER</div>
+      <h1>ACK early. Deliver later.</h1>
+      <p>The client hands off retry ownership to the buffer.</p>
+    </div>
+    <code class="setting">wait_for_result: true</code>
+  </header>
+
+  <div class="canvas" tabindex="0" role="region" aria-label="Architecture diagram; scroll horizontally on small screens">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 665" role="img" aria-labelledby="diagram-title diagram-description">
+      <title id="diagram-title">Client acceptance and buffer-owned delivery</title>
+      <desc id="diagram-description">The client sends telemetry to a receiver, which ingests it into a durable buffer backed by Quiver WAL and segments. Ingest success returns an Ack to the receiver, then a successful wire response to the client. Ingest failure returns an error and the client retries. The buffer replays stored data through an exporter to a backend. Exporter Ack completes the bundle locally. A transient exporter Nack keeps the bundle for local retry, without another client response. A permanent Nack rejects the bundle.</desc>
+      <defs>
+        <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+          <circle cx="1" cy="1" r=".7" fill="#23354c"/>
+        </pattern>
+        <marker id="blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0 10 5 0 10Z" fill="#79d6fa"/>
+        </marker>
+        <marker id="green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0 10 5 0 10Z" fill="#80e2b6"/>
+        </marker>
+        <marker id="orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0 10 5 0 10Z" fill="#f3bd75"/>
+        </marker>
+        <marker id="red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0 10 5 0 10Z" fill="#fa959f"/>
+        </marker>
+        <symbol id="client-icon" viewBox="0 0 64 64">
+          <rect x="8" y="9" width="48" height="34" rx="5"/>
+          <path d="M24 55h16M32 43v12M21 21l-6 5 6 5M43 21l6 5-6 5M35 19l-6 14"/>
+        </symbol>
+        <symbol id="receiver-icon" viewBox="0 0 64 64">
+          <path d="M32 7v28m-10-10 10 10 10-10M13 31l-6 14v11h50V45l-6-14M7 45h16l4 6h10l4-6h16"/>
+        </symbol>
+        <symbol id="buffer-icon" viewBox="0 0 64 64">
+          <rect x="8" y="9" width="48" height="12" rx="4"/>
+          <rect x="8" y="26" width="48" height="12" rx="4"/>
+          <rect x="8" y="43" width="48" height="12" rx="4"/>
+          <path d="M17 15h2m-2 17h2m-2 17h2M29 15h17M29 32h17M29 49h17"/>
+        </symbol>
+        <symbol id="disk-icon" viewBox="0 0 64 64">
+          <ellipse cx="32" cy="13" rx="23" ry="8"/>
+          <path d="M9 13v36c0 11 46 11 46 0V13M9 31c0 11 46 11 46 0M9 45c0 11 46 11 46 0"/>
+        </symbol>
+        <symbol id="exporter-icon" viewBox="0 0 64 64">
+          <path d="M32 42V9m-11 11L32 9l11 11M14 32H8v23h48V32h-6M20 48h24"/>
+        </symbol>
+        <symbol id="cloud-icon" viewBox="0 0 64 64">
+          <path d="M17 48C1 48 1 27 16 26c-2-21 31-25 35-4 17 0 18 26 1 26ZM25 35l6 6 12-13"/>
+        </symbol>
+      </defs>
+
+      <rect width="1240" height="665" fill="url(#grid)"/>
+      <rect x="226" y="80" width="733" height="445" rx="22" fill="#122137" stroke="#354b67"/>
+      <text x="252" y="109" fill="#8ca5c7" font-size="11" font-weight="650" letter-spacing="2">SERVER / PIPELINE</text>
+
+      <!-- Ingest completion and its wire response are separate hops. -->
+      <path d="M591 216V162Q591 150 579 150H383Q370 150 370 163V242" fill="none" stroke="#80e2b6" stroke-width="3" marker-end="url(#green)"/>
+      <text x="481" y="136" class="flow" fill="#80e2b6">Ingest ACK</text>
+      <path d="M280 242V202Q280 190 268 190H124Q112 190 112 202V242" fill="none" stroke="#80e2b6" stroke-width="3" marker-end="url(#green)"/>
+      <text x="193" y="172" class="flow" fill="#80e2b6">OK / 200 / BatchStatus(0)</text>
+
+      <!-- Payload path. -->
+      <path d="M190 316H248" stroke="#79d6fa" stroke-width="3" marker-end="url(#blue)"/>
+      <path d="M404 316H461" stroke="#79d6fa" stroke-width="3" marker-end="url(#blue)"/>
+      <path d="M721 316H778" stroke="#79d6fa" stroke-width="3" marker-end="url(#blue)"/>
+      <path d="M934 316H992" stroke="#79d6fa" stroke-width="3" marker-end="url(#blue)"/>
+      <text x="218" y="296" class="flow" fill="#79d6fa" font-size="12">Send</text>
+      <text x="432" y="296" class="flow" fill="#79d6fa" font-size="12">Ingest</text>
+      <text x="748" y="296" class="flow" fill="#79d6fa" font-size="12">Replay</text>
+      <text x="962" y="296" class="flow" fill="#79d6fa" font-size="12">Export</text>
+
+      <!-- Architecture boxes with pictograms. -->
+      <rect x="34" y="244" width="156" height="152" rx="16" fill="#1b2d45" stroke="#567393"/>
+      <use href="#client-icon" x="82" y="263" width="60" height="60" fill="none" stroke="#b5d9ff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="112" y="353" class="label">Client</text>
+      <text x="112" y="376" class="small">SDK / producer</text>
+
+      <rect x="248" y="244" width="156" height="152" rx="16" fill="#1b2d45" stroke="#567393"/>
+      <use href="#receiver-icon" x="296" y="263" width="60" height="60" fill="none" stroke="#79d6fa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="326" y="353" class="label">Receiver</text>
+      <text x="326" y="376" class="small">Request / response</text>
+
+      <rect x="461" y="216" width="260" height="300" rx="19" fill="#173a35" stroke="#80e2b6" stroke-width="2"/>
+      <use href="#buffer-icon" x="562" y="238" width="58" height="58" fill="none" stroke="#80e2b6" stroke-width="2.5" stroke-linecap="round"/>
+      <text x="591" y="328" class="label">Durable buffer</text>
+      <text x="591" y="353" class="small">Owns delivery + retries</text>
+      <path d="M591 364v20" stroke="#bca8f7" stroke-width="2" marker-end="url(#blue)"/>
+      <rect x="484" y="390" width="214" height="104" rx="12" fill="#142a2c" stroke="#628b82"/>
+      <use href="#disk-icon" x="501" y="409" width="56" height="56" fill="none" stroke="#c5b6fb" stroke-width="2.5"/>
+      <text x="618" y="433" class="label" style="font-size:23px">Quiver</text>
+      <text x="618" y="458" class="small">WAL + segments</text>
+      <text x="618" y="479" class="small" style="font-size:12px">Embedded, per-core</text>
+
+      <rect x="778" y="244" width="156" height="152" rx="16" fill="#1b2d45" stroke="#567393"/>
+      <use href="#exporter-icon" x="826" y="263" width="60" height="60" fill="none" stroke="#79d6fa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="856" y="353" class="label">Exporter</text>
+      <text x="856" y="376" class="small">Backend delivery</text>
+
+      <rect x="992" y="244" width="190" height="152" rx="16" fill="#1b2d45" stroke="#567393"/>
+      <use href="#cloud-icon" x="1056" y="263" width="62" height="62" fill="none" stroke="#b5d9ff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="1087" y="353" class="label">Backend</text>
+      <text x="1087" y="376" class="small">Destination</text>
+      <path d="M1087 398v27q0 10-10 10H908q-10 0-10-10v-27" fill="none" stroke="#7b97ba" stroke-width="2" marker-end="url(#blue)"/>
+      <text x="1000" y="457" class="small">Delivery result</text>
+
+      <!-- An ingest error can still reach the waiting client. -->
+      <path d="M461 433H340q-14 0-14-14v-21" fill="none" stroke="#fa959f" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#red)"/>
+      <path d="M280 398v22q0 13-13 13H126q-14 0-14-14v-21" fill="none" stroke="#fa959f" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#red)"/>
+      <text x="397" y="456" class="flow" fill="#fa959f" style="font-size:13px">Ingest fails</text>
+      <text x="194" y="456" class="flow" fill="#fa959f" style="font-size:13px">ERROR: client retries</text>
+
+      <!-- Export completion terminates at the buffer, not the client. -->
+      <path d="M817 398v148q0 12-12 12H677q-12 0-12-12v-28" fill="none" stroke="#80e2b6" stroke-width="3" marker-end="url(#green)"/>
+      <rect x="677" y="545" width="126" height="25" rx="6" fill="#101b2c"/>
+      <text x="740" y="563" class="flow" fill="#80e2b6">ACK: complete</text>
+      <path d="M877 398v205q0 12-12 12H543q-12 0-12-12v-85" fill="none" stroke="#f3bd75" stroke-width="3" marker-end="url(#orange)"/>
+      <rect x="589" y="601" width="232" height="27" rx="6" fill="#101b2c"/>
+      <text x="705" y="620" class="flow" fill="#f3bd75">Transient NACK: keep + retry</text>
+      <text x="111" y="555" class="small">Client response is done.</text>
+      <text x="111" y="578" class="small">No later exporter response.</text>
+      <text x="1074" y="564" class="small" style="fill:#f3bd75">Permanent NACK?</text>
+      <text x="1074" y="587" class="small">Reject. No retry.</text>
+    </svg>
+  </div>
+
+  <div class="note">
+    <strong>Ingest ACK &ne; exporter ACK.</strong>
+    <span class="warning">Default WAL sync is policy-dependent &mdash; ACK is not a per-request fsync guarantee.</span>
+  </div>
+  <footer>
+    <span>Local source: a2b7fbb5 &middot; experimental &middot; October 11, 2026</span>
+    <span>
+      <a href="../../submodules/otel-arrow/rust/otap-dataflow/crates/core-nodes/src/processors/durable_buffer_processor/mod.rs">Buffer implementation</a>
+      &middot; <a href="../../submodules/otel-arrow/rust/otap-dataflow/crates/quiver/src/wal/writer.rs">WAL sync policy</a>
+      &middot; <a href="../../submodules/otel-arrow/rust/otap-dataflow/crates/otap/src/nack_status.rs">OTLP responses</a>
+    </span>
+  </footer>
+</main>
+</body>
+</html>

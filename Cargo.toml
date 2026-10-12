@@ -1,5 +1,14 @@
 [workspace]
-members = ["bin/*", "crates/*", "projects/loadtest/reader", "projects/otelcol-rust"]
+members = [
+    "bin/*",
+    "crates/*",
+    "projects/arrowcol-rust",
+    "projects/arrowcol-router-rust",
+    "projects/arrowcol-dataflow-rust",
+    "projects/loadtest/loadgen",
+    "projects/loadtest/reader",
+    "projects/otelcol-rust",
+]
 exclude = ["submodules/otel-arrow/rust/otap-dataflow", "submodules/otel-arrow/rust/otap-dataflow/**"]
 resolver = "2"
 

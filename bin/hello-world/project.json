@@ -231,6 +231,7 @@
       "configurations": {
         "main": {
           "tags": [
+            "{gitBranchTag}",
             "sha-{gitSha}",
             "latest"
           ]
@@ -243,6 +244,7 @@
   },
   "tags": [
     "scope:rust",
-    "type:application"
+    "type:application",
+    "type:runtime-image"
   ]
 }

@@ -1,0 +1,82 @@
+{
+  "name": "arrowcol-catalog",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "crates/arrowcol-catalog/src",
+  "namedInputs": {
+    "default": [
+      "{projectRoot}/**/*",
+      "{workspaceRoot}/Cargo.toml",
+      "{workspaceRoot}/Cargo.lock",
+      "{workspaceRoot}/rust-toolchain.toml"
+    ]
+  },
+  "targets": {
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/clean.ts crates/arrowcol-catalog",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "format": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo fmt --package arrowcol-catalog"
+      }
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo fmt --package arrowcol-catalog -- --check"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo clippy --locked --package arrowcol-catalog --all-targets -- -D warnings"
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo build --locked --package arrowcol-catalog"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo test --locked --package arrowcol-catalog"
+      }
+    },
+    "doc": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "RUSTDOCFLAGS='-D warnings' cargo doc --locked --package arrowcol-catalog --no-deps"
+      }
+    },
+    "live-integration": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "crates/arrowcol-catalog/scripts/live-integration.sh",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      },
+      "metadata": {
+        "description": "Start durable Arrowcol infrastructure, exercise SQL Server and Hive Metastore, then stop without deleting volumes."
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["format-check", "lint", "build", "test", "doc"],
+      "options": {
+        "commands": []
+      }
+    }
+  },
+  "tags": ["scope:rust", "type:library"]
+}

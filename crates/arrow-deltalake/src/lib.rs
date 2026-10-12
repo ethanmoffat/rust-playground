@@ -4,7 +4,7 @@
 //! logical types losslessly and uses Delta Kernel to create/evolve/commit tables.
 
 use anyhow::{Context, Result};
-use arrow::array::RecordBatch;
+use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use parquet::arrow::AsyncArrowWriter;
 use std::fs::{File, OpenOptions};
@@ -16,13 +16,44 @@ pub mod commit;
 pub mod delta;
 #[cfg(feature = "delta")]
 pub mod normalize;
+pub mod sizing;
+
+/// Stable size and row counters for one completed Parquet file.
+///
+/// `input_bytes` is the logical size of the Arrow slices accepted by the
+/// writer. Shared buffers are counted once per logical column reference, while
+/// unused buffer capacity and Rust object overhead are excluded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompletedFileObservation {
+    /// Rows accepted into the completed file.
+    pub rows: usize,
+    /// Logical bytes in caller-provided Arrow slices.
+    pub input_bytes: u64,
+    /// Bytes in the synchronized Parquet file.
+    pub parquet_bytes: u64,
+}
 
 /// A completed, durable Parquet file. It is not necessarily committed to Delta.
 #[derive(Debug)]
 pub struct CompletedFile {
     pub path: PathBuf,
     pub rows: usize,
+    /// Logical Arrow bytes accepted before Parquet encoding.
+    pub input_bytes: u64,
+    /// Durable Parquet bytes. Kept as `bytes` for API compatibility.
     pub bytes: u64,
+}
+
+impl CompletedFile {
+    /// Return path-independent counters suitable for metrics and adaptive sizing.
+    #[must_use]
+    pub const fn observation(&self) -> CompletedFileObservation {
+        CompletedFileObservation {
+            rows: self.rows,
+            input_bytes: self.input_bytes,
+            parquet_bytes: self.bytes,
+        }
+    }
 }
 
 /// Streaming Parquet file writer. Dropping it does not finish the file.
@@ -31,6 +62,7 @@ pub struct ParquetFileWriter {
     durable_handle: File,
     path: PathBuf,
     rows: usize,
+    input_bytes: u64,
 }
 
 impl ParquetFileWriter {
@@ -52,16 +84,40 @@ impl ParquetFileWriter {
             durable_handle,
             path,
             rows: 0,
+            input_bytes: 0,
         })
     }
 
     /// Append a batch without retaining it in memory.
     ///
     /// # Errors
-    /// Returns schema or file-write errors.
+    /// Returns byte-accounting, schema, or file-write errors.
     pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        let input_bytes = record_batch_logical_bytes(batch)?;
+        self.write_accounted(batch, batch.num_rows(), input_bytes).await
+    }
+
+    /// Rows accepted by successful writes to the current file.
+    #[must_use]
+    pub const fn rows_written(&self) -> usize {
+        self.rows
+    }
+
+    /// Logical Arrow bytes accepted by successful writes to the current file.
+    #[must_use]
+    pub const fn input_bytes_written(&self) -> u64 {
+        self.input_bytes
+    }
+
+    pub(crate) async fn write_accounted(&mut self, batch: &RecordBatch, rows: usize, input_bytes: u64) -> Result<()> {
+        let rows = self.rows.checked_add(rows).context("row count overflow")?;
+        let input_bytes = self
+            .input_bytes
+            .checked_add(input_bytes)
+            .context("input Arrow byte count overflow")?;
         self.writer.write(batch).await?;
-        self.rows = self.rows.checked_add(batch.num_rows()).context("row count overflow")?;
+        self.rows = rows;
+        self.input_bytes = input_bytes;
         Ok(())
     }
 
@@ -83,11 +139,34 @@ impl ParquetFileWriter {
         Ok(CompletedFile {
             path: self.path,
             rows: self.rows,
+            input_bytes: self.input_bytes,
             bytes,
         })
     }
 }
 
+/// Return the logical Arrow bytes represented by a record batch.
+///
+/// The measurement follows each logical column and nested child slice. Shared
+/// buffers therefore contribute once per logical reference, while unused
+/// allocation capacity and Rust object overhead do not contribute.
+///
+/// # Errors
+/// Returns Arrow layout or checked integer-conversion/addition errors.
+pub fn record_batch_logical_bytes(batch: &RecordBatch) -> Result<u64> {
+    batch.columns().iter().try_fold(0_u64, |total, column| {
+        let bytes = column
+            .to_data()
+            .get_slice_memory_size()
+            .context("measure logical Arrow input bytes")?;
+        let bytes = u64::try_from(bytes).context("logical Arrow input byte count exceeds u64")?;
+        total
+            .checked_add(bytes)
+            .context("logical Arrow input byte count overflow")
+    })
+}
+
+#[cfg(feature = "delta")]
 pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)
         .with_context(|| format!("open directory {}", path.display()))?

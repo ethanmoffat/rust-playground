@@ -1,6 +1,8 @@
 //! Local, append-only Delta tables backed exclusively by Delta Kernel.
 
-use crate::{CompletedFile, ParquetFileWriter, normalize, sync_directory};
+use crate::{
+    CompletedFile, CompletedFileObservation, ParquetFileWriter, normalize, record_batch_logical_bytes, sync_directory,
+};
 use anyhow::{Context, Result, bail};
 use arrow::array::{RecordBatch, StructArray};
 use arrow::datatypes::SchemaRef;
@@ -15,6 +17,8 @@ use delta_kernel_default_engine::parquet::DataFileMetadata;
 use delta_kernel_default_engine::stats::FileStatsAccumulator;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder, build_add_file_metadata};
 use fs2::FileExt;
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -26,6 +30,115 @@ type LocalEngine = DefaultEngine<TokioBackgroundExecutor>;
 // Older and renamed writers must contend for the same persisted lock.
 const WRITER_LOCK: &str = ".arrow-lake-writer.lock";
 
+/// Immutable details passed to a publication fence immediately before commit.
+#[derive(Clone, Copy, Debug)]
+pub struct PublicationFenceContext<'a> {
+    table_path: &'a Path,
+    read_version: u64,
+    proposed_version: u64,
+    file_count: usize,
+}
+
+impl PublicationFenceContext<'_> {
+    /// Canonical local table path.
+    #[must_use]
+    pub const fn table_path(&self) -> &Path {
+        self.table_path
+    }
+
+    /// Snapshot version used to build the pending append.
+    #[must_use]
+    pub const fn read_version(&self) -> u64 {
+        self.read_version
+    }
+
+    /// Version the pending append intends to publish.
+    #[must_use]
+    pub const fn proposed_version(&self) -> u64 {
+        self.proposed_version
+    }
+
+    /// Number of completed files in the pending append.
+    #[must_use]
+    pub const fn file_count(&self) -> usize {
+        self.file_count
+    }
+}
+
+/// Machine-readable category returned by a [`PublicationFence`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PublicationFenceErrorKind {
+    /// The caller no longer owns the table generation or lease.
+    StaleOwnership,
+    /// Ownership could not be checked, so publication must stop.
+    CheckFailed,
+}
+
+/// A structured rejection from a caller-provided publication fence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicationFenceError {
+    kind: PublicationFenceErrorKind,
+    message: String,
+}
+
+impl PublicationFenceError {
+    /// Reject publication because the expected table ownership is stale.
+    #[must_use]
+    pub fn stale(message: impl Into<String>) -> Self {
+        Self {
+            kind: PublicationFenceErrorKind::StaleOwnership,
+            message: message.into(),
+        }
+    }
+
+    /// Reject publication because the ownership check itself failed.
+    #[must_use]
+    pub fn check_failed(message: impl Into<String>) -> Self {
+        Self {
+            kind: PublicationFenceErrorKind::CheckFailed,
+            message: message.into(),
+        }
+    }
+
+    /// Return the machine-readable rejection category.
+    #[must_use]
+    pub const fn kind(&self) -> PublicationFenceErrorKind {
+        self.kind
+    }
+
+    /// Return caller-provided diagnostic detail.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl Display for PublicationFenceError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Delta publication fence rejected commit: {}", self.message)
+    }
+}
+
+impl Error for PublicationFenceError {}
+
+/// Synchronous, storage-agnostic ownership check at the Delta commit boundary.
+///
+/// Implementations should compare an expected lease/generation with caller-owned
+/// state and return promptly. The SDK does not retry a rejection.
+pub trait PublicationFence: Send + Sync + 'static {
+    /// Check ownership after the transaction is prepared and immediately before
+    /// its versioned Delta log commit.
+    ///
+    /// # Errors
+    /// Returns a stale-ownership or check-failure rejection. The SDK propagates
+    /// it without retrying the pending commit.
+    fn check_before_commit(
+        &self,
+        context: &PublicationFenceContext<'_>,
+    ) -> std::result::Result<(), PublicationFenceError>;
+}
+
 /// Local table ownership and Kernel engine. Hold one instance per table.
 pub struct DeltaTable {
     root: PathBuf,
@@ -33,6 +146,7 @@ pub struct DeltaTable {
     engine: LocalEngine,
     _lock: File,
     commit_lock: Mutex<()>,
+    publication_fence: Option<Arc<dyn PublicationFence>>,
 }
 
 struct DurableCommitter;
@@ -90,9 +204,22 @@ impl DeltaTable {
     /// # Errors
     /// Rejects another writer, invalid paths, and filesystem errors.
     pub fn open(root: impl AsRef<Path>) -> Result<Arc<Self>> {
-        Self::open_with_store(
+        Self::open_inner(
             root,
             Arc::new(delta_kernel::object_store::local::LocalFileSystem::new()),
+            None,
+        )
+    }
+
+    /// Acquire local writer ownership with a check immediately before each data commit.
+    ///
+    /// # Errors
+    /// Rejects another writer, invalid paths, and filesystem errors.
+    pub fn open_with_fence(root: impl AsRef<Path>, publication_fence: Arc<dyn PublicationFence>) -> Result<Arc<Self>> {
+        Self::open_inner(
+            root,
+            Arc::new(delta_kernel::object_store::local::LocalFileSystem::new()),
+            Some(publication_fence),
         )
     }
 
@@ -104,6 +231,26 @@ impl DeltaTable {
     pub fn open_with_store(
         root: impl AsRef<Path>,
         store: Arc<dyn delta_kernel::object_store::ObjectStore>,
+    ) -> Result<Arc<Self>> {
+        Self::open_inner(root, store, None)
+    }
+
+    /// Inject local-URL storage and a publication fence.
+    ///
+    /// # Errors
+    /// Returns local ownership and filesystem errors.
+    pub fn open_with_store_and_fence(
+        root: impl AsRef<Path>,
+        store: Arc<dyn delta_kernel::object_store::ObjectStore>,
+        publication_fence: Arc<dyn PublicationFence>,
+    ) -> Result<Arc<Self>> {
+        Self::open_inner(root, store, Some(publication_fence))
+    }
+
+    fn open_inner(
+        root: impl AsRef<Path>,
+        store: Arc<dyn delta_kernel::object_store::ObjectStore>,
+        publication_fence: Option<Arc<dyn PublicationFence>>,
     ) -> Result<Arc<Self>> {
         fs::create_dir_all(root.as_ref())?;
         let root = fs::canonicalize(root)?;
@@ -123,6 +270,7 @@ impl DeltaTable {
             engine,
             _lock: lock,
             commit_lock: Mutex::new(()),
+            publication_fence,
         }))
     }
 
@@ -224,6 +372,8 @@ impl DeltaTable {
             .lock()
             .map_err(|_| anyhow::anyhow!("Delta commit lock poisoned"))?;
         let snapshot = self.snapshot()?;
+        let read_version = snapshot.version();
+        let proposed_version = read_version.checked_add(1).context("Delta version overflow")?;
         let canonical: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
         let mut transaction = snapshot
             .transaction(Box::new(DurableCommitter), &self.engine)?
@@ -244,6 +394,16 @@ impl DeltaTable {
             )?;
             let metadata = DataFileMetadata::new(FileMeta::new(url, modified, append.file.bytes), append.stats.clone());
             transaction.add_files(build_add_file_metadata(metadata, &append.context)?);
+        }
+        if let Some(publication_fence) = &self.publication_fence {
+            publication_fence
+                .check_before_commit(&PublicationFenceContext {
+                    table_path: &self.root,
+                    read_version,
+                    proposed_version,
+                    file_count: files.len(),
+                })
+                .map_err(anyhow::Error::new)?;
         }
         let version = committed(transaction.commit(&self.engine)?)?;
         sync_directory(&self.root)?;
@@ -277,6 +437,14 @@ pub struct StagedAppend {
     stats: StructArray,
 }
 
+impl StagedAppend {
+    /// Return counters for the durable file awaiting Delta publication.
+    #[must_use]
+    pub const fn observation(&self) -> CompletedFileObservation {
+        self.file.observation()
+    }
+}
+
 impl DeltaFileWriter {
     /// Normalize and append a raw Arrow batch.
     ///
@@ -293,7 +461,20 @@ impl DeltaFileWriter {
         result
     }
 
+    /// Rows accepted by successful writes to the current file.
+    #[must_use]
+    pub const fn rows_written(&self) -> usize {
+        self.parquet.rows_written()
+    }
+
+    /// Logical bytes from caller-provided Arrow batches accepted by this file.
+    #[must_use]
+    pub const fn input_bytes_written(&self) -> u64 {
+        self.parquet.input_bytes_written()
+    }
+
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let input_bytes = record_batch_logical_bytes(batch)?;
         let normalized = normalize::align(&normalize::batch(batch)?, Arc::clone(&self.schema))?;
         let data = ArrowEngineData::new(normalized);
         let evaluator = self.table.engine.evaluation_handler().new_expression_evaluator(
@@ -303,7 +484,9 @@ impl DeltaFileWriter {
         )?;
         let physical = evaluator.evaluate(&data)?.try_into_record_batch()?;
         self.stats.merge(&physical)?;
-        self.parquet.write(&physical).await
+        self.parquet
+            .write_accounted(&physical, batch.num_rows(), input_bytes)
+            .await
     }
 
     /// Finalize and synchronize Parquet without publishing it.
@@ -360,6 +543,19 @@ impl DeltaTableWriter {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             table: DeltaTable::open(path)?,
+            current: None,
+            input: None,
+            failed: false,
+        })
+    }
+
+    /// Open a local table writer with a check before every data commit.
+    ///
+    /// # Errors
+    /// Returns local ownership and filesystem errors.
+    pub fn open_with_fence(path: impl AsRef<Path>, publication_fence: Arc<dyn PublicationFence>) -> Result<Self> {
+        Ok(Self {
+            table: DeltaTable::open_with_fence(path, publication_fence)?,
             current: None,
             input: None,
             failed: false,

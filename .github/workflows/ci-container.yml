@@ -79,7 +79,7 @@ jobs:
           pattern: ci-image-*
           path: .temp/ci/images
           merge-multiple: true
-      - name: Download the independent reader
+      - name: Download the independent integration binaries
         if: inputs.integration
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -114,12 +114,12 @@ jobs:
             target/ci/cargo/git
           key: ${{ steps.cargo-sources.outputs.cache-primary-key }}
 
-      - name: Export the reader with executable permissions
+      - name: Export integration binaries with executable permissions
         if: inputs.export-reader
         env:
           CONTAINER_ID: ${{ steps.devcontainer.outputs.container_id }}
         run: npx --no-install nx run tools-scripts:ci-export-reader
-      - name: Share the reader with E2E
+      - name: Share integration binaries with E2E
         if: inputs.export-reader
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

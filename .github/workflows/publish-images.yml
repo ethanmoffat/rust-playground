@@ -8,13 +8,20 @@ on:
       - .dockerignore
       - .github/workflows/publish-images.yml
       - bin/hello-world/**
-      - projects/loadtest/reader/**
+      - projects/otelcol-rust/**
+      - projects/arrowcol-rust/**
+      - projects/arrowcol-dataflow-rust/**
+      - projects/arrowcol-router-rust/**
+      - projects/arrowcol-infra/migrations/**
+      - submodules/otel-arrow
+      - submodules/otel-arrow/**
       - Cargo.lock
       - Cargo.toml
       - crates/**
       - nx.json
       - package-lock.json
       - package.json
+      - project.json
       - rust-toolchain.toml
       - rustfmt.toml
       - tools/libs/rust-playground-build/**
@@ -24,17 +31,50 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: publish-images-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  publish:
-    name: Publish hello-world image
+  plan:
+    name: Discover publishable runtime images
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install host CLI dependencies
+        run: npm ci
+
+      - name: Discover and validate the image matrix
+        id: plan
+        run: npx --no-install nx run tools-scripts:image-publish-plan
+
+  publish:
+    name: Publish ${{ matrix.project }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
 
     steps:
       - name: Check out repository
@@ -56,8 +96,26 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - name: Smoke-test runtime image
-        run: npx --no-install nx run hello-world:image-smoke
+      - name: Expose the GitHub cache service to Nx BuildKit
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            for (const name of ["ACTIONS_RUNTIME_TOKEN", "ACTIONS_RESULTS_URL"]) {
+              const value = process.env[name];
+              if (!value) throw new Error(`${name} is required for the BuildKit cache`);
+              if (name === "ACTIONS_RUNTIME_TOKEN") core.setSecret(value);
+              core.exportVariable(name, value);
+            }
+
+      - name: Build the source image with persistent BuildKit caching
+        env:
+          IMAGE_PROJECT: ${{ matrix.project }}
+        run: npx --no-install nx run "$IMAGE_PROJECT:image:ci-verify"
+
+      - name: Smoke-test the already loaded image
+        env:
+          IMAGE_PROJECT: ${{ matrix.project }}
+        run: npx --no-install nx run "$IMAGE_PROJECT:image-smoke" --excludeTaskDependencies
 
       - name: Log in to GHCR
         env:
@@ -66,39 +124,86 @@ jobs:
           REGISTRY_OWNER: ${{ github.repository_owner }}
         run: npx --no-install nx run tools-scripts:registry-login
 
-      - name: Publish SHA and latest tags
-        if: github.ref == 'refs/heads/main'
+      - name: Resolve branch and immutable tags
+        id: tags
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_PROJECT: ${{ matrix.project }}
           REGISTRY_BRANCH: ${{ github.ref_name }}
           REGISTRY_ENVIRONMENT: ci
-          REGISTRY_OWNER: ${{ github.repository_owner }}
           REGISTRY_SHA: ${{ github.sha }}
-        run: npx --no-install nx run hello-world:publish:main
+        run: |
+          npx --no-install tsx tools/scripts/src/registry.ts tags \
+            > "target/images/${IMAGE_PROJECT}-tags.json"
+          node --input-type=module -e '
+            import { appendFileSync, readFileSync } from "node:fs";
+            const tags = JSON.parse(readFileSync(process.argv[1], "utf8"));
+            appendFileSync(
+              process.env.GITHUB_OUTPUT,
+              `branch_tag=${tags.branchTag}\nsha_tag=${tags.shaTag}\n`,
+            );
+          ' "target/images/${IMAGE_PROJECT}-tags.json"
+
+      - name: Publish branch, SHA, and latest tags
+        if: github.ref == 'refs/heads/main'
+        env:
+          IMAGE_PROJECT: ${{ matrix.project }}
+          REGISTRY_BRANCH: ${{ github.ref_name }}
+          REGISTRY_SHA: ${{ github.sha }}
+        run: npx --no-install nx run "$IMAGE_PROJECT:publish:main"
 
       - name: Publish branch and SHA tags
         if: github.ref != 'refs/heads/main'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_PROJECT: ${{ matrix.project }}
           REGISTRY_BRANCH: ${{ github.ref_name }}
-          REGISTRY_ENVIRONMENT: ci
-          REGISTRY_OWNER: ${{ github.repository_owner }}
           REGISTRY_SHA: ${{ github.sha }}
-        run: npx --no-install nx run hello-world:publish
+        run: npx --no-install nx run "$IMAGE_PROJECT:publish"
+
+      - name: Verify the deterministic publication manifest
+        env:
+          IMAGE_PROJECT: ${{ matrix.project }}
+          IMAGE_REFERENCE: ${{ matrix.reference }}
+          MANIFEST_FILE: ${{ matrix.manifest }}
+        run: |
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const metadata = JSON.parse(
+              readFileSync(`target/images/${process.env.IMAGE_PROJECT}-tags.json`, "utf8"),
+            );
+            const expected = metadata.values.map(
+              (tag) => `${process.env.IMAGE_REFERENCE}:${tag}`,
+            );
+            const actual = readFileSync(process.env.MANIFEST_FILE, "utf8")
+              .trim()
+              .split("\n");
+            if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+              throw new Error(
+                `publication manifest mismatch: ${JSON.stringify({ actual, expected })}`,
+              );
+            }
+          '
 
       - name: Verify immutable SHA manifest
         env:
           REGISTRY_ENVIRONMENT: ci
-          REGISTRY_IMAGE: hello-world
+          REGISTRY_IMAGE: ${{ matrix.image }}
           REGISTRY_OWNER: ${{ github.repository_owner }}
-          REGISTRY_TAG: sha-${{ github.sha }}
+          REGISTRY_TAG: ${{ steps.tags.outputs.sha_tag }}
+        run: npx --no-install nx run tools-scripts:registry-manifest
+
+      - name: Verify branch manifest
+        env:
+          REGISTRY_ENVIRONMENT: ci
+          REGISTRY_IMAGE: ${{ matrix.image }}
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+          REGISTRY_TAG: ${{ steps.tags.outputs.branch_tag }}
         run: npx --no-install nx run tools-scripts:registry-manifest
 
       - name: Verify latest manifest
         if: github.ref == 'refs/heads/main'
         env:
           REGISTRY_ENVIRONMENT: ci
-          REGISTRY_IMAGE: hello-world
+          REGISTRY_IMAGE: ${{ matrix.image }}
           REGISTRY_OWNER: ${{ github.repository_owner }}
           REGISTRY_TAG: latest
         run: npx --no-install nx run tools-scripts:registry-manifest

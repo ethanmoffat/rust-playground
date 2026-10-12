@@ -85,8 +85,12 @@ export function createCiProgram(dependencies: CiCliDependencies): Command {
     .command('verify-host')
     .description('Verify one dependency-closed Nx shard on the host.')
     .action(() => {
+      const task = selectedTasks(dependencies.env);
+      if (task === undefined) {
+        throw new Error('CI_TASK or CI_TASKS must be set.');
+      }
       verifyHost({
-        task: requiredEnvironment('CI_TASK', dependencies.env),
+        task,
         workspace: workflowWorkspace(dependencies),
         dockerCache: integrationEnabled(dependencies.env.CI_DOCKER_CACHE, 'CI_DOCKER_CACHE'),
         integration: integrationEnabled(dependencies.env.CI_INTEGRATION),
@@ -123,7 +127,7 @@ export function createCiProgram(dependencies: CiCliDependencies): Command {
 
   program
     .command('export-reader')
-    .description('Export the independently built Delta reader, retaining executable permissions.')
+    .description('Export independently built integration binaries, retaining executable permissions.')
     .action(() => {
       exportReader({
         containerId: requiredEnvironment('CONTAINER_ID', dependencies.env),
@@ -133,7 +137,7 @@ export function createCiProgram(dependencies: CiCliDependencies): Command {
 
   program
     .command('import-integration')
-    .description('Load and validate the exact images and reader required by E2E.')
+    .description('Load and validate the exact images and binaries required by E2E.')
     .action(() => {
       importIntegrationArtifacts({
         images: imageReferences(dependencies.env.CI_IMAGE_REFS),

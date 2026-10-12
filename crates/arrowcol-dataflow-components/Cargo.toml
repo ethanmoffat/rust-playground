@@ -1,0 +1,54 @@
+[package]
+name = "arrowcol-dataflow-components"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Arrow Flight and generic Delta components for the Arrowcol DFE collector"
+readme = "README.md"
+
+[dependencies]
+anyhow.workspace = true
+arrow-array = { version = "58.3", default-features = false }
+arrow-schema = { version = "58.3", default-features = false }
+arrow-deltalake = { path = "../arrow-deltalake", features = ["delta"] }
+arrowcol-catalog = { path = "../arrowcol-catalog" }
+arrowcol-flight = { path = "../arrowcol-flight" }
+arrowcol-protocol = { path = "../arrowcol-protocol" }
+arrowcol-routing = { path = "../arrowcol-routing" }
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+futures = "0.3"
+humantime-serde = "1"
+linkme = "0.3"
+otel-arrow-dfe-config = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/config" }
+otel-arrow-dfe-channel = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/channel" }
+otel-arrow-dfe-engine = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/engine" }
+otel-arrow-dfe-otap = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/otap", default-features = false, features = ["crypto-ring"] }
+otel-arrow-dfe-pdata = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/pdata" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror.workspace = true
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = "0.7"
+tonic = "0.14"
+
+[dev-dependencies]
+arrow-flight = { version = "58.3", default-features = false, features = ["flight-sql"] }
+parquet = { version = "58.3", default-features = false, features = ["arrow"] }
+tempfile = "3"
+uuid = { version = "1", features = ["v5"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+clone_on_ref_ptr = "warn"
+expect_used = "warn"
+large_enum_variant = "warn"
+missing_errors_doc = "warn"
+unwrap_used = "warn"
