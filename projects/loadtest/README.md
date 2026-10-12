@@ -6,9 +6,9 @@ This project contains two deliberately separate local validation paths:
 2. a production many-table Arrow Flight benchmark for the direct and DFE
    collectors behind the production router.
 
-[![Arrow load generator architecture](../../docs/architecture/durability/arrow-load-generator.png)](../../docs/architecture/durability/arrow-load-generator.html)
+[![Arrow load generator architecture](../../docs/architecture/loadtest/arrow-load-generator.png)](../../docs/architecture/loadtest/arrow-load-generator.html)
 
-See the [load generator runbook](../../docs/architecture/load-generator.md) for
+See the [load generator runbook](../../docs/architecture/loadtest/README.md) for
 finite, continuous, focused-scenario, tuning, cleanup, and chaos commands.
 
 ## Production Arrow benchmark

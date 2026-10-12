@@ -1,6 +1,6 @@
 # Arrow load generator
 
-[![Arrow load generator architecture](durability/arrow-load-generator.png)](durability/arrow-load-generator.html)
+[![Arrow load generator architecture](arrow-load-generator.png)](arrow-load-generator.html)
 
 The load generator registers 13 table schemas through Flight SQL, exports the
 immutable catalog artifacts, generates Rust and TypeScript SDKs, and builds
@@ -180,4 +180,4 @@ fencing, greater-generation restart, graceful collector drain, bounded SQL
 outage, and SQL recovery.
 
 For implementation and fixture details, see
-[`projects/loadtest/README.md`](../../projects/loadtest/README.md).
+[`projects/loadtest/README.md`](../../../projects/loadtest/README.md).
