@@ -80,6 +80,15 @@ Open:
 
 - Grafana: `http://127.0.0.1:3000`
 - Prometheus: `http://127.0.0.1:9090`
+- SQL Server: `127.0.0.1,14333` (`sa` / password printed by the run;
+  `SQLSERVER_PORT` overrides the host port, mapped to container port `1433`;
+  `sqlserver-data` is mounted at `/var/opt/mssql`)
+- Portainer: `https://127.0.0.1:9444` (`admin` / SQL Server SA password, printed
+  by the run; `PORTAINER_PORT` overrides the port)
+
+Connect to SSMS via:
+
+![SSMS](assets/ssms.png)
 
 Grafana provisions separate **Arrow Flight** and **OTEL Collector Baseline**
 folders. Add `--otel-baseline` if you also want the OTEL workload and its

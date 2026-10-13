@@ -4,7 +4,17 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { prepareBenchmarkDirectory } from '../src/main.js';
+import { deltaTableLocations, prepareBenchmarkDirectory } from '../src/main.js';
+
+test('Delta table locations show aligned absolute workspace paths for the selected run', () => {
+  const directory = path.resolve('onelake/benchmark/custom-run');
+  assert.equal(deltaTableLocations('onelake/benchmark/custom-run'), [
+    'Delta tables on disk (workspace paths)',
+    '-------------------------------------',
+    `  Direct:   ${path.join(directory, 'direct')}`,
+    `  Dataflow: ${path.join(directory, 'dataflow')}`,
+  ].join('\n'));
+});
 
 function staleRun(): { root: string; directory: string } {
   const root = mkdtempSync(path.join(tmpdir(), 'arrowcol-run-directory-'));

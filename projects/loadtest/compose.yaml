@@ -12,6 +12,8 @@ services:
       MSSQL_SA_PASSWORD_FILE: /run/secrets/sqlserver_sa_password
     secrets:
       - sqlserver_sa_password
+    ports:
+      - "127.0.0.1:${SQLSERVER_PORT:-14333}:1433"
     volumes:
       - sqlserver-data:/var/opt/mssql
     healthcheck:
@@ -235,6 +237,29 @@ services:
     networks:
       default:
         ipv4_address: 10.89.0.105
+
+  # Docker UI (logs, stats, shells). tmpfs /data re-seeds the admin from the SA password on every start.
+  portainer:
+    profiles: ["benchmark"]
+    image: portainer/portainer-ce:2.45.2@sha256:03f94a406496dc84d37b552795fc424ccad8d0d7200353b6a82915f6e8f73ab0
+    command:
+      - --admin-password-file=/run/secrets/sqlserver_sa_password
+      - --host=unix:///var/run/docker.sock
+    secrets:
+      - sqlserver_sa_password
+    ports:
+      - "127.0.0.1:${PORTAINER_PORT:-9444}:9443"
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /data:size=128m,mode=0700
+    networks:
+      default:
+        ipv4_address: 10.89.0.106
 
   router:
     profiles: ["benchmark"]

@@ -414,6 +414,28 @@ function runLocalLoadgen(
   if (expectFailure) assert(failed, `${command} unexpectedly succeeded`);
 }
 
+export function portainerAccess(port: string, passwordFile: string): string {
+  // Portainer trims exactly one trailing newline from --admin-password-file.
+  const password = readFileSync(passwordFile, 'utf8').replace(/\n$/u, '');
+  return `Portainer: https://localhost:${port} (port ${port}, username admin, password ${password}; self-signed TLS)`;
+}
+
+export function sqlserverAccess(port: string, passwordFile: string): string {
+  const password = readFileSync(passwordFile, 'utf8').replace(/\n+$/u, '');
+  assert(password.length > 0 && !/[\r\n]/u.test(password), 'SQL Server password secret must be non-empty and single-line');
+  return `SQL Server: localhost,${port} (host port ${port} -> container port 1433, username sa, password ${password})`;
+}
+
+export function deltaTableLocations(directory: string): string {
+  const root = path.resolve(directory);
+  return [
+    'Delta tables on disk (workspace paths)',
+    '-------------------------------------',
+    `  Direct:   ${path.join(root, 'direct')}`,
+    `  Dataflow: ${path.join(root, 'dataflow')}`,
+  ].join('\n');
+}
+
 function benchmark(options: BenchmarkOptions): BenchmarkContext {
   step(`Load test: warmup ${options.warmupSeconds}s, concurrency ${options.concurrency}, batch rows ${options.batchRows}`);
   step('Bootstrapping secrets and preparing run directory');
@@ -441,7 +463,7 @@ function benchmark(options: BenchmarkOptions): BenchmarkContext {
   const env = benchmarkEnvironment(directory, options, network, stageHelperBinaries(options.runId));
   const services = [
     'sqlserver', 'database-bootstrap', 'arrowcol-migrate', 'hive-schema', 'hive-metastore',
-    'lgtm', 'cadvisor', 'direct-1', 'dataflow-1', 'router',
+    'lgtm', 'cadvisor', 'portainer', 'direct-1', 'dataflow-1', 'router',
   ];
   let workspaceConnection: { container?: string; network?: string } = {};
   let failure: unknown;
@@ -462,6 +484,15 @@ function benchmark(options: BenchmarkOptions): BenchmarkContext {
       `Grafana: http://localhost:${process.env.GRAFANA_PORT ?? 3000} (admin/admin); ` +
       `logs: docker compose --project-name ${project} logs -f`,
     );
+    step(portainerAccess(
+      process.env.PORTAINER_PORT ?? '9444',
+      path.join(workspace, 'projects/arrowcol-infra/secrets/sqlserver-sa-password.txt'),
+    ));
+    step(sqlserverAccess(
+      process.env.SQLSERVER_PORT ?? '14333',
+      path.join(workspace, 'projects/arrowcol-infra/secrets/sqlserver-sa-password.txt'),
+    ));
+    step(deltaTableLocations(directory));
     const context = { directory, env, network, options };
     step('Running load generator (Ctrl+C to stop; stack is kept)');
     runLocalLoadgen(context, 'run', path.join(directory, 'results'));
