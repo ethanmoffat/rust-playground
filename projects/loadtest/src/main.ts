@@ -405,7 +405,7 @@ function runLocalLoadgen(
       path.join(cargoTargetDirectory(), 'debug/arrowcol-loadgen'),
       [command],
       localLoadgenEnvironment(context, results, overrides),
-      900_000,
+      command === 'validate' ? 3_600_000 : context.options.measureSeconds === undefined ? undefined : (context.options.warmupSeconds + context.options.measureSeconds + 600) * 1000,
     );
   } catch (error) {
     failed = true;
