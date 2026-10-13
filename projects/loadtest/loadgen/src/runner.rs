@@ -524,10 +524,42 @@ async fn run_phase(
         });
     }
     drop(receipt_sender);
+    println!(
+        "[loadgen] {phase} ({}) started: concurrency={}, rows/batch={}",
+        scenario.as_str(),
+        arguments.lanes,
+        arguments.batch_rows
+    );
+    let progress = {
+        let scheduler = Arc::clone(&scheduler);
+        let phase = phase.to_owned();
+        let started = Instant::now();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                println!(
+                    "[loadgen] {phase} {:>4}s: {} batches sent",
+                    started.elapsed().as_secs(),
+                    scheduler.scheduled().saturating_sub(first_ordinal)
+                );
+            }
+        })
+    };
+    let mut outcome = Ok(());
     while let Some(result) = lanes.join_next().await {
-        result.context("load lane task failed")??;
+        if let Err(error) = result.context("load lane task failed").and_then(|inner| inner) {
+            outcome = Err(error);
+            break;
+        }
     }
-    Ok(())
+    progress.abort();
+    println!(
+        "[loadgen] {phase} finished: {} batches sent",
+        scheduler.scheduled().saturating_sub(first_ordinal)
+    );
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]

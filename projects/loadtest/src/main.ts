@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import {
   chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync,
 } from 'node:fs';
@@ -12,15 +12,20 @@ import { setTimeout as delay } from 'node:timers/promises';
 import {
   benchmarkUsage,
   parseBenchmarkOptions,
-  shouldRunIndependentValidation,
-  shouldStartRuntimeObservability,
   type BenchmarkOptions,
 } from './cli.js';
-import { commitSpansCores, parseInspection, signalsReady, validateSignals, type Inspection } from './validate.js';
 
 const workspace = realpathSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..'));
 const composeFile = path.join(workspace, 'projects/loadtest/compose.yaml');
 const observabilityComposeFile = path.join(workspace, 'projects/loadtest/compose.observability.yaml');
+
+const startedAt = Date.now();
+
+function step(message: string): void {
+  const elapsed = Math.round((Date.now() - startedAt) / 1000);
+  const stamp = `${String(Math.floor(elapsed / 60)).padStart(2, '0')}:${String(elapsed % 60).padStart(2, '0')}`;
+  console.log(`\n[loadtest +${stamp}] ${message}`);
+}
 
 function run(command: string, args: string[], env: NodeJS.ProcessEnv = process.env, timeout = 300_000): string {
   const result = spawnSync(command, args, { cwd: workspace, env, encoding: 'utf8', timeout, maxBuffer: 64 * 1024 * 1024 });
@@ -113,153 +118,6 @@ function runInteractive(
   }
 }
 
-function inspect(directory: string): Inspection {
-  const value: unknown = JSON.parse(run(path.join(workspace, 'target/debug/delta-inspect'), [directory]));
-  return parseInspection(value);
-}
-
-function report(inspection: Inspection): void {
-  console.log(`${inspection.files} committed Delta data files`);
-  for (const [table, rows] of Object.entries(inspection.tables)) {
-    console.log(`\n${table}: ${rows.length} rows, version ${inspection.versions[table]}`);
-    console.log(`Schema: ${JSON.stringify(inspection.schemas[table])}`);
-    console.log(JSON.stringify(rows.slice(0, 2), null, 2));
-  }
-}
-
-function tablesInitialized(directory: string): boolean {
-  const tables = readdirSync(directory, { withFileTypes: true }).filter((entry) => entry.isDirectory());
-  return tables.length > 0 && tables.every((table) =>
-    existsSync(path.join(directory, table.name, '_delta_log/00000000000000000000.json')));
-}
-
-async function waitForSignals(directory: string, runIds: string[], container: string): Promise<Inspection> {
-  const deadline = Date.now() + 90_000;
-  while (Date.now() < deadline) {
-    if (run('docker', ['inspect', '--format', '{{.State.Running}}', container]).trim() !== 'true') {
-      throw new Error('Collector exited before committing the expected signals');
-    }
-    if (tablesInitialized(directory)) {
-      const result = inspect(directory);
-      if (runIds.every((runId) => signalsReady(result, runId, 3))) {
-        for (const runId of runIds) validateSignals(result, runId, 3);
-        return result;
-      }
-    }
-    await delay(1000);
-  }
-  throw new Error(`Timed out waiting for committed Delta signals for ${runIds.join(', ')}`);
-}
-
-function crossCoreCommit(directory: string, inspection: Inspection): boolean {
-  const log = path.join(directory, 'logs/_delta_log');
-  for (const file of readdirSync(log).filter((name) => /^\d{20}\.json$/u.test(name))) {
-    const paths = readFileSync(path.join(log, file), 'utf8').trim().split('\n').flatMap((line) => {
-      const action: unknown = JSON.parse(line);
-      assert(typeof action === 'object' && action !== null && !Array.isArray(action), 'Invalid Delta action');
-      if (!('add' in action)) return [];
-      const add = action.add;
-      assert(typeof add === 'object' && add !== null && 'path' in add && typeof add.path === 'string', 'Invalid Delta add action');
-      return [add.path];
-    });
-    if (commitSpansCores(inspection, 'logs', paths)) return true;
-  }
-  return false;
-}
-
-function emit(project: string, env: NodeJS.ProcessEnv, runId: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('docker', ['compose', '--project-name', project, '--file', composeFile,
-      'run', '--rm', '--no-deps', 'hello-world', '--telemetry', '--count', '3', '--interval-ms', '100', '--run-id', runId],
-    { cwd: workspace, env, stdio: ['ignore', 'ignore', 'pipe'] });
-    let stderr = '';
-    child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr = `${stderr}${chunk}`.slice(-32_768); });
-    const timer = setTimeout(() => {
-      child.kill('SIGTERM');
-      reject(new Error(`Emitter timed out for ${runId}`));
-    }, 60_000);
-    child.once('error', (error) => { clearTimeout(timer); reject(error); });
-    child.once('exit', (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error(`Emitter ${runId} failed (${code}): ${stderr}`));
-    });
-  });
-}
-
-function stopCollector(project: string, env: NodeJS.ProcessEnv): void {
-  compose(project, env, ['stop', 'otelcol-rust']);
-  const container = compose(project, env, ['ps', '--all', '--quiet', 'otelcol-rust']).trim();
-  const exitCode = run('docker', ['inspect', '--format', '{{.State.ExitCode}}', container]).trim();
-  if (exitCode !== '0') {
-    throw new Error(`Collector shutdown failed with exit code ${exitCode}`);
-  }
-}
-
-async function otelE2e(): Promise<void> {
-  const runId = `e2e-${randomUUID()}`;
-  const directory = path.join(workspace, 'onelake/e2e', runId);
-  mkdirSync(directory, { recursive: true });
-  const env = { ...environment(directory), LOADTEST_CORES: '2' };
-  const project = `rust-playground-${runId}`;
-  console.log(`E2E output: ${path.relative(workspace, directory)}`);
-  let failure: unknown;
-  try {
-    compose(project, env, ['config', '--quiet']);
-    compose(project, env, ['up', '--detach', '--no-build', '--wait', '--wait-timeout', '90', 'otelcol-rust']);
-    const container = compose(project, env, ['ps', '--all', '--quiet', 'otelcol-rust']).trim();
-    const runIds: string[] = [];
-    let committed: Inspection | undefined;
-    for (let round = 0; round < 3; round++) {
-      const emitters = Array.from({ length: 4 }, (_, index) => `${runId}-${round}-${index}`);
-      runIds.push(...emitters);
-      await Promise.all(emitters.map((id) => emit(project, env, id)));
-      committed = await waitForSignals(directory, runIds, container);
-      if (crossCoreCommit(directory, committed)) break;
-    }
-    assert(committed && crossCoreCommit(directory, committed), 'No Delta commit batched files from different collector cores');
-    const shutdownId = `${runId}-shutdown`;
-    await emit(project, env, shutdownId);
-    assert(!signalsReady(inspect(directory), shutdownId, 3), 'Shutdown test had no unpublished telemetry');
-    stopCollector(project, env);
-    const first = inspect(directory);
-    runIds.push(shutdownId);
-    for (const id of runIds) validateSignals(first, id, 3);
-    const restartId = `${runId}-restart`;
-    compose(project, env, ['up', '--detach', '--no-build', '--wait', '--wait-timeout', '90', 'otelcol-rust']);
-    await emit(project, env, restartId);
-    stopCollector(project, env);
-    const result = inspect(directory);
-    writeFileSync(path.join(directory, 'inspection.json'), JSON.stringify(result, null, 2));
-    for (const id of runIds) validateSignals(result, id, 3);
-    validateSignals(result, restartId, 3);
-    for (const table of ['logs', 'spans', 'number_data_points']) {
-      if (result.versions[table] <= first.versions[table]) {
-        throw new Error(`Delta version did not advance after restart for ${table}`);
-      }
-    }
-    console.log(`PASS: multi-core batched commits, forced shutdown, restart, and three signals from ${result.files} committed Delta files`);
-  } catch (error) {
-    failure = error;
-  } finally {
-    try {
-      writeFileSync(path.join(directory, 'compose.log'), compose(project, env, ['logs', '--no-color']));
-    } catch (error) {
-      console.error(`Unable to capture Compose logs: ${String(error)}`);
-      failure ??= error;
-    }
-    try {
-      compose(project, env, ['down', '--remove-orphans']);
-    } catch (error) {
-      console.error(`Compose cleanup failed: ${String(error)}`);
-      failure ??= error;
-    }
-  }
-  if (failure) {
-    throw failure;
-  }
-}
-
 function benchmarkProject(runId: string): string {
   const safe = runId.toLowerCase().replace(/[^a-z0-9_-]+/gu, '-').replace(/^-+|-+$/gu, '');
   return `rust-playground-loadtest-${safe}`.slice(0, 63);
@@ -278,20 +136,13 @@ function archiveTimestamp(now: Date): string {
 export function prepareBenchmarkDirectory(
   benchmarkRoot: string,
   runId: string,
-  continuous: boolean,
   projectHasContainers: () => boolean,
   now = new Date(),
 ): { directory: string; archived?: string } {
   const directory = path.join(benchmarkRoot, runId);
   if (!existsSync(directory) || readdirSync(directory).length === 0) return { directory };
-  if (!continuous) {
-    throw new Error(`Benchmark run directory already contains data: ${path.relative(workspace, directory)}`);
-  }
   if (projectHasContainers()) {
-    throw new Error(
-      `Benchmark stack for run '${runId}' still exists. Stop it first with: ` +
-      `npx --no-install tsx projects/loadtest/src/main.ts benchmark-down --run-id ${runId}`,
-    );
+    throw new Error(`Benchmark stack for '${runId}' is still running; tear it down first`);
   }
   const archiveRoot = path.join(benchmarkRoot, 'archive');
   mkdirSync(archiveRoot, { recursive: true });
@@ -387,12 +238,12 @@ function benchmarkEnvironment(
     LOADTEST_CAPTURE_SETTLE: `${options.captureSettleSeconds}s`,
     LOADTEST_DRAIN_TIMEOUT: `${options.drainTimeoutSeconds}s`,
     LOADTEST_REQUEST_TIMEOUT: `${options.requestTimeoutSeconds}s`,
-    LOADTEST_CONTINUOUS: String(options.continuous),
-    LOADTEST_KEEP_STACK: String(options.keepStack),
-    LOADTEST_LANES: String(options.lanes),
+    LOADTEST_CONTINUOUS: 'true',
+    LOADTEST_KEEP_STACK: 'true',
+    LOADTEST_LANES: String(options.concurrency),
     LOADTEST_BATCH_ROWS: String(options.batchRows),
     LOADTEST_SEED: String(options.seed),
-    LOADTEST_SCENARIOS: options.scenarios.join(','),
+    LOADTEST_SCENARIOS: 'paired',
     LOADTEST_EDGE_HMAC_FILE: hostPath(secrets.edge),
     LOADTEST_INTERNAL_HMAC_FILE: hostPath(secrets.internal),
     LOADTEST_SCRATCH_HOST_PATH: hostPath(path.join(workspace, 'projects/loadtest/.temp')),
@@ -560,12 +411,13 @@ function runLocalLoadgen(
 }
 
 function benchmark(options: BenchmarkOptions): BenchmarkContext {
+  step(`Load test: warmup ${options.warmupSeconds}s, concurrency ${options.concurrency}, batch rows ${options.batchRows}`);
+  step('Bootstrapping secrets and preparing run directory');
   run(path.join(workspace, 'projects/arrowcol-infra/scripts/bootstrap-secrets.sh'), []);
   const project = benchmarkProject(options.runId);
   const prepared = prepareBenchmarkDirectory(
     path.join(workspace, 'onelake/benchmark'),
     options.runId,
-    options.continuous,
     () => benchmarkProjectHasContainers(project),
   );
   const directory = prepared.directory;
@@ -587,32 +439,41 @@ function benchmark(options: BenchmarkOptions): BenchmarkContext {
     'sqlserver', 'database-bootstrap', 'arrowcol-migrate', 'hive-schema', 'hive-metastore',
     'direct-1', 'direct-2', 'direct-3', 'dataflow-1', 'dataflow-2', 'dataflow-3', 'router',
   ];
-  if (existsSync(observabilityComposeFile) && shouldStartRuntimeObservability()) {
+  if (existsSync(observabilityComposeFile)) {
     services.push(
       'prometheus', 'grafana', 'loki', 'tempo', 'alloy', 'cadvisor',
       'sql-exporter', 'json-exporter', 'blackbox-exporter',
     );
   }
-  if (options.otelBaseline) services.push('otelcol-rust', 'hello-world');
   let workspaceConnection: { container?: string; network?: string } = {};
   let failure: unknown;
+  const resultsDirectory = path.relative(workspace, path.join(directory, 'results'));
   try {
+    step('Validating Compose configuration');
     compose(project, env, ['--profile', 'benchmark', 'config', '--quiet']);
-    compose(project, env, [
+    step('Building sqlserver and hive-metastore images (can take several minutes on first run)');
+    composeInteractive(project, env, [
       '--profile', 'benchmark', 'build', 'sqlserver', 'hive-metastore',
     ], 3_600_000);
-    compose(project, env, [
+    step(`Starting ${services.length} services and waiting for health (up to 10 minutes)`);
+    composeInteractive(project, env, [
       '--profile', 'benchmark', 'up', '--detach', '--no-build', '--wait', '--wait-timeout', '600', ...services,
     ], 3_600_000);
     workspaceConnection = connectWorkspaceContainer(project, env);
-    const context = { directory, env, network, options };
-    runLocalLoadgen(context, 'run', path.join(directory, 'results'));
-    if (shouldRunIndependentValidation(options)) {
-      composeInteractive(project, env, ['--profile', 'benchmark', 'run', '--rm', '--no-deps', 'validator'], 900_000);
+    if (services.includes('grafana')) {
+      step(
+        `Browse live dashboards: Grafana http://localhost:${process.env.GRAFANA_PORT ?? 3000} ` +
+        `(Prometheus http://localhost:${process.env.PROMETHEUS_PORT ?? 9090}); ` +
+        `follow logs: docker compose --project-name ${project} logs -f`,
+      );
     }
+    const context = { directory, env, network, options };
+    step('Running load generator (Ctrl+C to stop; stack is kept)');
+    runLocalLoadgen(context, 'run', path.join(directory, 'results'));
   } catch (error) {
     failure = error;
   } finally {
+    step('Capturing Compose logs and diagnostics');
     try {
       writeFileSync(path.join(directory, 'results/compose.log'),
         compose(project, env, ['--profile', 'benchmark', 'logs', '--no-color', '--timestamps']));
@@ -622,21 +483,12 @@ function benchmark(options: BenchmarkOptions): BenchmarkContext {
       console.error(`Unable to capture benchmark Compose diagnostics: ${String(error)}`);
       failure ??= error;
     }
-    if (!options.keepStack) {
-      disconnectWorkspaceContainer({
-        workspaceContainer: workspaceConnection.container,
-        networkName: workspaceConnection.network,
-      });
-      try {
-        compose(project, env, ['--profile', 'benchmark', 'down', '--volumes', '--remove-orphans'], 600_000);
-      } catch (error) {
-        console.error(`Benchmark Compose cleanup failed: ${String(error)}`);
-        failure ??= error;
-      }
-    }
   }
-  if (failure) throw failure;
-  console.log(`Benchmark results: ${path.relative(workspace, path.join(directory, 'results'))}`);
+  if (failure) {
+    step(`FAILED. Diagnostics: ${resultsDirectory}/compose.log`);
+    throw failure;
+  }
+  step(`Done. Results: ${resultsDirectory}. Stack kept; run again to replace it.`);
   return {
     directory,
     env,
@@ -648,373 +500,45 @@ function benchmark(options: BenchmarkOptions): BenchmarkContext {
   };
 }
 
-interface RoutingEvidence {
-  collectors: Array<{ instance_id: string; instance_key: string; implementation_pool: string }>;
-  leases: Array<{ implementation_pool: string; table: string; holder_instance_id: string }>;
-}
-
-function nestedDriver(
-  context: BenchmarkContext,
-  name: string,
-  extraEnvironment: Record<string, string>,
-  expectFailure = false,
-): void {
-  mkdirSync(path.join(context.directory, 'results', name), { recursive: true });
-  const environmentArguments = {
-    LOADTEST_WARMUP: '0s',
-    LOADTEST_MEASURE: '2s',
-    LOADTEST_CAPTURE_SETTLE: '0s',
-    LOADTEST_DRAIN_TIMEOUT: '60s',
-    LOADTEST_REQUEST_TIMEOUT: '10s',
-    LOADTEST_CONTINUOUS: 'false',
-    LOADTEST_LANES: '2',
-    LOADTEST_BATCH_ROWS: '64',
-    LOADTEST_SEED: String(context.options.seed),
-    LOADTEST_SCENARIOS: 'direct',
-    LOADTEST_SKIP_PROBES: 'true',
-    LOADTEST_REUSE_GENERATED: 'true',
-    LOADTEST_SKIP_CAPABILITIES: 'true',
-    LOADTEST_REQUIRE_ALL_COLLECTORS: 'false',
-    ...extraEnvironment,
-  };
-  runLocalLoadgen(
-    context,
-    'run',
-    path.join(context.directory, 'results', name),
-    environmentArguments,
-    expectFailure,
+function stopBenchmarkStack(options: BenchmarkOptions): void {
+  const directory = path.join(workspace, 'onelake/benchmark', options.runId);
+  const env = benchmarkEnvironment(
+    directory,
+    options,
+    readBenchmarkNetwork(directory),
+    stageHelperBinaries(options.runId),
   );
+  const project = benchmarkProject(options.runId);
+  const connection = connectWorkspaceContainer(project, env);
+  disconnectWorkspaceContainer({
+    workspaceContainer: connection.container,
+    networkName: connection.network,
+  });
+  compose(project, env, ['--profile', 'benchmark', 'kill'], 120_000);
+  compose(project, env, [
+    '--profile', 'benchmark', 'down', '--volumes', '--remove-orphans', '--timeout', '0',
+  ], 120_000);
 }
 
-function catalogEndpoint(context: BenchmarkContext, excludedService?: string): string {
-  for (let index = 0; index < context.network.direct.length; index++) {
-    const service = `direct-${index + 1}`;
-    if (service !== excludedService) return `http://${context.network.direct[index]}:50051`;
-  }
-
-  throw new Error('No healthy direct catalog endpoint is available');
-}
-
-function directAdminEndpoints(context: BenchmarkContext, excludedService?: string): string {
-  const endpoints = context.network.direct
-    .map((ip, index) => ({ endpoint: `http://${ip}:8081`, service: `direct-${index + 1}` }))
-    .filter(({ service }) => service !== excludedService)
-    .filter(({ service }) => {
-      const container = compose(context.project, context.env, [
-        '--profile', 'benchmark', 'ps', '--all', '--quiet', service,
-      ]).trim();
-      if (!container) return false;
-      const state = run('docker', [
-        'inspect', '--format', '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{end}}', container,
-      ]).trim();
-      return state === 'true healthy';
-    })
-    .map(({ endpoint }) => endpoint);
-  if (endpoints.length === 0) throw new Error('No healthy direct admin endpoint is available');
-  while (endpoints.length < 3) endpoints.push(endpoints[0]);
-  return endpoints.slice(0, 3).join(',');
-}
-
-function routingOwner(
-  directory: string,
-  excludedService?: string,
-): { instanceId: string; service: string; table: string } {
-  const routing = JSON.parse(readFileSync(path.join(directory, 'routing.json'), 'utf8')) as RoutingEvidence;
-  const collectors = new Map(routing.collectors.map((collector) => [collector.instance_id, collector]));
-  for (const lease of routing.leases) {
-    if (lease.implementation_pool !== 'direct') continue;
-    const collector = collectors.get(lease.holder_instance_id);
-    if (!collector?.instance_key.startsWith('loadtest-direct-')) continue;
-    const service = collector.instance_key.replace('loadtest-', '');
-    if (service !== excludedService) {
-      return { instanceId: lease.holder_instance_id, service, table: lease.table };
-    }
-  }
-
-  throw new Error('No eligible direct routing owner was found');
-}
-
-function forceRoutingExpiry(context: BenchmarkContext, holderInstanceId: string): void {
-  if (!/^[0-9a-f-]{36}$/iu.test(holderInstanceId)) throw new Error('Invalid routing holder UUID');
-  const sql = serviceContainer(context, 'sqlserver');
-  run('docker', [
-    'exec', sql, 'bash', '-lc',
-    `/usr/local/bin/sqlcmd-secret -b -S localhost -U sa -d arrowcol -Q "` +
-      `SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WARNINGS ON; ` +
-      `SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; ` +
-      `SET QUOTED_IDENTIFIER ON; SET NUMERIC_ROUNDABORT OFF; ` +
-      `UPDATE arrowcol.routing_collectors ` +
-      `SET state='failed', heartbeat_at_utc=DATEADD(second,-2,SYSUTCDATETIME()), ` +
-      `lease_expires_at_utc=DATEADD(second,-1,SYSUTCDATETIME()) ` +
-      `WHERE instance_id='${holderInstanceId}'; ` +
-      `UPDATE arrowcol.collector_instances ` +
-      `SET state='failed', heartbeat_at_utc=DATEADD(second,-2,SYSUTCDATETIME()), ` +
-      `lease_expires_at_utc=DATEADD(second,-1,SYSUTCDATETIME()), ` +
-      `stopped_at_utc=SYSUTCDATETIME() ` +
-      `WHERE instance_id='${holderInstanceId}' AND stopped_at_utc IS NULL; ` +
-      `DELETE FROM arrowcol.routing_table_leases ` +
-      `WHERE holder_instance_id='${holderInstanceId}'; ` +
-      `UPDATE arrowcol.table_leases ` +
-      `SET renewed_at_utc=DATEADD(second,-2,SYSUTCDATETIME()), ` +
-      `expires_at_utc=DATEADD(second,-1,SYSUTCDATETIME()) ` +
-      `WHERE holder_instance_id='${holderInstanceId}' AND released_at_utc IS NULL;"`,
-  ]);
-}
-
-function resetDirectLeases(context: BenchmarkContext): void {
-  const sql = serviceContainer(context, 'sqlserver');
-  run('docker', [
-    'exec', sql, 'bash', '-lc',
-    `/usr/local/bin/sqlcmd-secret -b -S localhost -U sa -d arrowcol -Q "` +
-      `SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WARNINGS ON; ` +
-      `SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; ` +
-      `SET QUOTED_IDENTIFIER ON; SET NUMERIC_ROUNDABORT OFF; ` +
-      `DELETE FROM arrowcol.routing_table_leases WHERE implementation_pool='direct'; ` +
-      `UPDATE arrowcol.table_leases ` +
-      `SET renewed_at_utc=DATEADD(second,-2,SYSUTCDATETIME()), ` +
-      `expires_at_utc=DATEADD(second,-1,SYSUTCDATETIME()) ` +
-      `WHERE released_at_utc IS NULL;"`,
-  ]);
-}
-
-function serviceContainer(context: BenchmarkContext, service: string): string {
-  const container = compose(context.project, context.env, [
-    '--profile', 'benchmark', 'ps', '--all', '--quiet', service,
-  ]).trim();
-  if (!container) throw new Error(`Compose service ${service} has no container`);
-  return container;
-}
-
-function recreateService(context: BenchmarkContext, service: string): void {
-  if (service.startsWith('direct-')) writeDirectConfig(context.directory, service, context.network);
-  compose(context.project, context.env, [
-    '--profile', 'benchmark', 'rm', '--stop', '--force', service,
-  ]);
-  compose(context.project, context.env, [
-    '--profile', 'benchmark', 'up', '--detach', '--no-deps', '--wait', '--wait-timeout', '180', service,
-  ], 300_000);
-}
-
-async function chaos(options: BenchmarkOptions): Promise<void> {
-  const context = benchmark({ ...options, keepStack: true, continuous: false });
-  const chaosEvidence: Record<string, unknown> = {};
-  let failure: unknown;
-  try {
-    const initialOwner = routingOwner(path.join(context.directory, 'results'), 'direct-1');
-    const killedContainer = serviceContainer(context, initialOwner.service);
-    run('docker', ['kill', '--signal', 'KILL', killedContainer]);
-    forceRoutingExpiry(context, initialOwner.instanceId);
-    writeRouterConfig(context.directory, 60_000);
-    recreateService(context, 'router');
-    nestedDriver(context, 'owner-kill-resend', {
-      LOADTEST_RUN_ID: options.runId,
-      LOADTEST_TABLES: initialOwner.table,
-      LOADTEST_CATALOG_ENDPOINT: catalogEndpoint(context, initialOwner.service),
-      LOADTEST_DIRECT_ADMIN_ENDPOINTS: directAdminEndpoints(context, initialOwner.service),
-      LOADTEST_MAX_ATTEMPTS: '16',
-    });
-    recreateService(context, initialOwner.service);
-    chaosEvidence.ownerKillLeaseExpiryResend = {
-      service: initialOwner.service,
-      table: initialOwner.table,
-      container: killedContainer,
-      passed: true,
-    };
-
-    const staleOwner = routingOwner(path.join(context.directory, 'results/owner-kill-resend'), 'direct-1');
-    const staleContainer = serviceContainer(context, staleOwner.service);
-    run('docker', ['pause', staleContainer]);
-    forceRoutingExpiry(context, staleOwner.instanceId);
-    recreateService(context, 'router');
-    nestedDriver(context, 'stale-fence-resend', {
-      LOADTEST_RUN_ID: options.runId,
-      LOADTEST_TABLES: staleOwner.table,
-      LOADTEST_CATALOG_ENDPOINT: catalogEndpoint(context, staleOwner.service),
-      LOADTEST_DIRECT_ADMIN_ENDPOINTS: directAdminEndpoints(context, staleOwner.service),
-      LOADTEST_MAX_ATTEMPTS: '16',
-    }, true);
-    run('docker', ['unpause', staleContainer]);
-    await delay(10_000);
-    const staleReady = spawnSync('docker', [
-      'exec', staleContainer, 'curl', '--fail', '--silent', 'http://127.0.0.1:8081/readyz',
-    ], { cwd: workspace, stdio: 'ignore' }).status === 0;
-    assert(!staleReady, 'stale direct owner remained ready after its lease was transferred');
-    recreateService(context, staleOwner.service);
-    const recoveryOwner = routingOwner(
-      path.join(context.directory, 'results/stale-fence-resend'),
-    );
-    const recoveryContainer = serviceContainer(context, recoveryOwner.service);
-    spawnSync('docker', ['kill', '--signal', 'KILL', recoveryContainer], {
-      cwd: workspace,
-      stdio: 'ignore',
-    });
-    forceRoutingExpiry(context, recoveryOwner.instanceId);
-    recreateService(context, 'router');
-    nestedDriver(context, 'stale-fence-recovery', {
-      LOADTEST_RUN_ID: options.runId,
-      LOADTEST_TABLES: staleOwner.table,
-      LOADTEST_DIRECT_ADMIN_ENDPOINTS: directAdminEndpoints(context, recoveryOwner.service),
-      LOADTEST_MAX_ATTEMPTS: '16',
-    });
-    recreateService(context, recoveryOwner.service);
-    chaosEvidence.staleFence = {
-      service: staleOwner.service,
-      table: staleOwner.table,
-      container: staleContainer,
-      passed: true,
-    };
-
-    for (const service of ['direct-3', 'dataflow-3']) {
-      compose(context.project, context.env, [
-        '--profile', 'benchmark', 'stop', '--timeout', '120', service,
-      ], 180_000);
-      const container = serviceContainer(context, service);
-      const exitCode = run('docker', ['inspect', '--format', '{{.State.ExitCode}}', container]).trim();
-      assert.equal(exitCode, '0', `${service} graceful drain exited ${exitCode}`);
-      recreateService(context, service);
-    }
-    chaosEvidence.gracefulDrainRestart = { services: ['direct-3', 'dataflow-3'], passed: true };
-
-    compose(context.project, context.env, ['--profile', 'benchmark', 'stop', '--timeout', '30', 'sqlserver'], 120_000);
-    nestedDriver(context, 'sql-outage', {
-      LOADTEST_RUN_ID: options.runId,
-      LOADTEST_TABLES: initialOwner.table,
-      LOADTEST_REQUEST_TIMEOUT: '5s',
-      LOADTEST_DRAIN_TIMEOUT: '10s',
-      LOADTEST_CATALOG_ENDPOINT: catalogEndpoint(context),
-    }, true);
-    compose(context.project, context.env, [
-      '--profile', 'benchmark', 'up', '--detach', '--no-deps', '--wait', '--wait-timeout', '180', 'sqlserver',
-    ], 300_000);
-    for (const service of ['direct-1', 'direct-2', 'direct-3']) recreateService(context, service);
-    resetDirectLeases(context);
-    recreateService(context, 'router');
-    compose(context.project, context.env, [
-      '--profile', 'benchmark', 'up', '--detach', '--no-deps', '--wait', '--wait-timeout', '180',
-      'dataflow-1', 'dataflow-2', 'dataflow-3',
-    ], 600_000);
-    nestedDriver(context, 'sql-recovery', {
-      LOADTEST_RUN_ID: options.runId,
-      LOADTEST_TABLES: initialOwner.table,
-      LOADTEST_CATALOG_ENDPOINT: catalogEndpoint(context),
-    });
-    chaosEvidence.sqlInterruptionRecovery = { boundedFailure: true, recovery: true };
-    runLocalLoadgen(
-      context,
-      'validate',
-      path.join(context.directory, 'results'),
-      { LOADTEST_DRAIN_TIMEOUT: '90s', LOADTEST_REQUIRE_ALL_COLLECTORS: 'true' },
-    );
-  } catch (error) {
-    failure = error;
-  } finally {
-    try {
-      writeFileSync(
-        path.join(context.directory, 'results/chaos.json'),
-        `${JSON.stringify({ passed: failure === undefined, ...chaosEvidence }, null, 2)}\n`,
-      );
-      writeFileSync(path.join(context.directory, 'results/compose-chaos.log'),
-        compose(context.project, context.env, ['--profile', 'benchmark', 'logs', '--no-color', '--timestamps']));
-    } catch (error) {
-      failure ??= error;
-    }
-    if (!options.keepStack) {
-      disconnectWorkspaceContainer(context);
-      try {
-        compose(context.project, context.env, [
-          '--profile', 'benchmark', 'down', '--volumes', '--remove-orphans',
-        ], 600_000);
-      } catch (error) {
-        failure ??= error;
-      }
-    }
-  }
-  if (failure) throw failure;
-}
-
-async function main(): Promise<void> {
-  const action = process.argv[2];
-  if (action === 'otel-e2e') {
-    await otelE2e();
+function main(): void {
+  const userArguments = process.argv.slice(2);
+  if (userArguments.some((argument) => argument === '--help' || argument === '-h')) {
+    console.log(benchmarkUsage);
     return;
   }
-  if (action === 'e2e') {
-    await otelE2e();
-    await chaos(parseBenchmarkOptions([
-      '--run-id', `e2e-arrow-${randomUUID()}`,
-      '--warmup', '0',
-      '--measure', '1s',
-      '--capture-settle', '0',
-      '--drain-timeout', '2m',
-      '--request-timeout', '30s',
-      '--lanes', '2',
-      '--batch-rows', '16',
-      '--scenarios', 'direct,dataflow,paired',
-    ]));
-    return;
+  const options = parseBenchmarkOptions(userArguments);
+  if (benchmarkProjectHasContainers(benchmarkProject(options.runId))) {
+    step('Tearing down previous stack');
+    stopBenchmarkStack(options);
   }
-  if (action === 'chaos') {
-    if (process.argv.slice(3).some((argument) => argument === '--help' || argument === '-h')) {
-      console.log(benchmarkUsage);
-      return;
-    }
-    await chaos(parseBenchmarkOptions(process.argv.slice(3)));
-    return;
-  }
-  if (action === 'benchmark' || action === 'run') {
-    if (process.argv.slice(3).some((argument) => argument === '--help' || argument === '-h')) {
-      console.log(benchmarkUsage);
-      return;
-    }
-    benchmark(parseBenchmarkOptions(process.argv.slice(3)));
-    return;
-  }
-  if (action === 'benchmark-down') {
-    const options = parseBenchmarkOptions(process.argv.slice(3));
-    const directory = path.join(workspace, 'onelake/benchmark', options.runId);
-    const env = benchmarkEnvironment(
-      directory,
-      options,
-      readBenchmarkNetwork(directory),
-      stageHelperBinaries(options.runId),
-    );
-    const project = benchmarkProject(options.runId);
-    const connection = connectWorkspaceContainer(project, env);
-    disconnectWorkspaceContainer({
-      workspaceContainer: connection.container,
-      networkName: connection.network,
-    });
-    console.log(compose(project, env, [
-      '--profile', 'benchmark', 'down', '--volumes', '--remove-orphans',
-    ], 600_000));
-    return;
-  }
-  const directory = path.join(workspace, 'onelake/demo');
-  mkdirSync(directory, { recursive: true });
-  if (action === 'inspect') {
-    report(inspect(process.env.ONELAKE_INSPECT_PATH ? path.resolve(process.env.ONELAKE_INSPECT_PATH) : directory));
-    return;
-  }
-  const env = environment(directory);
-  const project = 'rust-playground-loadtest';
-  switch (action) {
-    case 'up':
-      console.log(compose(project, env, ['up', '--detach', '--no-build', '--wait', '--wait-timeout', '90'], 1_800_000));
-      break;
-    case 'down':
-      console.log(compose(project, env, ['down', '--remove-orphans']));
-      break;
-    case 'logs':
-      console.log(compose(project, env, ['logs', '--no-color', '--tail', '100']));
-      break;
-    default:
-      throw new Error('Usage: loadtest <up|down|logs|inspect|otel-e2e|e2e|benchmark|run|chaos|benchmark-down>');
-  }
+  benchmark(options);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch((error: unknown) => {
+  try {
+    main();
+  } catch (error) {
     console.error(error);
     process.exitCode = 1;
-  });
+  }
 }
