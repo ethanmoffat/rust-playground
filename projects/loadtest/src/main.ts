@@ -17,7 +17,6 @@ import {
 
 const workspace = realpathSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..'));
 const composeFile = path.join(workspace, 'projects/loadtest/compose.yaml');
-const observabilityComposeFile = path.join(workspace, 'projects/loadtest/compose.observability.yaml');
 
 const startedAt = Date.now();
 
@@ -83,13 +82,11 @@ function environment(directory: string): NodeJS.ProcessEnv {
 
 function compose(project: string, env: NodeJS.ProcessEnv, args: string[], timeout = 300_000): string {
   const files = ['--file', composeFile];
-  if (existsSync(observabilityComposeFile)) files.push('--file', observabilityComposeFile);
   return run('docker', ['compose', '--project-name', project, ...files, ...args], env, timeout);
 }
 
 function composeInteractive(project: string, env: NodeJS.ProcessEnv, args: string[], timeout?: number): void {
   const files = ['--file', composeFile];
-  if (existsSync(observabilityComposeFile)) files.push('--file', observabilityComposeFile);
   const result = spawnSync('docker', ['compose', '--project-name', project, ...files, ...args], {
     cwd: workspace,
     env,
@@ -124,9 +121,9 @@ function benchmarkProject(runId: string): string {
 }
 
 function benchmarkProjectHasContainers(project: string): boolean {
-  return run('docker', [
-    'ps', '--all', '--quiet', '--filter', `label=com.docker.compose.project=${project}`,
-  ]).trim().length > 0;
+  const filter = `label=com.docker.compose.project=${project}`;
+  return run('docker', ['ps', '--all', '--quiet', '--filter', filter]).trim().length > 0
+    || run('docker', ['network', 'ls', '--quiet', '--filter', filter]).trim().length > 0;
 }
 
 function archiveTimestamp(now: Date): string {
@@ -197,8 +194,7 @@ function writeDirectConfig(directory: string, service: string, network: Benchmar
     throw new Error(`Invalid persisted direct collector generation for ${service}`);
   }
   const generation = previous + 1;
-  const address = network.direct[Number(service.split('-')[1]) - 1];
-  assert(address, `No network address is configured for ${service}`);
+  const address = network.direct;
   const template = readFileSync(path.join(workspace, 'projects/loadtest/config/direct.yaml.tmpl'), 'utf8');
   const config = template
     .replaceAll('__INSTANCE_KEY__', `loadtest-${service}`)
@@ -209,7 +205,7 @@ function writeDirectConfig(directory: string, service: string, network: Benchmar
 }
 
 function writeRuntimeConfigs(directory: string, network: BenchmarkNetwork): void {
-  for (const service of ['direct-1', 'direct-2', 'direct-3']) writeDirectConfig(directory, service, network);
+  writeDirectConfig(directory, 'direct-1', network);
   writeRouterConfig(directory, 500);
 }
 
@@ -234,11 +230,11 @@ function benchmarkEnvironment(
     ...environment(directory),
     LOADTEST_RUN_ID: options.runId,
     LOADTEST_WARMUP: `${options.warmupSeconds}s`,
-    LOADTEST_MEASURE: `${options.measureSeconds}s`,
+    ...(options.measureSeconds === undefined ? {} : { LOADTEST_MEASURE: `${options.measureSeconds}s` }),
     LOADTEST_CAPTURE_SETTLE: `${options.captureSettleSeconds}s`,
     LOADTEST_DRAIN_TIMEOUT: `${options.drainTimeoutSeconds}s`,
     LOADTEST_REQUEST_TIMEOUT: `${options.requestTimeoutSeconds}s`,
-    LOADTEST_CONTINUOUS: 'true',
+    LOADTEST_CONTINUOUS: String(options.measureSeconds === undefined),
     LOADTEST_KEEP_STACK: 'true',
     LOADTEST_LANES: String(options.concurrency),
     LOADTEST_BATCH_ROWS: String(options.batchRows),
@@ -252,12 +248,8 @@ function benchmarkEnvironment(
     LOADTEST_SQL_IP: network.sql,
     LOADTEST_HIVE_IP: network.hive,
     LOADTEST_ROUTER_IP: network.router,
-    LOADTEST_DIRECT_1_IP: network.direct[0],
-    LOADTEST_DIRECT_2_IP: network.direct[1],
-    LOADTEST_DIRECT_3_IP: network.direct[2],
-    LOADTEST_DATAFLOW_1_IP: network.dataflow[0],
-    LOADTEST_DATAFLOW_2_IP: network.dataflow[1],
-    LOADTEST_DATAFLOW_3_IP: network.dataflow[2],
+    LOADTEST_DIRECT_1_IP: network.direct,
+    LOADTEST_DATAFLOW_1_IP: network.dataflow,
     SQLSERVER_SA_PASSWORD_FILE: hostPath(path.join(infra, 'sqlserver-sa-password.txt')),
     ARROWCOL_APP_PASSWORD_FILE: hostPath(path.join(infra, 'arrowcol-app-password.txt')),
     ARROWCOL_MIGRATOR_PASSWORD_FILE: hostPath(path.join(infra, 'arrowcol-migrator-password.txt')),
@@ -280,8 +272,8 @@ interface BenchmarkNetwork {
   sql: string;
   hive: string;
   router: string;
-  direct: [string, string, string];
-  dataflow: [string, string, string];
+  direct: string;
+  dataflow: string;
 }
 
 function cidrRange(value: string): [number, number] | undefined {
@@ -317,8 +309,8 @@ function selectBenchmarkNetwork(_runId: string): BenchmarkNetwork {
     sql: '10.89.0.2',
     hive: '10.89.0.3',
     router: '10.89.0.10',
-    direct: ['10.89.0.21', '10.89.0.22', '10.89.0.23'],
-    dataflow: ['10.89.0.31', '10.89.0.32', '10.89.0.33'],
+    direct: '10.89.0.21',
+    dataflow: '10.89.0.31',
   };
 }
 
@@ -374,13 +366,13 @@ function localLoadgenEnvironment(
     LOADTEST_DIRECT_ROOT: path.join(context.directory, 'direct'),
     LOADTEST_DATAFLOW_ROOT: path.join(context.directory, 'dataflow'),
     LOADTEST_ROUTER_ENDPOINT: `http://${context.network.router}:50050`,
-    LOADTEST_CATALOG_ENDPOINT: `http://${context.network.direct[0]}:50051`,
+    LOADTEST_CATALOG_ENDPOINT: `http://${context.network.direct}:50051`,
     LOADTEST_RECEIPT_ENDPOINT: `http://${context.network.router}:50050`,
     LOADTEST_EDGE_SECRET_FILE: path.join(secrets, 'edge-hmac.txt'),
     LOADTEST_INTERNAL_SECRET_FILE: path.join(secrets, 'internal-hmac.txt'),
     LOADTEST_SCRATCH_ROOT: 'projects/loadtest/.temp/loadgen',
-    LOADTEST_DIRECT_ADMIN_ENDPOINTS: context.network.direct.map((ip) => `http://${ip}:8081`).join(','),
-    LOADTEST_DATAFLOW_ADMIN_ENDPOINTS: context.network.dataflow.map((ip) => `http://${ip}:32011`).join(','),
+    LOADTEST_DIRECT_ADMIN_ENDPOINTS: `http://${context.network.direct}:8081`,
+    LOADTEST_DATAFLOW_ADMIN_ENDPOINTS: `http://${context.network.dataflow}:32011`,
     ARROWCOL_SQL_HOST: context.network.sql,
     ARROWCOL_SQL_PASSWORD_FILE: path.join(infra, 'arrowcol-app-password.txt'),
     ARROWCOL_SDK_GEN: path.join(cargoTargetDirectory(), 'debug/arrowcol-sdk-gen'),
@@ -426,7 +418,7 @@ function benchmark(options: BenchmarkOptions): BenchmarkContext {
   }
   for (const child of [
     'direct', 'dataflow', 'otel', 'results', 'router-state',
-    'direct-state-1', 'direct-state-2', 'direct-state-3',
+    'direct-state-1',
   ]) {
     mkdirSync(path.join(directory, child), { recursive: true });
   }
@@ -437,14 +429,8 @@ function benchmark(options: BenchmarkOptions): BenchmarkContext {
   const env = benchmarkEnvironment(directory, options, network, stageHelperBinaries(options.runId));
   const services = [
     'sqlserver', 'database-bootstrap', 'arrowcol-migrate', 'hive-schema', 'hive-metastore',
-    'direct-1', 'direct-2', 'direct-3', 'dataflow-1', 'dataflow-2', 'dataflow-3', 'router',
+    'lgtm', 'cadvisor', 'direct-1', 'dataflow-1', 'router',
   ];
-  if (existsSync(observabilityComposeFile)) {
-    services.push(
-      'prometheus', 'grafana', 'loki', 'tempo', 'alloy', 'cadvisor',
-      'sql-exporter', 'json-exporter', 'blackbox-exporter',
-    );
-  }
   let workspaceConnection: { container?: string; network?: string } = {};
   let failure: unknown;
   const resultsDirectory = path.relative(workspace, path.join(directory, 'results'));
@@ -460,16 +446,17 @@ function benchmark(options: BenchmarkOptions): BenchmarkContext {
       '--profile', 'benchmark', 'up', '--detach', '--no-build', '--wait', '--wait-timeout', '600', ...services,
     ], 3_600_000);
     workspaceConnection = connectWorkspaceContainer(project, env);
-    if (services.includes('grafana')) {
-      step(
-        `Browse live dashboards: Grafana http://localhost:${process.env.GRAFANA_PORT ?? 3000} ` +
-        `(Prometheus http://localhost:${process.env.PROMETHEUS_PORT ?? 9090}); ` +
-        `follow logs: docker compose --project-name ${project} logs -f`,
-      );
-    }
+    step(
+      `Grafana: http://localhost:${process.env.GRAFANA_PORT ?? 3000} (admin/admin); ` +
+      `logs: docker compose --project-name ${project} logs -f`,
+    );
     const context = { directory, env, network, options };
     step('Running load generator (Ctrl+C to stop; stack is kept)');
     runLocalLoadgen(context, 'run', path.join(directory, 'results'));
+    if (options.validate) {
+      step('Validating Delta output');
+      runLocalLoadgen(context, 'validate', path.join(directory, 'results'));
+    }
   } catch (error) {
     failure = error;
   } finally {
@@ -502,6 +489,20 @@ function benchmark(options: BenchmarkOptions): BenchmarkContext {
 
 function stopBenchmarkStack(options: BenchmarkOptions): void {
   const directory = path.join(workspace, 'onelake/benchmark', options.runId);
+  if (!existsSync(path.join(directory, 'router-state/network.json'))) {
+    const filter = `label=com.docker.compose.project=${benchmarkProject(options.runId)}`;
+    for (const [kind, rm] of [['container', ['rm', '-f']], ['network', ['rm']], ['volume', ['rm', '-f']]] as const) {
+      const ids = run('docker', [kind, 'ls', ...(kind === 'container' ? ['--all'] : []), '--quiet', '--filter', filter]).trim();
+      if (kind === 'network') {
+        for (const id of ids.split('\n').filter(Boolean)) {
+          const attached = run('docker', ['network', 'inspect', '--format', '{{range $key, $_ := .Containers}}{{$key}} {{end}}', id]);
+          for (const name of attached.split(/\s+/u).filter(Boolean)) run('docker', ['network', 'disconnect', '--force', id, name]);
+        }
+      }
+      if (ids) run('docker', [kind, ...rm, ...ids.split('\n')]);
+    }
+    return;
+  }
   const env = benchmarkEnvironment(
     directory,
     options,
@@ -509,12 +510,20 @@ function stopBenchmarkStack(options: BenchmarkOptions): void {
     stageHelperBinaries(options.runId),
   );
   const project = benchmarkProject(options.runId);
-  const connection = connectWorkspaceContainer(project, env);
-  disconnectWorkspaceContainer({
-    workspaceContainer: connection.container,
-    networkName: connection.network,
-  });
-  compose(project, env, ['--profile', 'benchmark', 'kill'], 120_000);
+  try {
+    const connection = connectWorkspaceContainer(project, env);
+    disconnectWorkspaceContainer({
+      workspaceContainer: connection.container,
+      networkName: connection.network,
+    });
+  } catch {
+    // Half-created stack: nothing to detach.
+  }
+  try {
+    compose(project, env, ['--profile', 'benchmark', 'kill'], 120_000);
+  } catch {
+    // Nothing running.
+  }
   compose(project, env, [
     '--profile', 'benchmark', 'down', '--volumes', '--remove-orphans', '--timeout', '0',
   ], 120_000);

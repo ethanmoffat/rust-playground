@@ -30,7 +30,7 @@ routing:
   hard_pressure_bps: 10000
   warmup_ms: 1
   minimum_warmup_bps: 9500
-  lease_ttl_ms: 300000
+  lease_ttl_ms: 86400000
   readiness_max_staleness_ms: 30000
 
 auth:

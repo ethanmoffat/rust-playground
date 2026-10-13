@@ -192,6 +192,7 @@ async fn production_delta_sink_is_visible_to_a_parquet_reader() -> Result<()> {
             max_pending_files: 4,
         },
         Arc::clone(&leases),
+        arrowcol_rust::metrics::CollectorMetrics::new()?,
     );
     let mut session = sink
         .begin(PublicationContext {
@@ -294,6 +295,7 @@ async fn lost_ownership_fences_delta_before_visibility() -> Result<()> {
             max_pending_files: 4,
         },
         Arc::clone(&leases),
+        arrowcol_rust::metrics::CollectorMetrics::new()?,
     );
     let mut session = sink
         .begin(PublicationContext {

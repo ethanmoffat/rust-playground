@@ -474,8 +474,8 @@ fn validate_routing(
             .filter(|collector| &collector.implementation_pool == pool)
             .collect::<Vec<_>>();
         check(
-            pool_collectors.len() == 3,
-            &format!("{pool} did not register exactly three collectors"),
+            !pool_collectors.is_empty(),
+            &format!("{pool} did not register a collector"),
             failures,
         );
         let leases = routing
@@ -506,8 +506,8 @@ fn validate_routing(
         }
         if require_all_collectors {
             check(
-                holders.len() == 3,
-                &format!("{pool} table distribution did not use all three collectors"),
+                holders.len() == pool_collectors.len(),
+                &format!("{pool} table distribution did not use every collector"),
                 failures,
             );
         }
@@ -534,10 +534,10 @@ fn validate_capabilities(capabilities: &Value, failures: &mut Vec<String>) {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    check(direct.len() == 3, "direct capability evidence is incomplete", failures);
+    check(!direct.is_empty(), "direct capability evidence is missing", failures);
     check(
-        dataflow.len() == 3,
-        "dataflow capability evidence is incomplete",
+        !dataflow.is_empty(),
+        "dataflow capability evidence is missing",
         failures,
     );
     for entry in direct {

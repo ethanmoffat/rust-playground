@@ -22,7 +22,6 @@ DOCUMENTS = [
     ROOT / "projects/arrowcol-router-rust/README.md",
     ROOT / "projects/arrowcol-dataflow-rust/README.md",
     ROOT / "projects/loadtest/README.md",
-    ROOT / "projects/loadtest/observability/README.md",
     ROOT / "projects/otelcol-rust/README.md",
     ROOT / "crates/arrow-deltalake/README.md",
     ROOT / "crates/arrowcol-buffer/README.md",

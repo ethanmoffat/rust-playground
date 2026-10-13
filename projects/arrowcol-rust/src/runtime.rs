@@ -135,6 +135,7 @@ pub async fn run(config: CollectorConfig) -> Result<RunOutcome> {
         config.delta.root.clone(),
         config.delta.commit_options()?,
         Arc::clone(&leases),
+        metrics.clone(),
     ));
     let buffer = BufferManager::new(config.buffer.buffer_config()?, Arc::clone(&receipt_store), sink)?;
     let status = Arc::new(CollectorStatus::new(

@@ -338,6 +338,7 @@ impl LiveStack {
                 max_pending_files: 32,
             },
             Arc::clone(&leases),
+            arrowcol_rust::metrics::CollectorMetrics::new()?,
         ));
         let table_root = sink.table_path(identity);
         let publication: Arc<dyn PublicationSink> = sink;

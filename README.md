@@ -227,8 +227,7 @@ Cargo caches and `target/`, Docker images/volumes/build caches, `dist/`, and
 not removed.
 
 These targets clean files only; they do not stop running processes or
-containers. Stop the demo with `npx --no-install nx run loadtest:down` before
-cleaning its state.
+containers. Stop the load test before cleaning its state.
 
 ## Sample CLI and image
 
@@ -285,16 +284,9 @@ See [Rust project layout](docs/rust/project-layout.md) and
 
 ```bash
 git submodule update --init --recursive
-npx --no-install nx run loadtest:up
-npx --no-install nx run loadtest:inspect
-npx --no-install nx run loadtest:down
-npx --no-install nx run loadtest:e2e
+npx --no-install nx run loadtest:run
 ```
 
-The sample sends logs, metrics, and traces to the Rust collector and writes
-readable local Delta tables containing Parquet. Multiple collector cores stream
-files concurrently and share batched Delta commits per table. `loadtest:up`
-rebuilds both local Dockerfiles, including uncommitted submodule edits.
 See [loadtest](projects/loadtest/README.md) and
 [collector development](projects/otelcol-rust/README.md#editing-the-submodule).
 

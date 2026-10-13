@@ -250,7 +250,7 @@ pub struct RunArgs {
         long,
         env = "LOADTEST_DIRECT_ADMIN_ENDPOINTS",
         value_delimiter = ',',
-        default_value = "http://direct-1:8081,http://direct-2:8081,http://direct-3:8081"
+        default_value = "http://direct-1:8081"
     )]
     pub direct_admin_endpoints: Vec<String>,
 
@@ -259,7 +259,7 @@ pub struct RunArgs {
         long,
         env = "LOADTEST_DATAFLOW_ADMIN_ENDPOINTS",
         value_delimiter = ',',
-        default_value = "http://dataflow-1:32011,http://dataflow-2:32011,http://dataflow-3:32011"
+        default_value = "http://dataflow-1:32011"
     )]
     pub dataflow_admin_endpoints: Vec<String>,
 }
@@ -295,7 +295,7 @@ pub struct ValidateArgs {
     #[arg(long, env = "LOADTEST_DRAIN_TIMEOUT", default_value = "2m")]
     pub timeout: DurationArg,
 
-    /// Require every one of the three collectors in each implementation pool to own a table.
+    /// Require every collector in each implementation pool to own a table.
     #[arg(long, env = "LOADTEST_REQUIRE_ALL_COLLECTORS", default_value_t = true)]
     pub require_all_collectors: bool,
 }

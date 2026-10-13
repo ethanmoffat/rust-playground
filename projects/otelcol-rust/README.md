@@ -34,8 +34,7 @@ prevent false joins across cores and after restart. This is an experimental
 append-only local writer, not a production or cross-table durability guarantee.
 
 `otelcol-rust:run` is for a native collector invocation; its config expects a
-writable `/onelake`. Prefer `loadtest:up` for the managed local mount and sample
-traffic. Native build artifacts stay in root `target/`.
+writable `/onelake`.  Native build artifacts stay in root `target/`.
 
 ## Toolchain and build prerequisites
 
@@ -81,7 +80,7 @@ git -C submodules/otel-arrow switch arrowcol-work
 
 Native and image builds consume local source, including uncommitted edits;
 no remote Cargo git dependency bypasses the submodule. After editing, rebuild
-and restart the two-container demo with `npx --no-install nx run loadtest:up`.
+the images you use.
 See [loadtest](../loadtest/README.md) for observing and testing the result.
 
 To inspect and deliberately move to a reviewed upstream commit without

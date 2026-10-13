@@ -55,6 +55,7 @@
       "executor": "nx:run-commands",
       "cache": false,
       "dependsOn": [
+        "reader-build",
         {
           "projects": [
             "arrowcol-rust",
@@ -77,6 +78,33 @@
       ],
       "options": {
         "commands": []
+      }
+    },
+    "reader-build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "projects/loadtest/scripts/build-reader-bundle.sh"
+      }
+    },
+    "e2e": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        "build"
+      ],
+      "options": {
+        "command": "npx --no-install tsx projects/loadtest/src/main.ts --warmup 5s --measure 30s --validate",
+        "forwardAllArgs": false
+      }
+    },
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/clean.ts projects/loadtest",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
       }
     }
   },

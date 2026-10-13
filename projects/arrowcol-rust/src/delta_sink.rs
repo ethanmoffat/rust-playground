@@ -1,27 +1,42 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arrow::record_batch::RecordBatch;
 use arrow_deltalake::commit::{BatchedTable, CommitOptions};
 use arrow_deltalake::delta::PublicationFence as DeltaFence;
-use arrowcol_buffer::{DeltaPublicationSink, PublicationContext, PublicationSession, PublicationSink, SinkError};
+use arrowcol_buffer::{
+    DeltaPublicationSink, PublicationContext, PublicationOutcome, PublicationSession, PublicationSink, SinkError,
+};
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::lease::TableLeaseManager;
+use crate::metrics::CollectorMetrics;
 
 /// Multi-table Delta sink that opens one fenced coordinator per owned table.
 pub struct ProductionDeltaSink {
     root: PathBuf,
     options: CommitOptions,
     leases: Arc<TableLeaseManager>,
+    metrics: CollectorMetrics,
 }
 
 impl ProductionDeltaSink {
     /// Creates a dynamic multi-table publication sink.
     #[must_use]
-    pub fn new(root: PathBuf, options: CommitOptions, leases: Arc<TableLeaseManager>) -> Self {
-        Self { root, options, leases }
+    pub fn new(
+        root: PathBuf,
+        options: CommitOptions,
+        leases: Arc<TableLeaseManager>,
+        metrics: CollectorMetrics,
+    ) -> Self {
+        Self {
+            root,
+            options,
+            leases,
+            metrics,
+        }
     }
 
     /// Returns the physical table path.
@@ -51,14 +66,41 @@ impl PublicationSink for ProductionDeltaSink {
                 .map_err(|error| SinkError::retryable(format!("open Delta table coordinator: {error:#}")))?;
             handle.install_delta_table(opened).await
         };
-        DeltaPublicationSink::new(
+        let session = DeltaPublicationSink::new(
             table,
             context.table.clone(),
             context.schema_fingerprint,
             context.fence.clone(),
         )
         .begin(context)
-        .await
+        .await?;
+        Ok(Box::new(CountingSession {
+            inner: session,
+            rows: 0,
+            metrics: self.metrics.clone(),
+        }))
+    }
+}
+
+struct CountingSession {
+    inner: Box<dyn PublicationSession>,
+    rows: u64,
+    metrics: CollectorMetrics,
+}
+
+#[async_trait]
+impl PublicationSession for CountingSession {
+    async fn write(&mut self, batch: &RecordBatch) -> Result<(), SinkError> {
+        self.inner.write(batch).await?;
+        self.rows = self.rows.saturating_add(batch.num_rows() as u64);
+        Ok(())
+    }
+
+    async fn finish(self: Box<Self>) -> Result<PublicationOutcome, SinkError> {
+        let Self { inner, rows, metrics } = *self;
+        let outcome = inner.finish().await?;
+        metrics.exported_rows(rows);
+        Ok(outcome)
     }
 }
 

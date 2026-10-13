@@ -1,29 +1,4 @@
 services:
-  otelcol-rust:
-    image: ghcr.io/mdrakiburrahman/rust-playground/otelcol-rust:dev
-    pull_policy: never
-    user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
-    command: ["--num-cores", "${LOADTEST_CORES:-2}", "--http-admin-bind", "0.0.0.0:8080", "--config", "/etc/otelcol-rust/config.yaml"]
-    volumes:
-      - type: bind
-        source: ${ONELAKE_HOST_PATH:?Run through Nx}
-        target: /onelake
-        bind:
-          create_host_path: false
-    stop_grace_period: 30s
-  hello-world:
-    image: ghcr.io/mdrakiburrahman/rust-playground/hello-world:dev
-    pull_policy: never
-    depends_on:
-      otelcol-rust:
-        condition: service_healthy
-    environment:
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otelcol-rust:4318
-      OTEL_SERVICE_NAME: hello-world
-      RUST_LOG: info
-    command: ["--telemetry", "--repeat", "--interval-ms", "1000", "--run-id", "demo"]
-    stop_grace_period: 30s
-
   sqlserver:
     profiles: ["benchmark"]
     image: arrowcol-loadtest/sqlserver:2022-cu27
@@ -160,7 +135,7 @@ services:
     user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
     command: ["--config", "/state/direct.yaml"]
     environment:
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://tempo:4318}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
     secrets:
       - source: arrowcol_app_password
@@ -181,46 +156,12 @@ services:
     depends_on:
       hive-metastore:
         condition: service_healthy
+      lgtm:
+        condition: service_healthy
     networks:
       default:
         ipv4_address: ${LOADTEST_DIRECT_1_IP:-10.89.0.21}
     stop_grace_period: 5m
-
-  direct-2:
-    profiles: ["benchmark"]
-    extends: direct-1
-    networks:
-      default:
-        ipv4_address: ${LOADTEST_DIRECT_2_IP:-10.89.0.22}
-    volumes:
-      - type: bind
-        source: ${ONELAKE_HOST_PATH:?Run through Nx}/direct
-        target: /delta/direct
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${ONELAKE_HOST_PATH:?Run through Nx}/direct-state-2
-        target: /state
-        bind:
-          create_host_path: false
-
-  direct-3:
-    profiles: ["benchmark"]
-    extends: direct-1
-    networks:
-      default:
-        ipv4_address: ${LOADTEST_DIRECT_3_IP:-10.89.0.23}
-    volumes:
-      - type: bind
-        source: ${ONELAKE_HOST_PATH:?Run through Nx}/direct
-        target: /delta/direct
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${ONELAKE_HOST_PATH:?Run through Nx}/direct-state-3
-        target: /state
-        bind:
-          create_host_path: false
 
   dataflow-1:
     profiles: ["benchmark"]
@@ -234,7 +175,7 @@ services:
       ARROWCOL_SQL_HOST: sqlserver
       ARROWCOL_HIVE_HOST: hive-metastore
       ARROWCOL_MAX_MESSAGE_BYTES: "33554432"
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://tempo:4318}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
     secrets:
       - source: arrowcol_app_password
@@ -248,36 +189,52 @@ services:
     depends_on:
       hive-metastore:
         condition: service_healthy
+      lgtm:
+        condition: service_healthy
     networks:
       default:
         ipv4_address: ${LOADTEST_DATAFLOW_1_IP:-10.89.0.31}
     stop_grace_period: 5m
 
-  dataflow-2:
+  lgtm:
     profiles: ["benchmark"]
-    extends: dataflow-1
-    environment:
-      ARROWCOL_INSTANCE_KEY: loadtest-dataflow-2
-      ARROWCOL_ADVERTISED_FLIGHT_ENDPOINT: ${LOADTEST_DATAFLOW_2_IP:-10.89.0.32}:32010
-      ARROWCOL_DELTA_ROOT: /delta/dataflow
-      ARROWCOL_SQL_HOST: sqlserver
-      ARROWCOL_HIVE_HOST: hive-metastore
+    image: grafana/otel-lgtm@sha256:57c04cbd8e7022f32bb84c4ac005d79baf8b08e2c5be44facf11f5f1f9944ba2
     networks:
       default:
-        ipv4_address: ${LOADTEST_DATAFLOW_2_IP:-10.89.0.32}
+        ipv4_address: 10.89.0.40
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./observability/prometheus.yaml:/otel-lgtm/prometheus.yaml:ro
+      - ./observability/dashboards.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/arrowcol.yaml:ro
+      - ./observability/arrowcol.json:/otel-lgtm/grafana/conf/provisioning/dashboards/arrowcol/arrowcol.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
 
-  dataflow-3:
+  cadvisor:
     profiles: ["benchmark"]
-    extends: dataflow-1
-    environment:
-      ARROWCOL_INSTANCE_KEY: loadtest-dataflow-3
-      ARROWCOL_ADVERTISED_FLIGHT_ENDPOINT: ${LOADTEST_DATAFLOW_3_IP:-10.89.0.33}:32010
-      ARROWCOL_DELTA_ROOT: /delta/dataflow
-      ARROWCOL_SQL_HOST: sqlserver
-      ARROWCOL_HIVE_HOST: hive-metastore
+    image: ghcr.io/google/cadvisor:v0.60.6@sha256:b8e7d1093144fd088f425ff003d75a4aa405de075db78dae3bc563730b1bd07a
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=2s
+      - --max_housekeeping_interval=2s
+      - --store_container_labels=false
+      - --whitelisted_container_labels=com.docker.compose.project,com.docker.compose.service
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    tmpfs:
+      - /var/lib/cadvisor:size=64m,mode=0755
     networks:
       default:
-        ipv4_address: ${LOADTEST_DATAFLOW_3_IP:-10.89.0.33}
+        ipv4_address: 10.89.0.105
 
   router:
     profiles: ["benchmark"]
@@ -286,7 +243,7 @@ services:
     user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
     command: ["--config", "/state/config.yaml"]
     environment:
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://tempo:4318}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
     secrets:
       - source: arrowcol_app_password
@@ -304,103 +261,12 @@ services:
     depends_on:
       direct-1:
         condition: service_healthy
-      direct-2:
-        condition: service_healthy
-      direct-3:
-        condition: service_healthy
       dataflow-1:
-        condition: service_healthy
-      dataflow-2:
-        condition: service_healthy
-      dataflow-3:
         condition: service_healthy
     networks:
       default:
         ipv4_address: ${LOADTEST_ROUTER_IP:-10.89.0.10}
     stop_grace_period: 5m
-
-  load-driver:
-    profiles: ["benchmark"]
-    image: ghcr.io/mdrakiburrahman/rust-playground/arrowcol-router-rust:dev
-    pull_policy: never
-    user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
-    entrypoint: ["/usr/local/bin/arrowcol-loadgen"]
-    command: ["run"]
-    working_dir: /workspace
-    environment:
-      LOADTEST_RUN_ID: ${LOADTEST_RUN_ID:-benchmark}
-      LOADTEST_WARMUP: ${LOADTEST_WARMUP:-2m}
-      LOADTEST_MEASURE: ${LOADTEST_MEASURE:-5m}
-      LOADTEST_CAPTURE_SETTLE: ${LOADTEST_CAPTURE_SETTLE:-30s}
-      LOADTEST_DRAIN_TIMEOUT: ${LOADTEST_DRAIN_TIMEOUT:-2m}
-      LOADTEST_REQUEST_TIMEOUT: ${LOADTEST_REQUEST_TIMEOUT:-1m}
-      LOADTEST_CONTINUOUS: ${LOADTEST_CONTINUOUS:-false}
-      LOADTEST_KEEP_STACK: ${LOADTEST_KEEP_STACK:-false}
-      LOADTEST_LANES: ${LOADTEST_LANES:-4}
-      LOADTEST_BATCH_ROWS: ${LOADTEST_BATCH_ROWS:-8192}
-      LOADTEST_SEED: ${LOADTEST_SEED:-20260923}
-      LOADTEST_SCENARIOS: ${LOADTEST_SCENARIOS:-direct,dataflow,paired}
-      LOADTEST_ROUTER_ENDPOINT: http://${LOADTEST_ROUTER_IP:-10.89.0.10}:50050
-      LOADTEST_CATALOG_ENDPOINT: http://${LOADTEST_DIRECT_1_IP:-10.89.0.21}:50051
-      LOADTEST_RECEIPT_ENDPOINT: http://${LOADTEST_ROUTER_IP:-10.89.0.10}:50050
-      LOADTEST_EDGE_SECRET_FILE: /run/secrets/edge-hmac
-      LOADTEST_INTERNAL_SECRET_FILE: /run/secrets/internal-hmac
-      LOADTEST_RESULTS: /results
-      LOADTEST_DIRECT_ROOT: /delta/direct
-      LOADTEST_DATAFLOW_ROOT: /delta/dataflow
-      LOADTEST_SCRATCH_ROOT: target/loadgen
-      ARROWCOL_SDK_GEN: /usr/local/bin/arrowcol-sdk-gen
-      ARROWCOL_SQL_HOST: ${LOADTEST_SQL_IP:-10.89.0.2}
-      ARROWCOL_SQL_PASSWORD_FILE: /run/secrets/arrowcol-app-password
-      LOADTEST_DIRECT_ADMIN_ENDPOINTS: "http://${LOADTEST_DIRECT_1_IP:-10.89.0.21}:8081,http://${LOADTEST_DIRECT_2_IP:-10.89.0.22}:8081,http://${LOADTEST_DIRECT_3_IP:-10.89.0.23}:8081"
-      LOADTEST_DATAFLOW_ADMIN_ENDPOINTS: "http://${LOADTEST_DATAFLOW_1_IP:-10.89.0.31}:32011,http://${LOADTEST_DATAFLOW_2_IP:-10.89.0.32}:32011,http://${LOADTEST_DATAFLOW_3_IP:-10.89.0.33}:32011"
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://tempo:4318}
-      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
-    secrets:
-      - source: arrowcol_app_password
-        target: arrowcol-app-password
-      - source: edge_hmac
-        target: edge-hmac
-      - source: internal_hmac
-        target: internal-hmac
-    volumes:
-      - type: bind
-        source: ${ONELAKE_HOST_PATH:?Run through Nx}/results
-        target: /results
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${ONELAKE_HOST_PATH:?Run through Nx}/direct
-        target: /delta/direct
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${ONELAKE_HOST_PATH:?Run through Nx}/dataflow
-        target: /delta/dataflow
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${LOADTEST_SCRATCH_HOST_PATH:?Run through benchmark target}
-        target: /workspace/target
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${LOADTEST_BIN_HOST_PATH:?Run through benchmark target}/arrowcol-loadgen
-        target: /usr/local/bin/arrowcol-loadgen
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${LOADTEST_BIN_HOST_PATH:?Run through benchmark target}/arrowcol-sdk-gen
-        target: /usr/local/bin/arrowcol-sdk-gen
-        read_only: true
-        bind:
-          create_host_path: false
-    depends_on:
-      router:
-        condition: service_healthy
 
   validator:
     profiles: ["benchmark"]

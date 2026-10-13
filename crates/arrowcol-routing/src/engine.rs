@@ -237,7 +237,11 @@ impl RoutingEngine {
                         .collectors
                         .get(&lease.holder_instance_id)
                         .is_some_and(|collector| collector_is_eligible(collector, now, &self.policy, false));
-                    if !holder_is_safe {
+                    let has_alternative = rank_collectors(&view, &lease.key, now, &self.policy, false)
+                        .into_iter()
+                        .any(|candidate| candidate != lease.holder_instance_id);
+                    // Draining without a transfer target would only strand the table.
+                    if !holder_is_safe && has_alternative {
                         match self
                             .store
                             .begin_lease_drain(&LeaseCas {

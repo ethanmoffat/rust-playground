@@ -35,10 +35,9 @@ uses source-built `:dev` images and does not pull the published GHCR images.
 Run direct, DFE, and paired phases, then validate and remove the scoped stack:
 
 ```bash
-npx --no-install nx run loadtest:benchmark -- \
-  --run-id bench-1 \
+npx --no-install nx run loadtest:run -- \
   --warmup 2m \
-  --measure 5m
+  --measure 1m
 ```
 
 Results are retained at:
@@ -103,21 +102,21 @@ npx --no-install nx run loadtest:clean
 
 ```bash
 # Durable direct collector only.
-npx --no-install nx run loadtest:benchmark -- \
+npx --no-install nx run loadtest:run -- \
   --run-id direct-only \
   --warmup 30s \
   --measure 2m \
   --scenarios direct
 
 # DFE collector only.
-npx --no-install nx run loadtest:benchmark -- \
+npx --no-install nx run loadtest:run -- \
   --run-id dfe-only \
   --warmup 30s \
   --measure 2m \
   --scenarios dataflow
 
 # Identical logical batches sent concurrently to both pools.
-npx --no-install nx run loadtest:benchmark -- \
+npx --no-install nx run loadtest:run -- \
   --run-id paired \
   --warmup 30s \
   --measure 2m \
@@ -127,7 +126,7 @@ npx --no-install nx run loadtest:benchmark -- \
 ## Tune load
 
 ```bash
-npx --no-install nx run loadtest:benchmark -- \
+npx --no-install nx run loadtest:run -- \
   --run-id tuned \
   --warmup 1m \
   --measure 5m \

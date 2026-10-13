@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -13,8 +13,6 @@ const args = [
   '--project-name', 'loadtest-config-check',
   '--file', path.join(workspace, 'projects/loadtest/compose.yaml'),
 ];
-const overlay = path.join(workspace, 'projects/loadtest/compose.observability.yaml');
-if (existsSync(overlay)) args.push('--file', overlay);
 args.push('--profile', 'benchmark', 'config', '--quiet');
 const result = spawnSync('docker', args, {
   cwd: workspace,

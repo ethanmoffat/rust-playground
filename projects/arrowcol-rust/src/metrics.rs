@@ -15,6 +15,7 @@ pub struct CollectorMetrics {
     received_batches: IntCounter,
     received_rows: IntCounter,
     received_bytes: IntCounter,
+    exported_rows: IntCounter,
     stream_outcomes: IntCounterVec,
     control_failures: IntCounterVec,
     reconciled_receipts: IntCounterVec,
@@ -54,6 +55,11 @@ impl CollectorMetrics {
             "Approximate Arrow bytes admitted by completed or failed streams",
             registry.as_ref()
         )?;
+        let exported_rows = register_int_counter_with_registry!(
+            "arrowcol_direct_exported_rows_total",
+            "Rows durably committed to Delta",
+            registry.as_ref()
+        )?;
         let stream_outcomes = register_int_counter_vec_with_registry!(
             Opts::new(
                 "arrowcol_direct_stream_outcomes_total",
@@ -90,11 +96,17 @@ impl CollectorMetrics {
             received_batches,
             received_rows,
             received_bytes,
+            exported_rows,
             stream_outcomes,
             control_failures,
             reconciled_receipts,
             incomplete_shutdown,
         })
+    }
+
+    /// Records rows durably committed to Delta.
+    pub fn exported_rows(&self, rows: u64) {
+        self.exported_rows.inc_by(rows);
     }
 
     /// Encodes Prometheus text exposition.
