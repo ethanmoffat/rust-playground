@@ -40,4 +40,4 @@ out/
 .vscode/settings.json
 
 # Scratch
-.temp//autonomous-delivery/
+.temp/
