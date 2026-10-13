@@ -18,7 +18,12 @@
     "node",
     ".devcontainer/scripts/post-create.ts"
   ],
-  "waitFor": "postCreateCommand",
+  "postStartCommand": [
+    "node",
+    ".devcontainer/scripts/post-create.ts",
+    "--permissions-only"
+  ],
+  "waitFor": "postStartCommand",
   "customizations": {
     "vscode": {
       "extensions": [

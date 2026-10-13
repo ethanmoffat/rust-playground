@@ -30,14 +30,6 @@ Common Nx targets:
 - `nx run devcontainer:down -- --volumes`: remove only this workspace's
   discovered Compose project and its volumes.
 
-`initializeCommand` creates the host Azure and GitHub CLI configuration
-directories and writes the ignored `.devcontainer/.env` used by Compose. The
-hash is based on Git's tracked and non-ignored image-building inputs with
-normalized line endings: `.dockerignore`, `Dockerfile`,
-`devcontainer.build.json`, and `devcontainer-lock.json`. Compose lifecycle
-files, published-image references, scripts, tests, project metadata,
-documentation, and local `.env` state are excluded so the hash represents the
-published image without recursion.
 
 See
 [headless devcontainer operations](../docs/devcontainer/headless-operations.md)

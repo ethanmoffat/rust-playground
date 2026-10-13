@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'node:child_process';
-import { accessSync, constants, realpathSync } from 'node:fs';
+import { accessSync, constants, existsSync, realpathSync } from 'node:fs';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -12,20 +12,23 @@ const defaultRepositoryRoot = realpathSync(
   join(dirname(fileURLToPath(import.meta.url)), '..', '..'),
 );
 
-const usage = `Usage: node .devcontainer/scripts/post-create.ts [--dry-run]
+const usage = `Usage: node .devcontainer/scripts/post-create.ts [--dry-run] [--permissions-only]
 
 Validates the pinned Rust and Node.js toolchains, verifies rustfmt and Clippy,
 installs the pinned cargo-make release when needed, and finally runs npm ci.
+With --permissions-only, repairs workspace permissions without reinstalling tools.
 `;
 
 export interface PostCreateOptions {
   dryRun: boolean;
+  permissionsOnly?: boolean;
 }
 
 export interface PostCreateDependencies {
   capture(command: string, args: readonly string[], cwd: string): string;
   commandExists(command: string): boolean;
   execute(command: string, args: readonly string[], cwd: string): void;
+  inContainer: boolean;
   nodeVersion: string;
   stdout(message: string): void;
 }
@@ -94,6 +97,7 @@ const defaultDependencies: PostCreateDependencies = {
     }
   },
   nodeVersion: process.version,
+  inContainer: existsSync('/.dockerenv'),
   stdout(message) {
     process.stdout.write(message);
   },
@@ -107,6 +111,9 @@ export function parsePostCreateArguments(
     switch (argument) {
       case '--dry-run':
         parsed.dryRun = true;
+        break;
+      case '--permissions-only':
+        parsed.permissionsOnly = true;
         break;
       case '-h':
       case '--help':
@@ -124,17 +131,30 @@ export function runPostCreate(
   repositoryRoot = defaultRepositoryRoot,
 ): void {
   if (options.dryRun) {
+    dependencies.stdout('Would require: execution inside the devcontainer\n');
+    dependencies.stdout('Would repair: build, cache, scratch, and onelake ownership and owner write permissions using passwordless sudo\n');
+    if (options.permissionsOnly) return;
     dependencies.stdout(`Would require: rustc ${expectedRustVersion}\n`);
     dependencies.stdout(`Would require: Node.js ${expectedNodeMajor}.x\n`);
     dependencies.stdout('Would verify: rustfmt and cargo clippy\n');
     dependencies.stdout(
       `Would ensure: cargo-make ${cargoMakeVersion} (installed with --locked)\n`,
     );
-    dependencies.stdout('Would normalize: node_modules ownership\n');
     dependencies.stdout('Would trust: the mounted Git workspace\n');
     dependencies.stdout('Would run: npm ci\n');
     return;
   }
+
+  if (!dependencies.inContainer) {
+    throw new Error(
+      'Run this script inside the devcontainer, not on the WSL host. ' +
+      'Start it with npx --no-install nx run devcontainer:up, then use ' +
+      'npx --no-install devcontainer exec --workspace-folder . --config ' +
+      '.devcontainer/devcontainer.json <command>.',
+    );
+  }
+  repairWorkspacePermissions(dependencies, repositoryRoot);
+  if (options.permissionsOnly) return;
 
   const rustcOutput = dependencies.capture(
     'rustc',
@@ -183,6 +203,18 @@ export function runPostCreate(
     dependencies.execute('cargo', args, repositoryRoot);
   }
 
+  dependencies.execute(
+    'git',
+    ['config', '--global', '--add', 'safe.directory', repositoryRoot],
+    repositoryRoot,
+  );
+  dependencies.execute('npm', ['ci'], repositoryRoot);
+}
+
+function repairWorkspacePermissions(
+  dependencies: PostCreateDependencies,
+  repositoryRoot: string,
+): void {
   const userId = numericId(
     dependencies.capture('id', ['-u'], repositoryRoot),
     'user ID',
@@ -191,24 +223,34 @@ export function runPostCreate(
     dependencies.capture('id', ['-g'], repositoryRoot),
     'group ID',
   );
+  if (userId === '0') {
+    throw new Error('Run as the devcontainer vscode user; loadtest does not support root. Passwordless sudo supplies administrator access.');
+  }
+  const directories = [
+    'node_modules', '.nx', 'target', '.temp', 'onelake', 'projects/loadtest/.temp',
+  ].map((directory) => join(repositoryRoot, directory));
+  dependencies.execute(
+    'sudo',
+    ['-n', 'install', '-d', '-m', '0755', '-o', userId, '-g', groupId, ...directories],
+    repositoryRoot,
+  );
   dependencies.execute(
     'sudo',
     [
+      '-n',
       'chown',
       '-R',
+      '--no-dereference',
       `${userId}:${groupId}`,
-      join(repositoryRoot, 'node_modules'),
-      join(repositoryRoot, '.nx'),
-      join(repositoryRoot, 'target'),
+      ...directories,
     ],
     repositoryRoot,
   );
   dependencies.execute(
-    'git',
-    ['config', '--global', '--add', 'safe.directory', repositoryRoot],
+    'sudo',
+    ['-n', 'chmod', '-R', 'u+rwX', ...directories],
     repositoryRoot,
   );
-  dependencies.execute('npm', ['ci'], repositoryRoot);
 }
 
 function numericId(value: string, description: string): string {

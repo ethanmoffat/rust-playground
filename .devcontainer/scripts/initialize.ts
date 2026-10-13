@@ -56,6 +56,9 @@ export function initializeHost(
   const githubDirectory = join(home, '.config', 'gh');
   dependencies.createDirectory(azureDirectory);
   dependencies.createDirectory(githubDirectory);
+  for (const directory of ['node_modules', '.nx', 'target']) {
+    dependencies.createDirectory(join(repositoryRoot, directory));
+  }
 
   const contents = [
     `HOST_AZURE_DIR=${composeEnvironmentValue(azureDirectory)}`,

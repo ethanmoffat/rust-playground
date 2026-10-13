@@ -63,10 +63,15 @@ CI uses the same development environment.
    Node.js, and the Dev Containers CLI. It also restarts Docker and clears
    existing Docker containers, volumes, and networks.
 
-1. Start and enter the devcontainer:
+1. Clean install npm:
 
    ```bash
    npm ci
+   ```
+
+1. Start and enter the devcontainer:
+
+   ```bash
    npx nx run devcontainer:up
    WORKSPACE_HEX=$(printf '%s' "$(wslpath -w .)" | od -An -tx1 | tr -d '[:space:]')
    code --folder-uri "vscode-remote://dev-container+${WORKSPACE_HEX}/workspaces/rust-playground"
