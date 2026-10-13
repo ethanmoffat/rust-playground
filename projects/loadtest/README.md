@@ -64,12 +64,10 @@ sends every table even when its requested duration is very short.
 
 ```bash
 # Finite direct, dataflow, then paired scenarios.
-npx --no-install nx run loadtest:benchmark -- \
-  --run-id bench-1 --warmup 2m --measure 5m
+npx --no-install nx run loadtest:benchmark -- --run-id bench-1 --warmup 2m --measure 5m
 
 # Live paired comparison; Ctrl+C stops load but retains the stack.
-npx --no-install nx run loadtest:run -- \
-  --run-id live --warmup 2m --continuous --keep-stack
+npx --no-install nx run loadtest:run -- --run-id live --warmup 2m --continuous --keep-stack
 
 # Stop a retained stack by using its Compose project name shown at startup.
 npx --no-install tsx projects/loadtest/src/main.ts benchmark-down --run-id live

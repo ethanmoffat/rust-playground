@@ -5,28 +5,6 @@ Linux inside the repository's
 [VS Code devcontainer](https://code.visualstudio.com/docs/devcontainers/containers).
 CI uses the same development environment.
 
-## Enter the devcontainer
-
-After completing the one-time setup below, run these commands from WSL:
-
-```bash
-cd /workspaces/rust-playground
-npm ci
-npx nx run devcontainer:up
-WORKSPACE_HEX=$(printf '%s' "$(wslpath -w .)" | od -An -tx1 | tr -d '[:space:]')
-code --folder-uri "vscode-remote://dev-container+${WORKSPACE_HEX}/workspaces/rust-playground"
-```
-
-This starts the default immutable devcontainer image and opens the repository
-inside it. To enter the same container from a terminal without VS Code, run:
-
-```bash
-npx --no-install devcontainer exec \
-  --workspace-folder . \
-  --config .devcontainer/devcontainer.json \
-  bash
-```
-
 ## First-time setup
 
 1. Install VS Code and its WSL and Dev Containers extensions from PowerShell:

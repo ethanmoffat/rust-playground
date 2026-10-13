@@ -3,6 +3,8 @@ services:
     image: ghcr.io/mdrakiburrahman/rust-playground/devcontainer:6fd2a851f87d3f9eef038d25e64a5a8e16168e0fab4a4ca11db50fd8f8dd9b06
     command: sleep infinity
     init: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - type: bind
         source: ..
