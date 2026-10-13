@@ -105,18 +105,98 @@ impl SqlServerRoutingConfig {
 }
 
 /// SQL Server-backed multi-router coordination store.
+///
+/// Transactions chosen as deadlock victims (SQL error 1205) are rolled back by
+/// the server and retried a few times before the error is surfaced.
 #[derive(Clone)]
 pub struct SqlServerRoutingStore {
-    config: SqlServerRoutingConfig,
+    inner: RawSqlStore,
 }
 
 impl SqlServerRoutingStore {
     /// Creates a SQL routing store.
     #[must_use]
     pub const fn new(config: SqlServerRoutingConfig) -> Self {
-        Self { config }
+        Self {
+            inner: RawSqlStore { config },
+        }
+    }
+}
+
+const DEADLOCK_ATTEMPTS: u32 = 6;
+
+async fn retry_deadlock<T, F, Fut>(mut operation: F) -> RoutingResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = RoutingResult<T>>,
+{
+    let mut attempt = 1;
+    loop {
+        match operation().await {
+            Err(error) if attempt < DEADLOCK_ATTEMPTS && error.to_string().contains("deadlock victim") => {
+                tokio::time::sleep(Duration::from_millis(25 * u64::from(attempt))).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+#[async_trait]
+impl RoutingStore for SqlServerRoutingStore {
+    async fn register_collector(&self, registration: &CollectorRegistration) -> RoutingResult<()> {
+        retry_deadlock(|| self.inner.register_collector(registration)).await
     }
 
+    async fn heartbeat_collector(
+        &self,
+        instance_id: CollectorInstanceId,
+        heartbeat_at: UnixMillis,
+        lease_expires_at: UnixMillis,
+    ) -> RoutingResult<()> {
+        retry_deadlock(|| {
+            self.inner
+                .heartbeat_collector(instance_id, heartbeat_at, lease_expires_at)
+        })
+        .await
+    }
+
+    async fn set_collector_state(
+        &self,
+        instance_id: CollectorInstanceId,
+        state: CollectorState,
+        changed_at: UnixMillis,
+    ) -> RoutingResult<()> {
+        retry_deadlock(|| self.inner.set_collector_state(instance_id, state, changed_at)).await
+    }
+
+    async fn publish_pressure(&self, snapshot: &RichPressureSnapshot) -> RoutingResult<()> {
+        retry_deadlock(|| self.inner.publish_pressure(snapshot)).await
+    }
+
+    async fn load_view(&self, loaded_at: UnixMillis) -> RoutingResult<RoutingView> {
+        retry_deadlock(|| self.inner.load_view(loaded_at)).await
+    }
+
+    async fn claim_lease(&self, claim: &LeaseClaim) -> RoutingResult<RoutingLease> {
+        retry_deadlock(|| self.inner.claim_lease(claim)).await
+    }
+
+    async fn begin_lease_drain(&self, request: &LeaseCas) -> RoutingResult<RoutingLease> {
+        retry_deadlock(|| self.inner.begin_lease_drain(request)).await
+    }
+
+    async fn transfer_drained_lease(&self, request: &LeaseTransfer) -> RoutingResult<RoutingLease> {
+        retry_deadlock(|| self.inner.transfer_drained_lease(request)).await
+    }
+}
+
+#[derive(Clone)]
+struct RawSqlStore {
+    config: SqlServerRoutingConfig,
+}
+
+impl RawSqlStore {
     async fn connect(&self) -> RoutingResult<SqlClient> {
         let mut config = Config::new();
         config.host(&self.config.host);
@@ -151,7 +231,7 @@ impl SqlServerRoutingStore {
 }
 
 #[async_trait]
-impl RoutingStore for SqlServerRoutingStore {
+impl RoutingStore for RawSqlStore {
     async fn register_collector(&self, registration: &CollectorRegistration) -> RoutingResult<()> {
         registration.validate()?;
         let instance_id = registration.instance_id.as_uuid();

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import {
-  chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync,
+  chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync,
 } from 'node:fs';
 import { hostname } from 'node:os';
 import path from 'node:path';
@@ -83,6 +83,18 @@ function environment(directory: string): NodeJS.ProcessEnv {
 function compose(project: string, env: NodeJS.ProcessEnv, args: string[], timeout = 300_000): string {
   const files = ['--file', composeFile];
   return run('docker', ['compose', '--project-name', project, ...files, ...args], env, timeout);
+}
+
+function composeToFile(project: string, env: NodeJS.ProcessEnv, args: string[], file: string): void {
+  const fd = openSync(file, 'w');
+  try {
+    const result = spawnSync('docker', ['compose', '--project-name', project, '--file', composeFile, ...args], {
+      cwd: workspace, env, stdio: ['ignore', fd, 'inherit'], timeout: 600_000,
+    });
+    if (result.error || result.status !== 0) throw new Error(`docker compose ${args.join(' ')} failed: ${result.error?.message ?? result.status}`);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function composeInteractive(project: string, env: NodeJS.ProcessEnv, args: string[], timeout?: number): void {
@@ -462,8 +474,8 @@ function benchmark(options: BenchmarkOptions): BenchmarkContext {
   } finally {
     step('Capturing Compose logs and diagnostics');
     try {
-      writeFileSync(path.join(directory, 'results/compose.log'),
-        compose(project, env, ['--profile', 'benchmark', 'logs', '--no-color', '--timestamps']));
+      composeToFile(project, env, ['--profile', 'benchmark', 'logs', '--no-color', '--timestamps'],
+        path.join(directory, 'results/compose.log'));
       writeFileSync(path.join(directory, 'results/compose-ps.json'),
         compose(project, env, ['--profile', 'benchmark', 'ps', '--all', '--format', 'json']));
     } catch (error) {
