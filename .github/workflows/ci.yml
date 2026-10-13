@@ -191,7 +191,7 @@ jobs:
     name: Artifact-backed three-signal E2E
     needs: [plan, images, reader]
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -224,11 +224,13 @@ jobs:
           CI_INTEGRATION: "true"
         run: npx --no-install nx run tools-scripts:ci-verify-host
       - name: Preserve failed integration diagnostics
-        if: failure()
+        if: ${{ !success() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: telemetry-e2e-diagnostics
-          path: onelake/e2e/
+          path: |
+            onelake/e2e/
+            onelake/benchmark/latest/results/
           if-no-files-found: ignore
           retention-days: 7
 
