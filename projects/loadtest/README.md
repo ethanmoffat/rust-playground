@@ -1,7 +1,7 @@
 # loadtest
 
 ```bash
-npx nx run loadtest:run -- --run-id soak-20261014 --warmup 2m --concurrency 8 --batch-rows 1024
+npx nx run loadtest:run -- --warmup 2m --concurrency 8 --batch-rows 1024
 ```
 
 Omit `--measure` to run continuously until Ctrl+C. SQL Server defaults to a
