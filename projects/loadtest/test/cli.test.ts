@@ -1,13 +1,23 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { parseBenchmarkOptions, parseDuration } from '../src/cli.js';
+import { benchmarkProject, parseBenchmarkOptions, parseDuration } from '../src/cli.js';
 
 test('durations accept whole-number units', () => {
   assert.equal(parseDuration('30', 'd'), 30);
   assert.equal(parseDuration('2m', 'd'), 120);
   assert.equal(parseDuration('1H', 'd'), 3600);
   assert.throws(() => parseDuration('1.5m', 'd'), /must look like/u);
+});
+
+test('explicit run IDs are exact bounded Compose and path identities', () => {
+  assert.equal(parseBenchmarkOptions([]).runId, 'latest');
+  assert.equal(parseBenchmarkOptions(['--run-id=soak-20261014']).runId, 'soak-20261014');
+  assert.equal(benchmarkProject('a'.repeat(38)).length, 63);
+  for (const value of ['../escape', '.', '..', '/root', 'UPPER', '-leading', 'a b', 'a.b', 'a/b', 'a\\b', 'a'.repeat(39), 'a\n', 'é', '']) {
+    assert.throws(() => parseBenchmarkOptions([`--run-id=${value}`]), /run-id/u, value);
+  }
+  assert.notEqual(benchmarkProject('soak-a'), benchmarkProject('soak_a'));
 });
 
 test('defaults and overrides', () => {

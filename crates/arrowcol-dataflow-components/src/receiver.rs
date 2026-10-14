@@ -124,11 +124,27 @@ impl DfeAdmission {
         max_concurrent_streams: usize,
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
+        Self::with_permits(
+            sender,
+            leases,
+            instance_id,
+            Arc::new(Semaphore::new(max_concurrent_streams)),
+            metrics,
+        )
+    }
+
+    fn with_permits(
+        sender: Arc<dyn PdataSender>,
+        leases: Arc<dyn LeaseResolver>,
+        instance_id: CollectorInstanceId,
+        permits: Arc<Semaphore>,
+        metrics: Arc<RuntimeMetrics>,
+    ) -> Self {
         Self {
             sender,
             leases,
             instance_id,
-            permits: Arc::new(Semaphore::new(max_concurrent_streams)),
+            permits,
             pending: Arc::new(PendingTracker::new(Arc::clone(&metrics))),
             metrics,
         }
@@ -285,6 +301,7 @@ struct ArrowFlightReceiver {
     config: FlightReceiverConfig,
     routing: Arc<dyn RoutingStore>,
     metrics: Arc<RuntimeMetrics>,
+    permits: Arc<Semaphore>,
 }
 
 fn validate_receiver_config(value: &serde_json::Value) -> Result<(), otel_arrow_dfe_config::error::Error> {
@@ -303,6 +320,9 @@ fn create_receiver(
     config.validate().map_err(config_error)?;
     let routing = config.routing.build().map_err(config_error)?;
     let metrics = global_metrics();
+    let permits = metrics
+        .stream_permits(config.registration.max_concurrent_streams)
+        .map_err(config_error)?;
     metrics.configure_receiver(
         config.registration.max_concurrent_streams,
         config.registration.rss_limit_bytes,
@@ -316,6 +336,7 @@ fn create_receiver(
             config,
             routing,
             metrics,
+            permits,
         },
         node,
         node_config,
@@ -356,13 +377,13 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
             .map_err(|error| receiver_error(&effect_handler, ReceiverErrorKind::Connect, error.to_string()))?;
         self.metrics.set_catalog_ready(true);
         let leases: Arc<dyn LeaseResolver> = Arc::new(StoreLeaseResolver::new(Arc::clone(&self.routing), instance_id));
-        let admission = Arc::new(DfeAdmission::new(
+        let admission = Arc::new(DfeAdmission::with_permits(
             Arc::new(EnginePdataSender {
                 effect_handler: effect_handler.clone(),
             }),
             leases,
             instance_id,
-            self.config.registration.max_concurrent_streams,
+            Arc::clone(&self.permits),
             Arc::clone(&self.metrics),
         ));
         let admission_trait: Arc<dyn BatchAdmission> = Arc::clone(&admission) as Arc<dyn BatchAdmission>;

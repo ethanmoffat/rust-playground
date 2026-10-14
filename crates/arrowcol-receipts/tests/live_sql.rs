@@ -67,6 +67,10 @@ async fn live_receipts_prove_durability_races_and_hot_queries() -> anyhow::Resul
     assert_eq!(duplicates.len(), 2);
     assert_ne!(duplicates[0].receipt_id, duplicates[1].receipt_id);
     assert_eq!(duplicates[0].state, ReceiptState::Accepted);
+    for receipt in &duplicates {
+        assert_eq!(receipt.created_at_unix_ms, receipt.updated_at_unix_ms);
+        assert_eq!(receipt.created_at_unix_ms, receipt.heartbeat_at_unix_ms);
+    }
 
     let first_version = ReceiptVersion::new(duplicates[0].receipt_id, 0);
     let left = {

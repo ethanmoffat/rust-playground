@@ -11,6 +11,8 @@ const compose = YAML.parse(readFileSync(path.join(root, 'projects/loadtest/compo
   services: Record<string, {
     profiles?: string[];
     image?: string;
+    cpus?: string;
+    environment?: Record<string, string>;
     command?: string[];
     ports?: string[];
     secrets?: Array<string | { source: string; target?: string }>;
@@ -46,6 +48,18 @@ test('SQL Server publishes an overridable loopback port and retains its data and
   assert(sqlserver.secrets?.includes('sqlserver_sa_password'));
   const devcontainer = JSON.parse(readFileSync(path.join(root, '.devcontainer/devcontainer.json'), 'utf8'));
   assert.equal(devcontainer.portsAttributes['14333'].onAutoForward, 'ignore');
+});
+
+test('SQL Server has an overridable 16 GiB memory budget for continuous benchmarks', () => {
+  assert.equal(compose.services.sqlserver.environment?.MSSQL_MEMORY_LIMIT_MB,
+    '${SQLSERVER_MEMORY_LIMIT_MB:-16384}');
+});
+
+test('both collectors have equal CPU budgets and explicit matching runtime thread/core counts', () => {
+  assert.equal(compose.services['direct-1'].cpus, '${LOADTEST_CPUS:-2}');
+  assert.equal(compose.services['dataflow-1'].cpus, compose.services['direct-1'].cpus);
+  assert.equal(compose.services['direct-1'].environment?.TOKIO_WORKER_THREADS, '${LOADTEST_CPUS:-2}');
+  assert.deepEqual(compose.services['dataflow-1'].command?.slice(0, 2), ['--num-cores', '${LOADTEST_CPUS:-2}']);
 });
 
 test('portainer is pinned, loopback-only, seeded from the SA secret and stateless', () => {

@@ -15,6 +15,8 @@ pub mod commit;
 #[cfg(feature = "delta")]
 pub mod delta;
 #[cfg(feature = "delta")]
+mod delta_io;
+#[cfg(feature = "delta")]
 pub mod normalize;
 pub mod sizing;
 

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use arrow_deltalake::commit::{BatchedTable, CommitReceiptError};
+use arrow_deltalake::sizing::AdaptiveFileSizeEstimator;
 use async_trait::async_trait;
 use futures::future::{FutureExt, LocalBoxFuture};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -21,9 +22,11 @@ use otel_arrow_dfe_engine::{ConsumerEffectHandlerExtension, ExporterFactory};
 use otel_arrow_dfe_otap::OTAP_EXPORTER_FACTORIES;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::PayloadData;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::time::Instant;
 
 use crate::DeltaExporterConfig;
-use crate::config::{config_error, parse_config, table_path};
+use crate::config::{BatchCapacity, FileBatchConfig, config_error, parse_config, table_path};
 use crate::envelope::{DecodedArrowBatch, EnvelopeError, decode_record_set};
 use crate::metrics::{RuntimeMetrics, global_metrics};
 use crate::routing::{AuthorityClient, LeaseEvidence, RoutingPublicationFence};
@@ -31,7 +34,7 @@ use crate::routing::{AuthorityClient, LeaseEvidence, RoutingPublicationFence};
 /// DFE URN for arbitrary Arrow Delta output.
 pub const ARROW_DELTALAKE_EXPORTER_URN: &str = "urn:otel:exporter:arrow_deltalake";
 
-type BackendRegistry = Mutex<HashMap<DeltaExporterConfig, Weak<DeltaBackend>>>;
+type BackendRegistry = Mutex<HashMap<PathBuf, Weak<DeltaBackend>>>;
 static BACKENDS: LazyLock<BackendRegistry> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Generic Delta exporter runtime.
@@ -41,12 +44,13 @@ pub struct GenericDeltaExporter {
 
 impl GenericDeltaExporter {
     fn shared(config: DeltaExporterConfig, metrics: Arc<RuntimeMetrics>) -> Result<Self, String> {
-        if let Some(existing) = BACKENDS
+        let mut registry = BACKENDS
             .lock()
-            .map_err(|_| "Delta backend registry lock poisoned".to_owned())?
-            .get(&config)
-            .and_then(Weak::upgrade)
-        {
+            .map_err(|_| "Delta backend registry lock poisoned".to_owned())?;
+        if let Some(existing) = registry.get(&config.base_path).and_then(Weak::upgrade) {
+            if existing.configuration.as_ref() != Some(&config) {
+                return Err("conflicting Delta exporter configuration for the same root".to_owned());
+            }
             return Ok(Self { backend: existing });
         }
         let store = config.routing.build()?;
@@ -54,16 +58,18 @@ impl GenericDeltaExporter {
         metrics.configure_exporter(options.max_pending_files);
         let authority = AuthorityClient::start(store, config.authority_timeout, options.max_pending_files)?;
         let backend = Arc::new(DeltaBackend {
+            configuration: Some(config.clone()),
             base_path: config.base_path.clone(),
             options,
+            batching: config.batching.clone(),
+            capacity: Capacity::new(config.batching.global_capacity),
+            flush_slots: Arc::new(Semaphore::new(config.batching.max_concurrent_flushes)),
+            draining: std::sync::atomic::AtomicBool::new(false),
             authority,
             metrics,
             tables: tokio::sync::Mutex::new(HashMap::new()),
         });
-        BACKENDS
-            .lock()
-            .map_err(|_| "Delta backend registry lock poisoned".to_owned())?
-            .insert(config, Arc::downgrade(&backend));
+        registry.insert(config.base_path, Arc::downgrade(&backend));
         Ok(Self { backend })
     }
 
@@ -74,12 +80,38 @@ impl GenericDeltaExporter {
         options: arrow_deltalake::commit::CommitOptions,
         metrics: Arc<RuntimeMetrics>,
     ) -> Result<Self, String> {
+        Self::with_batching(
+            base_path,
+            store,
+            options,
+            FileBatchConfig {
+                max_batches_per_flush: 1,
+                ..Default::default()
+            },
+            metrics,
+        )
+    }
+
+    #[cfg(test)]
+    fn with_batching(
+        base_path: PathBuf,
+        store: Arc<dyn arrowcol_routing::RoutingStore>,
+        options: arrow_deltalake::commit::CommitOptions,
+        batching: FileBatchConfig,
+        metrics: Arc<RuntimeMetrics>,
+    ) -> Result<Self, String> {
+        batching.validate()?;
         metrics.configure_exporter(options.max_pending_files);
         Ok(Self {
             backend: Arc::new(DeltaBackend {
+                configuration: None,
                 base_path,
                 authority: AuthorityClient::start(store, std::time::Duration::from_secs(2), options.max_pending_files)?,
                 options,
+                capacity: Capacity::new(batching.global_capacity),
+                flush_slots: Arc::new(Semaphore::new(batching.max_concurrent_flushes)),
+                batching,
+                draining: std::sync::atomic::AtomicBool::new(false),
                 metrics,
                 tables: tokio::sync::Mutex::new(HashMap::new()),
             }),
@@ -115,8 +147,13 @@ impl GenericDeltaExporter {
 }
 
 struct DeltaBackend {
+    configuration: Option<DeltaExporterConfig>,
     base_path: PathBuf,
     options: arrow_deltalake::commit::CommitOptions,
+    batching: FileBatchConfig,
+    capacity: Capacity,
+    flush_slots: Arc<Semaphore>,
+    draining: std::sync::atomic::AtomicBool,
     authority: AuthorityClient,
     metrics: Arc<RuntimeMetrics>,
     tables: tokio::sync::Mutex<HashMap<arrowcol_protocol::TableIdentity, Arc<TableOwner>>>,
@@ -125,6 +162,9 @@ struct DeltaBackend {
 impl DeltaBackend {
     async fn owner(&self, decoded: &DecodedArrowBatch) -> Result<Arc<TableOwner>, ExportFailure> {
         let mut tables = self.tables.lock().await;
+        if self.draining.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ExportFailure::Transient("Delta exporter is draining".to_owned()));
+        }
         if let Some(owner) = tables.get(&decoded.envelope.table) {
             return Ok(Arc::clone(owner));
         }
@@ -139,16 +179,35 @@ impl DeltaBackend {
         )
         .await
         .map_err(|error| ExportFailure::Transient(error.to_string()))?;
+        let (sender, receiver) = mpsc::channel(self.batching.per_table_capacity.batches as usize);
+        let (drain, drain_rx) = watch::channel(false);
+        let estimator = AdaptiveFileSizeEstimator::new(self.batching.adaptive_file.build())
+            .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
         let owner = Arc::new(TableOwner {
-            table,
+            sender,
+            drain,
+            capacity: Capacity::new(self.batching.per_table_capacity),
             fence,
             state: Mutex::new(OwnerState { evidence, pending: 0 }),
         });
+        tokio::spawn(run_batch_worker(
+            table,
+            receiver,
+            drain_rx,
+            self.batching.clone(),
+            estimator,
+            Arc::clone(&self.flush_slots),
+            Arc::clone(&self.metrics),
+            decoded.envelope.table.clone(),
+        ));
         tables.insert(decoded.envelope.table.clone(), Arc::clone(&owner));
         Ok(owner)
     }
 
     async fn stage_table(&self, decoded: DecodedArrowBatch) -> Result<PendingDelta, ExportFailure> {
+        if self.draining.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ExportFailure::Transient("Delta exporter is draining".to_owned()));
+        }
         let owner = self.owner(&decoded).await?;
         let evidence = LeaseEvidence::from_envelope(&decoded.envelope);
         let pending_owner = owner.begin(evidence)?;
@@ -160,92 +219,260 @@ impl DeltaBackend {
             decoded.envelope.source_schema_version,
             decoded.envelope.target_schema_version,
         );
-        self.metrics.publication_started(&decoded.envelope.table);
-        let staged = async {
-            let mut writer = owner
-                .table
-                .new_file(decoded.batch.schema())
-                .await
-                .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
-            writer
-                .write(&decoded.batch)
-                .await
-                .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
-            let append = writer
-                .stage()
-                .await
-                .map_err(|error| ExportFailure::Transient(error.to_string()))?;
-            let receipt = owner
-                .table
-                .submit(append, false)
-                .await
-                .map_err(|error| ExportFailure::Transient(error.to_string()))?;
-            Ok::<_, ExportFailure>(receipt)
-        }
-        .await;
-        let receipt = match staged {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                self.metrics
-                    .publication_finished(&decoded.envelope.table, rows, bytes, None);
-                return Err(error);
-            }
-        };
-        Ok(PendingDelta {
-            receipt: Some(receipt),
-            pending_owner: Some(pending_owner),
-            metrics: Arc::clone(&self.metrics),
-            table: decoded.envelope.table,
-            rows,
-            bytes,
-            accounted: false,
-        })
+        let mut capacity = self.capacity.acquire(rows, bytes)?;
+        capacity.extend(owner.capacity.acquire(rows, bytes)?);
+        let (reply, receipt) = oneshot::channel();
+        owner
+            .sender
+            .try_send(QueuedBatch {
+                batch: decoded.batch,
+                target_schema_version: decoded.envelope.target_schema_version.get(),
+                rows,
+                bytes,
+                accepted: Instant::now(),
+                reply: Some(reply),
+                _pending_owner: pending_owner,
+                _capacity: capacity,
+            })
+            .map_err(|error| ExportFailure::Transient(format!("Delta file queue admission failed: {error}")))?;
+        Ok(PendingDelta { receipt })
     }
 
     async fn start_draining(&self) {
+        self.draining.store(true, std::sync::atomic::Ordering::Release);
         let tables = self.tables.lock().await;
         for owner in tables.values() {
-            owner.table.start_draining();
+            owner.drain.send_replace(true);
         }
     }
 }
 
 struct PendingDelta {
-    receipt: Option<arrow_deltalake::commit::CommitReceipt>,
-    pending_owner: Option<PendingOwner>,
-    metrics: Arc<RuntimeMetrics>,
-    table: arrowcol_protocol::TableIdentity,
-    rows: u64,
-    bytes: u64,
-    accounted: bool,
+    receipt: oneshot::Receiver<Result<(), ExportFailure>>,
 }
 
 impl PendingDelta {
-    async fn wait(mut self) -> Result<(), ExportFailure> {
-        let receipt = self
-            .receipt
-            .take()
-            .ok_or_else(|| ExportFailure::Transient("Delta receipt is missing".to_owned()))?;
-        let result = receipt.wait_typed().await.map_err(map_receipt_error);
-        match &result {
-            Ok(append) => self
-                .metrics
-                .publication_finished(&self.table, self.rows, self.bytes, Some(append.version)),
-            Err(_) => self
-                .metrics
-                .publication_finished(&self.table, self.rows, self.bytes, None),
-        }
-        self.accounted = true;
-        let _ = self.pending_owner.take();
-        result.map(|_| ())
+    async fn wait(self) -> Result<(), ExportFailure> {
+        self.receipt
+            .await
+            .map_err(|error| ExportFailure::Transient(format!("Delta file publication worker disappeared: {error}")))?
     }
 }
 
-impl Drop for PendingDelta {
+struct Capacity {
+    bytes: Arc<Semaphore>,
+    rows: Arc<Semaphore>,
+    batches: Arc<Semaphore>,
+}
+
+impl Capacity {
+    fn new(limits: BatchCapacity) -> Self {
+        Self {
+            bytes: Arc::new(Semaphore::new(limits.bytes as usize)),
+            rows: Arc::new(Semaphore::new(limits.rows as usize)),
+            batches: Arc::new(Semaphore::new(limits.batches as usize)),
+        }
+    }
+
+    fn acquire(&self, rows: u64, bytes: u64) -> Result<Vec<OwnedSemaphorePermit>, ExportFailure> {
+        let rows = u32::try_from(rows).map_err(|error| ExportFailure::Permanent(error.to_string()))?;
+        let bytes = u32::try_from(bytes).map_err(|error| ExportFailure::Permanent(error.to_string()))?;
+        [
+            (Arc::clone(&self.bytes), bytes),
+            (Arc::clone(&self.rows), rows),
+            (Arc::clone(&self.batches), 1),
+        ]
+        .into_iter()
+        .map(|(capacity, amount)| {
+            capacity
+                .try_acquire_many_owned(amount)
+                .map_err(|error| ExportFailure::Transient(format!("Arrow file buffering capacity exhausted: {error}")))
+        })
+        .collect()
+    }
+}
+
+struct QueuedBatch {
+    batch: arrow_array::RecordBatch,
+    target_schema_version: u64,
+    rows: u64,
+    bytes: u64,
+    accepted: Instant,
+    reply: Option<oneshot::Sender<Result<(), ExportFailure>>>,
+    _pending_owner: PendingOwner,
+    _capacity: Vec<OwnedSemaphorePermit>,
+}
+
+impl QueuedBatch {
+    fn complete(&mut self, result: &Result<(), ExportFailure>) {
+        if let Some(reply) = self.reply.take() {
+            let result = match result {
+                Ok(()) => Ok(()),
+                Err(error) if error.permanent() => Err(ExportFailure::Permanent(error.to_string())),
+                Err(error) => Err(ExportFailure::Transient(error.to_string())),
+            };
+            let _ = reply.send(result);
+        }
+    }
+}
+
+impl Drop for QueuedBatch {
     fn drop(&mut self) {
-        if !self.accounted {
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(Err(ExportFailure::Transient(
+                "Delta file worker stopped before publication completed".to_owned(),
+            )));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_batch_worker(
+    table: Arc<BatchedTable>,
+    mut receiver: mpsc::Receiver<QueuedBatch>,
+    mut drain: watch::Receiver<bool>,
+    policy: FileBatchConfig,
+    mut estimator: AdaptiveFileSizeEstimator,
+    flush_slots: Arc<Semaphore>,
+    metrics: Arc<RuntimeMetrics>,
+    identity: arrowcol_protocol::TableIdentity,
+) {
+    let mut group: Vec<QueuedBatch> = Vec::new();
+    let mut rows = 0;
+    let mut bytes = 0;
+    let mut closing = false;
+    loop {
+        let next = if closing {
+            receiver.recv().await
+        } else if let Some(first) = group.first() {
+            tokio::select! {
+                next = receiver.recv() => next,
+                _ = tokio::time::sleep_until(first.accepted + policy.max_age) => {
+                    publish_group(&table, &mut group, &mut estimator, &flush_slots, &metrics, &identity).await;
+                    rows = 0;
+                    bytes = 0;
+                    continue;
+                }
+                _ = drain.changed() => {
+                    receiver.close();
+                    closing = true;
+                    continue;
+                }
+            }
+        } else {
+            tokio::select! {
+                next = receiver.recv() => next,
+                _ = drain.changed() => {
+                    receiver.close();
+                    closing = true;
+                    continue;
+                }
+            }
+        };
+        let Some(next) = next else {
+            publish_group(&table, &mut group, &mut estimator, &flush_slots, &metrics, &identity).await;
+            table.start_draining();
+            break;
+        };
+        if group.first().is_some_and(|first| {
+            first.target_schema_version != next.target_schema_version
+                || first.batch.schema_ref() != next.batch.schema_ref()
+        }) {
+            publish_group(&table, &mut group, &mut estimator, &flush_slots, &metrics, &identity).await;
+            rows = 0;
+            bytes = 0;
+        }
+        rows += next.rows;
+        bytes += next.bytes;
+        group.push(next);
+        if estimator.should_flush(bytes)
+            || bytes >= policy.max_arrow_memory_per_flush
+            || rows >= policy.max_rows_per_flush
+            || group.len() as u64 >= policy.max_batches_per_flush
+        {
+            publish_group(&table, &mut group, &mut estimator, &flush_slots, &metrics, &identity).await;
+            rows = 0;
+            bytes = 0;
+        }
+    }
+}
+
+async fn publish_group(
+    table: &BatchedTable,
+    group: &mut Vec<QueuedBatch>,
+    estimator: &mut AdaptiveFileSizeEstimator,
+    flush_slots: &Arc<Semaphore>,
+    metrics: &RuntimeMetrics,
+    identity: &arrowcol_protocol::TableIdentity,
+) {
+    if group.is_empty() {
+        return;
+    }
+    let rows = group.iter().map(|entry| entry.rows).sum();
+    let bytes = group.iter().map(|entry| entry.bytes).sum();
+    metrics.publication_started(identity);
+    let mut accounting = PublicationAccounting {
+        metrics,
+        identity,
+        rows,
+        bytes,
+        finished: false,
+    };
+    let result = async {
+        let _slot = flush_slots
+            .acquire()
+            .await
+            .map_err(|error| ExportFailure::Transient(error.to_string()))?;
+        let mut writer = table
+            .new_file(group[0].batch.schema())
+            .await
+            .map_err(|error| ExportFailure::Transient(error.to_string()))?;
+        for entry in group.iter() {
+            writer
+                .write(&entry.batch)
+                .await
+                .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
+        }
+        let append = writer
+            .stage()
+            .await
+            .map_err(|error| ExportFailure::Transient(error.to_string()))?;
+        let observation = append.observation();
+        let mut updated_estimator = estimator.clone();
+        updated_estimator
+            .observe(observation)
+            .map_err(|error| ExportFailure::Permanent(format!("file sizing observation failed: {error}")))?;
+        let receipt = table
+            .submit(append, true)
+            .await
+            .map_err(|error| ExportFailure::Transient(error.to_string()))?;
+        let committed = receipt.wait_typed().await.map_err(map_receipt_error)?;
+        *estimator = updated_estimator;
+        Ok::<_, ExportFailure>(committed.version)
+    }
+    .await;
+    metrics.publication_finished(identity, rows, bytes, result.as_ref().ok().copied());
+    accounting.finished = true;
+    let outcome = result.map(|_| ());
+    for mut entry in group.drain(..) {
+        entry.complete(&outcome);
+    }
+}
+
+struct PublicationAccounting<'a> {
+    metrics: &'a RuntimeMetrics,
+    identity: &'a arrowcol_protocol::TableIdentity,
+    rows: u64,
+    bytes: u64,
+    finished: bool,
+}
+
+impl Drop for PublicationAccounting<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
             self.metrics
-                .publication_finished(&self.table, self.rows, self.bytes, None);
+                .publication_finished(self.identity, self.rows, self.bytes, None);
+            self.metrics.set_healthy(false);
         }
     }
 }
@@ -256,7 +483,9 @@ struct OwnerState {
 }
 
 struct TableOwner {
-    table: Arc<BatchedTable>,
+    sender: mpsc::Sender<QueuedBatch>,
+    drain: watch::Sender<bool>,
+    capacity: Capacity,
     fence: Arc<RoutingPublicationFence>,
     state: Mutex<OwnerState>,
 }
@@ -527,6 +756,14 @@ mod tests {
     }
 
     fn pdata(lease: &arrowcol_routing::RoutingLease, fencing_token: FencingToken) -> OtapPdata {
+        versioned_pdata(lease, fencing_token, SchemaVersion::FIRST)
+    }
+
+    fn versioned_pdata(
+        lease: &arrowcol_routing::RoutingLease,
+        fencing_token: FencingToken,
+        target_schema_version: SchemaVersion,
+    ) -> OtapPdata {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::UInt64, false),
             Field::new("value", DataType::Utf8, true),
@@ -543,7 +780,7 @@ mod tests {
             ArrowcolBatchEnvelope {
                 table: table(),
                 source_schema_version: SchemaVersion::FIRST,
-                target_schema_version: SchemaVersion::FIRST,
+                target_schema_version,
                 lease_id: lease.lease_id,
                 holder_instance_id: lease.holder_instance_id,
                 fencing_token,
@@ -664,6 +901,312 @@ mod tests {
                 .path()
                 .join("demo/generated/events/_delta_log/00000000000000000001.json")
                 .exists()
+        );
+    }
+
+    /// Scenario: Two same-schema pdata batches reach the shared file-size threshold.
+    /// Guarantees: One Parquet file publishes both batches and releases their capacity only after commit.
+    #[tokio::test]
+    async fn coalesces_batches_before_acknowledgement() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let metrics = Arc::new(RuntimeMetrics::new(holder));
+        let exporter = GenericDeltaExporter::with_batching(
+            directory.path().to_path_buf(),
+            store as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions::default(),
+            FileBatchConfig {
+                max_batches_per_flush: 2,
+                max_age: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+            Arc::clone(&metrics),
+        )
+        .expect("exporter");
+        let first = exporter.stage(pdata(&lease, lease.fencing_epoch)).await.expect("first");
+        assert!(exporter.backend.capacity.batches.available_permits() < 4096);
+        assert!(
+            !directory
+                .path()
+                .join("demo/generated/events/_delta_log/00000000000000000001.json")
+                .exists()
+        );
+        let second = exporter
+            .stage(pdata(&lease, lease.fencing_epoch))
+            .await
+            .expect("second");
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            first.wait().await.expect("first publication");
+            second.wait().await.expect("second publication");
+        })
+        .await
+        .expect("bounded publication");
+        let files = std::fs::read_dir(directory.path().join("demo/generated/events"))
+            .expect("files")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "parquet"))
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&files[0]).expect("file"))
+            .expect("reader")
+            .build()
+            .expect("build");
+        assert_eq!(reader.map(|batch| batch.expect("batch").num_rows()).sum::<usize>(), 4);
+        assert!(metrics.prometheus().contains("arrowcol_delta_files_total 1\n"));
+        assert_eq!(exporter.backend.capacity.batches.available_permits(), 4096);
+    }
+
+    /// Scenario: A sparse table receives one batch below the size and row thresholds.
+    /// Guarantees: The age timer publishes it without additional traffic or a shutdown request.
+    #[tokio::test]
+    async fn sparse_tables_flush_at_max_age() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let exporter = GenericDeltaExporter::with_batching(
+            directory.path().to_path_buf(),
+            store as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions::default(),
+            FileBatchConfig {
+                max_age: std::time::Duration::from_millis(20),
+                ..Default::default()
+            },
+            Arc::new(RuntimeMetrics::new(holder)),
+        )
+        .expect("exporter");
+        let publication = exporter.stage(pdata(&lease, lease.fencing_epoch)).await.expect("stage");
+        tokio::time::timeout(std::time::Duration::from_secs(3), publication.wait())
+            .await
+            .expect("age flush")
+            .expect("publication");
+    }
+
+    /// Scenario: A batch exceeds the configured row capacity after acquiring its byte permits.
+    /// Guarantees: Admission fails explicitly, refunds partial capacity, and never creates a data file.
+    #[tokio::test]
+    async fn exhausted_capacity_is_explicit_and_refunded() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let mut policy = FileBatchConfig::default();
+        policy.global_capacity.rows = 1;
+        policy.per_table_capacity.rows = 1;
+        policy.max_rows_per_flush = 1;
+        let exporter = GenericDeltaExporter::with_batching(
+            directory.path().to_path_buf(),
+            store as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions::default(),
+            policy.clone(),
+            Arc::new(RuntimeMetrics::new(holder)),
+        )
+        .expect("exporter");
+        let result = exporter.stage(pdata(&lease, lease.fencing_epoch)).await;
+        assert!(matches!(result, Err(ExportFailure::Transient(message)) if message.contains("capacity exhausted")));
+        assert_eq!(
+            exporter.backend.capacity.bytes.available_permits(),
+            policy.global_capacity.bytes as usize
+        );
+        assert!(!directory.path().join("demo/generated/events/_delta_log").exists());
+    }
+
+    /// Scenario: A new fencing epoch arrives while a partial old-epoch file is retained.
+    /// Guarantees: The epochs are not mixed, and shutdown still publishes the admitted old-epoch batch.
+    #[tokio::test]
+    async fn ownership_transition_cannot_mix_pending_batches() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let exporter = GenericDeltaExporter::with_batching(
+            directory.path().to_path_buf(),
+            store as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions::default(),
+            FileBatchConfig {
+                max_age: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+            Arc::new(RuntimeMetrics::new(holder)),
+        )
+        .expect("exporter");
+        let publication = exporter
+            .stage(pdata(&lease, lease.fencing_epoch))
+            .await
+            .expect("old epoch");
+        let next = exporter
+            .stage(pdata(&lease, lease.fencing_epoch.next().expect("epoch")))
+            .await;
+        assert!(matches!(next, Err(ExportFailure::Transient(message)) if message.contains("lease changed")));
+        exporter.backend.start_draining().await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), publication.wait())
+            .await
+            .expect("drain")
+            .expect("old epoch publication");
+    }
+
+    /// Scenario: Same-shaped batches have different catalog schema versions.
+    /// Guarantees: The catalog boundary splits files, and draining publishes the residual group.
+    #[tokio::test]
+    async fn schema_version_transition_splits_files() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let exporter = GenericDeltaExporter::with_batching(
+            directory.path().to_path_buf(),
+            store as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions::default(),
+            FileBatchConfig {
+                max_age: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+            Arc::new(RuntimeMetrics::new(holder)),
+        )
+        .expect("exporter");
+        let first = exporter.stage(pdata(&lease, lease.fencing_epoch)).await.expect("first");
+        let second = exporter
+            .stage(versioned_pdata(
+                &lease,
+                lease.fencing_epoch,
+                SchemaVersion::new(2).expect("version"),
+            ))
+            .await
+            .expect("second");
+        tokio::time::timeout(std::time::Duration::from_secs(3), first.wait())
+            .await
+            .expect("schema boundary")
+            .expect("first publication");
+        exporter.backend.start_draining().await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), second.wait())
+            .await
+            .expect("drain")
+            .expect("second publication");
+        let files = std::fs::read_dir(directory.path().join("demo/generated/events"))
+            .expect("files")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "parquet"))
+            .count();
+        assert_eq!(files, 2);
+    }
+
+    /// Scenario: Multiple batches in one grouped file carry a stale authoritative lease.
+    /// Guarantees: Every completion fails, capacity is refunded, and no output is reported as published.
+    #[tokio::test]
+    async fn grouped_publication_failure_settles_all_batches() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let metrics = Arc::new(RuntimeMetrics::new(holder));
+        let exporter = GenericDeltaExporter::with_batching(
+            directory.path().to_path_buf(),
+            store as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions::default(),
+            FileBatchConfig {
+                max_batches_per_flush: 2,
+                ..Default::default()
+            },
+            Arc::clone(&metrics),
+        )
+        .expect("exporter");
+        let stale = lease.fencing_epoch.next().expect("epoch");
+        let first = exporter.stage(pdata(&lease, stale)).await.expect("first");
+        let second = exporter.stage(pdata(&lease, stale)).await.expect("second");
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            assert!(
+                first
+                    .wait()
+                    .await
+                    .expect_err("first fenced")
+                    .to_string()
+                    .contains("routing lease")
+            );
+            assert!(
+                second
+                    .wait()
+                    .await
+                    .expect_err("second fenced")
+                    .to_string()
+                    .contains("routing lease")
+            );
+        })
+        .await
+        .expect("bounded failures");
+        assert_eq!(exporter.backend.capacity.batches.available_permits(), 4096);
+        assert!(metrics.prometheus().contains("arrowcol_delta_files_total 0\n"));
+        assert!(metrics.prometheus().contains("arrowcol_delta_failures_total 1\n"));
+    }
+
+    /// Scenario: Concurrent pipeline cores create exporters for the same root.
+    /// Guarantees: They share one backend, and incompatible policies are rejected rather than silently reused.
+    #[test]
+    fn concurrent_exporters_share_only_matching_configuration() {
+        let directory = tempfile::tempdir().expect("directory");
+        let config = DeltaExporterConfig {
+            base_path: directory.path().to_path_buf(),
+            routing: crate::config::RoutingStoreConfig::Memory,
+            commit: crate::config::CommitConfig::default(),
+            batching: FileBatchConfig::default(),
+            authority_timeout: std::time::Duration::from_secs(2),
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
+        let exporters = std::thread::scope(|scope| {
+            (0..4)
+                .map(|_| {
+                    let config = config.clone();
+                    let barrier = Arc::clone(&barrier);
+                    let metrics = Arc::clone(&metrics);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        GenericDeltaExporter::shared(config, metrics).expect("shared")
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().expect("thread"))
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            exporters
+                .iter()
+                .all(|exporter| Arc::ptr_eq(&exporter.backend, &exporters[0].backend))
+        );
+        let mut different = config;
+        different.batching.max_age = std::time::Duration::from_secs(1);
+        assert!(GenericDeltaExporter::shared(different, metrics).is_err());
+    }
+
+    /// Scenario: A grouped file task disappears after accounting begins.
+    /// Guarantees: Pending publication pressure is released and health reports the failure.
+    #[test]
+    fn cancelled_publication_releases_accounting_and_marks_unhealthy() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        let identity = table();
+        metrics.publication_started(&identity);
+        {
+            let _accounting = PublicationAccounting {
+                metrics: &metrics,
+                identity: &identity,
+                rows: 2,
+                bytes: 32,
+                finished: false,
+            };
+        }
+        assert!(!metrics.healthy());
+        assert!(metrics.prometheus().contains("arrowcol_delta_failures_total 1\n"));
+        assert_eq!(
+            metrics
+                .pressure()
+                .expect("pressure")
+                .rich
+                .pending_commits
+                .current()
+                .get(),
+            0
         );
     }
 

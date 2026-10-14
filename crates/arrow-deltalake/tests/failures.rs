@@ -19,6 +19,7 @@ use std::sync::{
 enum Fault {
     Conflict,
     Uncertain,
+    ObserveReads,
 }
 
 #[derive(Debug)]
@@ -26,6 +27,9 @@ struct FaultStore {
     inner: LocalFileSystem,
     fault: Fault,
     attempts: AtomicUsize,
+    reads: AtomicUsize,
+    active_reads: AtomicUsize,
+    peak_reads: AtomicUsize,
 }
 
 impl std::fmt::Display for FaultStore {
@@ -53,6 +57,7 @@ impl ObjectStore for FaultStore {
                         source: Box::new(std::io::Error::other("injected failure after publishing the log")),
                     });
                 }
+                Fault::ObserveReads => {}
             }
         }
         self.inner.put_opts(path, payload, options).await
@@ -67,6 +72,15 @@ impl ObjectStore for FaultStore {
     }
 
     async fn get_opts(&self, path: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+        if matches!(self.fault, Fault::ObserveReads) && !options.head {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let active = self.active_reads.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_reads.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let result = self.inner.get_opts(path, options).await;
+            self.active_reads.fetch_sub(1, Ordering::SeqCst);
+            return result;
+        }
         self.inner.get_opts(path, options).await
     }
 
@@ -100,6 +114,9 @@ async fn failed_append(fault: Fault) -> Result<()> {
         inner: LocalFileSystem::new(),
         fault,
         attempts: AtomicUsize::new(0),
+        reads: AtomicUsize::new(0),
+        active_reads: AtomicUsize::new(0),
+        peak_reads: AtomicUsize::new(0),
     });
     let table = DeltaTable::open_with_store(directory.path(), Arc::<FaultStore>::clone(&store))?;
     let input = RecordBatch::try_new(
@@ -128,4 +145,43 @@ async fn commit_conflict_is_not_retried() -> Result<()> {
 #[tokio::test]
 async fn uncertain_published_commit_is_not_replayed() -> Result<()> {
     failed_append(Fault::Uncertain).await
+}
+
+/// Scenario: reopening a table must replay many commits before reaching its original metadata.
+/// Guarantees: read-ahead stays at eight, replay remains fresh, and historic corruption is visible.
+#[tokio::test(flavor = "current_thread")]
+async fn history_replay_has_bounded_readahead_and_detects_corruption() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let table = DeltaTable::open(directory.path())?;
+    let input = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )?;
+    let mut file = table.new_file(input.schema())?;
+    file.write(&input).await?;
+    file.finish().await?;
+    // External commits without metadata force replay back to the initial schema.
+    let append = std::fs::read(directory.path().join("_delta_log/00000000000000000001.json"))?;
+    for version in 2..40 {
+        std::fs::write(directory.path().join(format!("_delta_log/{version:020}.json")), &append)?;
+    }
+    drop(table);
+    let store = Arc::new(FaultStore {
+        inner: LocalFileSystem::new(),
+        fault: Fault::ObserveReads,
+        attempts: AtomicUsize::new(0),
+        reads: AtomicUsize::new(0),
+        active_reads: AtomicUsize::new(0),
+        peak_reads: AtomicUsize::new(0),
+    });
+    let table = DeltaTable::open_with_store(directory.path(), Arc::<FaultStore>::clone(&store))?;
+    assert_eq!(table.version()?, 39);
+    assert!(store.reads.load(Ordering::SeqCst) >= 40);
+    assert!((2..=8).contains(&store.peak_reads.load(Ordering::SeqCst)));
+    let prepared = table.new_file(input.schema())?;
+    std::fs::write(directory.path().join("_delta_log/00000000000000000000.json"), "corrupt")?;
+    assert!(table.version().is_err());
+    assert!(table.new_file(input.schema()).is_err());
+    drop(prepared);
+    Ok(())
 }

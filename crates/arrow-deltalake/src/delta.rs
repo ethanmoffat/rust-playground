@@ -1,5 +1,6 @@
 //! Local, append-only Delta tables backed exclusively by Delta Kernel.
 
+use crate::delta_io::{BATCH_ROWS, READ_AHEAD, SharedExecutor, shared_executor};
 use crate::{
     CompletedFile, CompletedFileObservation, ParquetFileWriter, normalize, record_batch_logical_bytes, sync_directory,
 };
@@ -12,7 +13,6 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::schema::StructType;
 use delta_kernel::transaction::{BoundWriteContext, CommitResult};
 use delta_kernel::{DeltaResult, DeltaResultIterator, Engine, FileMeta, FilteredEngineData, Snapshot, SnapshotRef};
-use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::parquet::DataFileMetadata;
 use delta_kernel_default_engine::stats::FileStatsAccumulator;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder, build_add_file_metadata};
@@ -20,12 +20,136 @@ use fs2::FileExt;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 use url::Url;
 
-type LocalEngine = DefaultEngine<TokioBackgroundExecutor>;
+type LocalEngine = DefaultEngine<SharedExecutor>;
+
+/// Initialize the process-wide Delta I/O runtime before applying thread affinity.
+///
+/// Both collectors should call this from their unpinned main thread. Table
+/// opening initializes it lazily for callers that do not use thread affinity.
+/// The runtime uses two async workers and at most 32 blocking workers; engines
+/// read ahead eight files and yield at most 256 rows per JSON/Parquet batch.
+///
+/// # Errors
+/// Returns runtime creation errors, including a previous initialization failure.
+pub fn initialize_shared_io() -> Result<()> {
+    shared_executor().map(|_| ())
+}
+
+#[cfg(test)]
+mod io_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::collections::HashSet;
+
+    /// Scenario: thirteen tables accumulate 16 then 32 real appends, retaining every log across reopen.
+    /// Guarantees: current-thread calls share one runtime, replay growing histories, and keep I/O workers bounded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn thirteen_tables_share_bounded_executor_with_growing_retained_histories() -> Result<()> {
+        initialize_shared_io()?;
+        initialize_shared_io()?;
+        let directory = tempfile::tempdir()?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![42]))],
+        )?;
+        let mut tables = Vec::new();
+        let mut runtimes = HashSet::new();
+        for index in 0..13 {
+            let table = DeltaTable::open(directory.path().join(index.to_string()))?;
+            {
+                let _guard = table.engine.enter();
+                runtimes.insert(tokio::runtime::Handle::current().id());
+            }
+            table.new_file(Arc::clone(&schema))?;
+            assert_eq!(table.version()?, 0);
+            tables.push(table);
+        }
+        assert_eq!(runtimes.len(), 1);
+        for (previous_version, version) in [(0, 16), (16, 32)] {
+            for table in &tables {
+                for expected_version in previous_version + 1..=version {
+                    let mut file = table.new_file(input.schema())?;
+                    file.write(&input).await?;
+                    assert_eq!(file.finish().await?.version, expected_version);
+                }
+                assert_eq!(table.version()?, version);
+            }
+            #[cfg(target_os = "linux")]
+            crate::delta_io::assert_worker_bound()?;
+            drop(tables);
+            tables = Vec::new();
+            for index in 0..13 {
+                let path = directory.path().join(index.to_string());
+                let table = DeltaTable::open(&path)?;
+                assert_eq!(table.version()?, version);
+                let log = path.join("_delta_log");
+                let retained_json_logs = fs::read_dir(&log)?
+                    .map(|entry| {
+                        entry.map(|entry| {
+                            usize::from(entry.path().extension().is_some_and(|extension| extension == "json"))
+                        })
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?
+                    .into_iter()
+                    .sum::<usize>();
+                assert_eq!(u64::try_from(retained_json_logs)?, version + 1);
+                assert!(log.join("00000000000000000000.json").exists());
+                {
+                    let _guard = table.engine.enter();
+                    assert!(runtimes.contains(&tokio::runtime::Handle::current().id()));
+                }
+                tables.push(table);
+            }
+            assert_eq!(tables.len(), 13);
+            #[cfg(target_os = "linux")]
+            crate::delta_io::assert_worker_bound()?;
+        }
+        Ok(())
+    }
+
+    /// Scenario: a large JSON commit spans more rows than the SDK's batch limit.
+    /// Guarantees: the shared engine yields bounded batches without losing or reordering rows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn json_batches_have_bounded_rows() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let table = DeltaTable::open(directory.path())?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let path = directory.path().join("rows.json");
+        let rows = (0..1025).map(|id| format!("{{\"id\":{id}}}\n")).collect::<String>();
+        fs::write(&path, &rows)?;
+        let url = Url::from_file_path(&path).map_err(|()| anyhow::anyhow!("invalid JSON path"))?;
+        let files = [FileMeta::new(url, 0, u64::try_from(rows.len())?)];
+        let batches =
+            table
+                .engine
+                .json_handler()
+                .read_json_files(&files, Arc::new(StructType::try_from_arrow(schema)?), None)?;
+        let mut count = 0;
+        for batch in batches {
+            let batch = batch?;
+            let batch = batch.try_into_record_batch()?;
+            assert!((1..=BATCH_ROWS).contains(&batch.num_rows()));
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .context("unexpected JSON column type")?;
+            for id in ids.values() {
+                assert_eq!(*id, count);
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1025);
+        Ok(())
+    }
+}
 
 // Older and renamed writers must contend for the same persisted lock.
 const WRITER_LOCK: &str = ".arrow-lake-writer.lock";
@@ -263,7 +387,11 @@ impl DeltaTable {
         lock.try_lock_exclusive()
             .with_context(|| format!("Delta table already has a writer: {}", root.display()))?;
         let url = Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table path"))?;
-        let engine = DefaultEngineBuilder::new(store).build();
+        let engine = DefaultEngineBuilder::new(store)
+            .with_task_executor(shared_executor()?)
+            .with_buffer_size(NonZeroUsize::new(READ_AHEAD).context("invalid Delta read-ahead")?)
+            .with_batch_size(NonZeroUsize::new(BATCH_ROWS).context("invalid Delta batch size")?)
+            .build();
         Ok(Arc::new(Self {
             root,
             url,
@@ -278,7 +406,7 @@ impl DeltaTable {
         Ok(Snapshot::builder_for(self.url.as_str()).build(&self.engine)?)
     }
 
-    fn ensure_schema(&self, incoming: SchemaRef) -> Result<SchemaRef> {
+    fn ensure_schema(&self, incoming: SchemaRef) -> Result<SnapshotRef> {
         let _guard = self
             .commit_lock
             .lock()
@@ -328,8 +456,12 @@ impl DeltaTable {
             }
             let transaction = builder.build(&self.engine, Box::new(DurableCommitter))?;
             committed(transaction.commit(&self.engine)?)?;
+            return self.snapshot();
         }
-        Ok(Arc::new(self.snapshot()?.schema().as_ref().try_into_arrow()?))
+        // Reuse only this freshly validated snapshot, never a cross-operation
+        // cache. Publication still rebuilds latest state to detect corruption
+        // and external schema changes/conflicts.
+        Ok(snapshot)
     }
 
     /// Open a streaming file using a raw Arrow schema, evolving nullable top-level columns.
@@ -337,8 +469,8 @@ impl DeltaTable {
     /// # Errors
     /// Returns ownership, schema, Kernel, and file creation errors.
     pub fn new_file(self: &Arc<Self>, input: SchemaRef) -> Result<DeltaFileWriter> {
-        let schema = self.ensure_schema(normalize::schema(&input)?)?;
-        let snapshot = self.snapshot()?;
+        let snapshot = self.ensure_schema(normalize::schema(&input)?)?;
+        let schema = Arc::new(snapshot.schema().as_ref().try_into_arrow()?);
         let transaction = snapshot.transaction(Box::new(DurableCommitter), &self.engine)?;
         let context = transaction.write_state()?.write_context_builder().build()?;
         let path = self.root.join(format!("part-{}.parquet", uuid::Uuid::new_v4()));

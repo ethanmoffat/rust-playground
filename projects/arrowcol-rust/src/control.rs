@@ -94,7 +94,7 @@ pub struct CollectorStatus {
     max_request_bytes: PositiveMeasurement,
     max_concurrent_streams: PositiveMeasurement,
     max_pending_receipts: PositiveMeasurement,
-    max_concurrent_flushes: u64,
+    max_pending_publications: u64,
     routing: RoutingConfig,
     flags: RwLock<StatusFlags>,
 }
@@ -137,8 +137,7 @@ impl CollectorStatus {
             )?,
             max_concurrent_streams: PositiveMeasurement::new(config.flight.max_concurrent_streams)?,
             max_pending_receipts: PositiveMeasurement::new(config.buffer.global_capacity.batches)?,
-            max_concurrent_flushes: u64::try_from(config.buffer.max_concurrent_flushes)
-                .context("flush concurrency exceeds protocol range")?,
+            max_pending_publications: publication_capacity(config)?,
             routing: config.routing.clone(),
             flags: RwLock::new(StatusFlags {
                 healthy: true,
@@ -262,7 +261,7 @@ impl CollectorStatus {
         let buffered_rows = gauge(pressure.global.rows, pressure.global.limits.rows)?;
         let buffered_batches = gauge(pressure.global.batches, pressure.global.limits.batches)?;
         let active_flushes = u64::try_from(pressure.active_flushes).unwrap_or(u64::MAX);
-        let pending_commits = gauge(active_flushes, self.max_concurrent_flushes)?;
+        let pending_commits = gauge(active_flushes, self.max_pending_publications)?;
         let available = self.max_concurrent_streams.get().saturating_sub(active.current().get());
         let available_permits = gauge(available, self.max_concurrent_streams.get())?;
         let rss = read_rss_bytes().unwrap_or(0).min(self.routing.rss_limit_bytes);
@@ -380,7 +379,7 @@ impl PressureReporter for CollectorStatus {
             gauge(pressure.global.bytes, pressure.global.limits.bytes).map_err(|_| RuntimeError::internal())?;
         let publication = gauge(
             u64::try_from(pressure.active_flushes).unwrap_or(u64::MAX),
-            self.max_concurrent_flushes,
+            self.max_pending_publications,
         )
         .map_err(|_| RuntimeError::internal())?;
         let memory = buffered.utilization();
@@ -750,6 +749,10 @@ fn gauge(current: u64, limit: u64) -> Result<PressureGauge> {
     PressureGauge::new(Measurement::new(current.min(limit.get()))?, limit).map_err(Into::into)
 }
 
+fn publication_capacity(config: &CollectorConfig) -> Result<u64> {
+    u64::try_from(config.delta.max_pending_files).context("publication queue capacity exceeds protocol range")
+}
+
 /// Builds the portable table identity used only for dependency read probes.
 ///
 /// # Errors
@@ -819,4 +822,24 @@ pub async fn finish_owner_drain(receipts: &dyn ReceiptStore, instance_id: Collec
 #[must_use]
 pub fn pending_receipts(pressure: &BufferPressureSnapshot) -> u64 {
     pressure.global.batches
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    /// Scenario: Every bounded file-writing slot is doing useful work.
+    /// Guarantees: Normal worker utilization does not become hard publication-queue pressure.
+    #[test]
+    fn busy_flush_workers_are_not_a_full_publication_queue() {
+        let config = CollectorConfig::from_yaml(include_bytes!("../config.yaml")).expect("configuration");
+        let capacity = publication_capacity(&config).expect("capacity");
+        assert_eq!(capacity, config.delta.max_pending_files as u64);
+        let busy = gauge(config.buffer.max_concurrent_flushes as u64, capacity).expect("busy");
+        assert!(busy.utilization().get() < 9_500);
+        let full = gauge(capacity, capacity).expect("full");
+        assert_eq!(full.utilization().get(), BasisPoints::FULL_SCALE);
+    }
 }

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use arrowcol_catalog::SchemaVersion;
 use arrowcol_protocol::{
@@ -69,6 +69,7 @@ pub struct RuntimeMetrics {
     delta_bytes: AtomicU64,
     delta_failures: AtomicU64,
     max_concurrent_streams: AtomicU64,
+    stream_permits: OnceLock<(usize, Arc<tokio::sync::Semaphore>)>,
     rss_limit_bytes: AtomicU64,
     buffered_bytes_limit: AtomicU64,
     buffered_rows_limit: AtomicU64,
@@ -105,6 +106,7 @@ impl RuntimeMetrics {
             delta_bytes: AtomicU64::new(0),
             delta_failures: AtomicU64::new(0),
             max_concurrent_streams: AtomicU64::new(1),
+            stream_permits: OnceLock::new(),
             rss_limit_bytes: AtomicU64::new(1),
             buffered_bytes_limit: AtomicU64::new(1),
             buffered_rows_limit: AtomicU64::new(1),
@@ -113,6 +115,16 @@ impl RuntimeMetrics {
             dfe_channel_capacity: AtomicU64::new(1),
             tables: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub(crate) fn stream_permits(&self, limit: usize) -> Result<Arc<tokio::sync::Semaphore>, String> {
+        let (configured, permits) = self
+            .stream_permits
+            .get_or_init(|| (limit, Arc::new(tokio::sync::Semaphore::new(limit))));
+        if *configured != limit {
+            return Err("conflicting process-wide Arrow Flight stream limits".to_owned());
+        }
+        Ok(Arc::clone(permits))
     }
 
     pub(crate) fn configure_receiver(
@@ -744,5 +756,18 @@ mod tests {
         assert_eq!(encoded["pdata_signal_discriminator"], "logs");
         assert_eq!(encoded["pdata_signal_semantics"], "representation_local_not_otap");
         assert_eq!(encoded["native_quiver"]["feature_gap"], QUIVER_UNSUPPORTED_GAP);
+    }
+
+    /// Scenario: Multiple pipeline cores request the collector's stream allowance.
+    /// Guarantees: Admission shares one process-wide limit and rejects conflicting configurations.
+    #[test]
+    fn stream_capacity_is_shared_across_cores() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        let first = metrics.stream_permits(2).expect("first");
+        let second = metrics.stream_permits(2).expect("second");
+        assert!(Arc::ptr_eq(&first, &second));
+        let _permits = first.try_acquire_many(2).expect("capacity");
+        assert!(second.try_acquire().is_err());
+        assert!(metrics.stream_permits(3).is_err());
     }
 }

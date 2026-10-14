@@ -628,13 +628,15 @@ impl ReceiptStore for SqlServerReceiptStore {
                 let table_id = delivery.table_id();
                 let row = client
                     .query(
-                        "INSERT INTO arrowcol.delivery_receipts ( \
+                        "DECLARE @receipt_now datetime2(3) = SYSUTCDATETIME(); \
+                         INSERT INTO arrowcol.delivery_receipts ( \
                             table_id, owner_instance_id, implementation_pool, schema_version, schema_sha256, \
                             lease_id, fencing_epoch, state, revision, row_count, batch_count, arrow_memory_bytes, \
-                            receipt_lease_deadline_utc, heartbeat_at_utc \
+                            receipt_lease_deadline_utc, heartbeat_at_utc, created_at_utc, updated_at_utc \
                          ) \
                          OUTPUT INSERTED.receipt_id \
-                         SELECT @P1, @P2, @P3, @P4, @P5, @P6, @P7, 'accepted', 0, @P8, @P9, @P10, @P11, SYSUTCDATETIME() \
+                         SELECT @P1, @P2, @P3, @P4, @P5, @P6, @P7, 'accepted', 0, @P8, @P9, @P10, @P11, \
+                                @receipt_now, @receipt_now, @receipt_now \
                          FROM arrowcol.table_schema_versions AS v \
                          INNER JOIN arrowcol.table_leases AS l \
                            ON l.table_id = v.table_id AND l.fencing_epoch = @P7 AND l.lease_id = @P6 \
@@ -642,7 +644,7 @@ impl ReceiptStore for SqlServerReceiptStore {
                          WHERE v.table_id = @P1 AND v.schema_version = @P4 AND v.schema_sha256 = @P5 \
                            AND v.state IN ('active', 'superseded') \
                            AND l.holder_instance_id = @P2 AND l.released_at_utc IS NULL \
-                           AND l.expires_at_utc > SYSUTCDATETIME() AND @P11 <= l.expires_at_utc \
+                           AND l.expires_at_utc > SYSUTCDATETIME() AND @P11 >= @receipt_now AND @P11 <= l.expires_at_utc \
                            AND i.state = 'active' AND i.stopped_at_utc IS NULL \
                            AND i.lease_expires_at_utc > SYSUTCDATETIME() AND @P11 <= i.lease_expires_at_utc;",
                         &[

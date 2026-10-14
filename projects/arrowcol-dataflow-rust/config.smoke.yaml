@@ -50,6 +50,8 @@ groups:
                 batch_window: 100ms
                 max_files_per_commit: 1
                 max_pending_files: 2
+              batching:
+                max_age: 100ms
               authority_timeout: 1s
         connections:
           - from: flight

@@ -6,6 +6,7 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    arrow_deltalake::delta::initialize_shared_io()?;
     let cli = Cli::parse();
     let config = CollectorConfig::load(&cli.config)?;
     initialize_tracing(&config)?;

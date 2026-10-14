@@ -8,7 +8,7 @@ services:
     environment:
       ACCEPT_EULA: "Y"
       MSSQL_PID: Developer
-      MSSQL_MEMORY_LIMIT_MB: ${SQLSERVER_MEMORY_LIMIT_MB:-2048}
+      MSSQL_MEMORY_LIMIT_MB: ${SQLSERVER_MEMORY_LIMIT_MB:-16384}
       MSSQL_SA_PASSWORD_FILE: /run/secrets/sqlserver_sa_password
     secrets:
       - sqlserver_sa_password
@@ -135,8 +135,10 @@ services:
     image: ghcr.io/mdrakiburrahman/rust-playground/arrowcol-rust:dev
     pull_policy: never
     user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
+    cpus: ${LOADTEST_CPUS:-2}
     command: ["--config", "/state/direct.yaml"]
     environment:
+      TOKIO_WORKER_THREADS: "${LOADTEST_CPUS:-2}"
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
     secrets:
@@ -170,6 +172,8 @@ services:
     image: ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust:dev
     pull_policy: never
     user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
+    cpus: ${LOADTEST_CPUS:-2}
+    command: ["--num-cores", "${LOADTEST_CPUS:-2}", "--config", "/etc/arrowcol-dataflow-rust/config.yaml"]
     environment:
       ARROWCOL_INSTANCE_KEY: loadtest-dataflow-1
       ARROWCOL_ADVERTISED_FLIGHT_ENDPOINT: ${LOADTEST_DATAFLOW_1_IP:-10.89.0.31}:32010

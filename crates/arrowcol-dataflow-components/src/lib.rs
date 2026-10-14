@@ -15,9 +15,11 @@ mod metrics;
 mod receiver;
 mod routing;
 
+pub use arrow_deltalake::delta::initialize_shared_io;
 pub use config::{
-    CatalogConfig, CommitConfig, DeltaExporterConfig, FlightReceiverConfig, HiveMetastoreConnectionConfig,
-    RegistrationConfig, RoutingStoreConfig, RuntimeLimitsConfig, SqlServerConnectionConfig,
+    AdaptiveFileConfig, BatchCapacity, CatalogConfig, CommitConfig, DeltaExporterConfig, FileBatchConfig,
+    FlightReceiverConfig, HiveMetastoreConnectionConfig, RegistrationConfig, RoutingStoreConfig, RuntimeLimitsConfig,
+    SqlServerConnectionConfig,
 };
 pub use envelope::{
     ARROWCOL_FLIGHT_REPRESENTATION_ID, ARROWCOL_FLIGHT_REPRESENTATION_VERSION, ArrowcolBatchEnvelope,

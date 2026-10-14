@@ -1,13 +1,12 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
 import { sqlserverAccess } from '../src/main.js';
 
 test('SQL Server access prints host and container ports and SA credentials from the secret', (t) => {
-  const directory = mkdtempSync(path.join(tmpdir(), 'arrowcol-sqlserver-'));
+  const directory = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-sqlserver-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const file = path.join(directory, 'sqlserver-sa-password.txt');
   for (const suffix of ['', '\n', '\n\n']) {
@@ -18,7 +17,7 @@ test('SQL Server access prints host and container ports and SA credentials from 
 });
 
 test('SQL Server access surfaces missing or invalid secrets', (t) => {
-  const directory = mkdtempSync(path.join(tmpdir(), 'arrowcol-sqlserver-'));
+  const directory = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-sqlserver-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const file = path.join(directory, 'sqlserver-sa-password.txt');
   assert.throws(() => sqlserverAccess('14333', file), { code: 'ENOENT' });

@@ -473,7 +473,7 @@ impl CommitConfig {
 }
 
 /// Strict configuration for `exporter:arrow_deltalake`.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DeltaExporterConfig {
     /// Absolute local root for logical Arrowcol tables.
@@ -483,6 +483,9 @@ pub struct DeltaExporterConfig {
     /// Bounded publication settings.
     #[serde(default)]
     pub commit: CommitConfig,
+    /// Bounded Arrow-to-Parquet file grouping.
+    #[serde(default)]
+    pub batching: FileBatchConfig,
     /// Maximum synchronous wait for the commit-boundary authority check.
     #[serde(default = "default_authority_timeout", with = "humantime_serde")]
     pub authority_timeout: Duration,
@@ -498,7 +501,147 @@ impl DeltaExporterConfig {
         }
         self.routing.validate()?;
         self.commit.build()?;
+        self.batching.validate()?;
         Ok(())
+    }
+}
+
+/// Logical Arrow capacity retained until publication finishes.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BatchCapacity {
+    /// Logical Arrow bytes.
+    pub bytes: u32,
+    /// Rows.
+    pub rows: u32,
+    /// Batches.
+    pub batches: u32,
+}
+
+/// Bounded file grouping, independent of delivery receipt semantics.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct FileBatchConfig {
+    /// Process-wide queued and in-flight capacity.
+    pub global_capacity: BatchCapacity,
+    /// Per-table queued and in-flight capacity.
+    pub per_table_capacity: BatchCapacity,
+    /// Maximum logical Arrow bytes in a file.
+    pub max_arrow_memory_per_flush: u64,
+    /// Maximum rows in a file.
+    pub max_rows_per_flush: u64,
+    /// Maximum batches in a file.
+    pub max_batches_per_flush: u64,
+    /// Maximum age of the first batch in a file.
+    #[serde(with = "humantime_serde")]
+    pub max_age: Duration,
+    /// Maximum simultaneous file publications.
+    pub max_concurrent_flushes: usize,
+    /// Compressed Parquet target and estimator limits.
+    pub adaptive_file: AdaptiveFileConfig,
+}
+
+impl Default for FileBatchConfig {
+    fn default() -> Self {
+        Self {
+            global_capacity: BatchCapacity {
+                bytes: 2 * 1024 * 1024 * 1024,
+                rows: 10_000_000,
+                batches: 4096,
+            },
+            per_table_capacity: BatchCapacity {
+                bytes: 512 * 1024 * 1024,
+                rows: 2_000_000,
+                batches: 1024,
+            },
+            max_arrow_memory_per_flush: 512 * 1024 * 1024,
+            max_rows_per_flush: 1_000_000,
+            max_batches_per_flush: 512,
+            max_age: Duration::from_secs(30),
+            max_concurrent_flushes: 4,
+            adaptive_file: AdaptiveFileConfig::default(),
+        }
+    }
+}
+
+impl FileBatchConfig {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let global = self.global_capacity;
+        let table = self.per_table_capacity;
+        if [
+            global.bytes,
+            global.rows,
+            global.batches,
+            table.bytes,
+            table.rows,
+            table.batches,
+        ]
+        .contains(&0)
+            || table.bytes > global.bytes
+            || table.rows > global.rows
+            || table.batches > global.batches
+            || self.max_arrow_memory_per_flush == 0
+            || self.max_arrow_memory_per_flush > u64::from(table.bytes)
+            || self.max_rows_per_flush == 0
+            || self.max_rows_per_flush > u64::from(table.rows)
+            || self.max_batches_per_flush == 0
+            || self.max_batches_per_flush > u64::from(table.batches)
+            || self.max_age.is_zero()
+            || tokio::time::Instant::now().checked_add(self.max_age).is_none()
+            || self.max_concurrent_flushes == 0
+        {
+            return Err("invalid bounded Arrow file batching capacities or flush policy".to_owned());
+        }
+        self.adaptive_file.build().validate().map_err(|error| error.to_string())
+    }
+}
+
+/// Configuration for the shared compressed-file size estimator.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdaptiveFileConfig {
+    /// Desired compressed Parquet bytes.
+    pub target_parquet_bytes: u64,
+    /// Minimum logical input threshold.
+    pub min_input_bytes: u64,
+    /// Maximum logical input threshold.
+    pub max_input_bytes: u64,
+    /// Initial compressed/input ratio.
+    pub cold_start_parquet_ratio: f64,
+    /// EWMA observation weight.
+    pub ewma_weight: f64,
+    /// Minimum observed ratio.
+    pub min_parquet_ratio: f64,
+    /// Maximum observed ratio.
+    pub max_parquet_ratio: f64,
+}
+
+impl Default for AdaptiveFileConfig {
+    fn default() -> Self {
+        let config = arrow_deltalake::sizing::AdaptiveFileSizeConfig::default();
+        Self {
+            target_parquet_bytes: config.target_parquet_bytes,
+            min_input_bytes: config.min_input_bytes,
+            max_input_bytes: config.max_input_bytes,
+            cold_start_parquet_ratio: config.cold_start_parquet_ratio,
+            ewma_weight: config.ewma_weight,
+            min_parquet_ratio: config.min_parquet_ratio,
+            max_parquet_ratio: config.max_parquet_ratio,
+        }
+    }
+}
+
+impl AdaptiveFileConfig {
+    pub(crate) const fn build(self) -> arrow_deltalake::sizing::AdaptiveFileSizeConfig {
+        arrow_deltalake::sizing::AdaptiveFileSizeConfig {
+            target_parquet_bytes: self.target_parquet_bytes,
+            min_input_bytes: self.min_input_bytes,
+            max_input_bytes: self.max_input_bytes,
+            cold_start_parquet_ratio: self.cold_start_parquet_ratio,
+            ewma_weight: self.ewma_weight,
+            min_parquet_ratio: self.min_parquet_ratio,
+            max_parquet_ratio: self.max_parquet_ratio,
+        }
     }
 }
 
