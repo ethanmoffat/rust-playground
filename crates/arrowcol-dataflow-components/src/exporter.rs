@@ -12,7 +12,7 @@ use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_engine::config::ExporterConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
 use otel_arrow_dfe_engine::control::{AckMsg, NackCause, NackMsg, NodeControlMsg};
-use otel_arrow_dfe_engine::error::Error;
+use otel_arrow_dfe_engine::error::{Error, ExporterErrorKind};
 use otel_arrow_dfe_engine::exporter::ExporterWrapper;
 use otel_arrow_dfe_engine::local::exporter;
 use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
@@ -159,6 +159,14 @@ struct DeltaBackend {
     tables: tokio::sync::Mutex<HashMap<arrowcol_protocol::TableIdentity, Arc<TableOwner>>>,
 }
 
+impl Drop for DeltaBackend {
+    fn drop(&mut self) {
+        for owner in self.tables.get_mut().values() {
+            owner.drain.send_replace(true);
+        }
+    }
+}
+
 impl DeltaBackend {
     async fn owner(&self, decoded: &DecodedArrowBatch) -> Result<Arc<TableOwner>, ExportFailure> {
         let mut tables = self.tables.lock().await;
@@ -224,7 +232,7 @@ impl DeltaBackend {
         let (reply, receipt) = oneshot::channel();
         owner
             .sender
-            .try_send(QueuedBatch {
+            .try_send(WorkerCommand::Batch(QueuedBatch {
                 batch: decoded.batch,
                 target_schema_version: decoded.envelope.target_schema_version.get(),
                 rows,
@@ -233,11 +241,28 @@ impl DeltaBackend {
                 reply: Some(reply),
                 _pending_owner: pending_owner,
                 _capacity: capacity,
-            })
+            }))
             .map_err(|error| ExportFailure::Transient(format!("Delta file queue admission failed: {error}")))?;
         Ok(PendingDelta { receipt })
     }
 
+    async fn flush_pending(&self) -> Result<(), ExportFailure> {
+        let owners = self.tables.lock().await.values().cloned().collect::<Vec<_>>();
+        for owner in owners {
+            let (reply, completion) = oneshot::channel();
+            owner
+                .sender
+                .send(WorkerCommand::Flush(reply))
+                .await
+                .map_err(|error| ExportFailure::Transient(format!("Delta flush request failed: {error}")))?;
+            completion
+                .await
+                .map_err(|error| ExportFailure::Transient(format!("Delta flush worker disappeared: {error}")))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     async fn start_draining(&self) {
         self.draining.store(true, std::sync::atomic::Ordering::Release);
         let tables = self.tables.lock().await;
@@ -298,6 +323,11 @@ impl Capacity {
     }
 }
 
+enum WorkerCommand {
+    Batch(QueuedBatch),
+    Flush(oneshot::Sender<()>),
+}
+
 struct QueuedBatch {
     batch: arrow_array::RecordBatch,
     target_schema_version: u64,
@@ -335,7 +365,7 @@ impl Drop for QueuedBatch {
 #[allow(clippy::too_many_arguments)]
 async fn run_batch_worker(
     table: Arc<BatchedTable>,
-    mut receiver: mpsc::Receiver<QueuedBatch>,
+    mut receiver: mpsc::Receiver<WorkerCommand>,
     mut drain: watch::Receiver<bool>,
     policy: FileBatchConfig,
     mut estimator: AdaptiveFileSizeEstimator,
@@ -379,6 +409,16 @@ async fn run_batch_worker(
             publish_group(&table, &mut group, &mut estimator, &flush_slots, &metrics, &identity).await;
             table.start_draining();
             break;
+        };
+        let next = match next {
+            WorkerCommand::Batch(batch) => batch,
+            WorkerCommand::Flush(reply) => {
+                publish_group(&table, &mut group, &mut estimator, &flush_slots, &metrics, &identity).await;
+                rows = 0;
+                bytes = 0;
+                let _ = reply.send(());
+                continue;
+            }
         };
         if group.first().is_some_and(|first| {
             first.target_schema_version != next.target_schema_version
@@ -489,7 +529,7 @@ struct OwnerState {
 }
 
 struct TableOwner {
-    sender: mpsc::Sender<QueuedBatch>,
+    sender: mpsc::Sender<WorkerCommand>,
     drain: watch::Sender<bool>,
     capacity: Capacity,
     fence: Arc<RoutingPublicationFence>,
@@ -631,7 +671,15 @@ impl exporter::Exporter<OtapPdata> for GenericDeltaExporter {
                     }
                 }
                 Message::Control(NodeControlMsg::Shutdown { .. }) => {
-                    self.backend.start_draining().await;
+                    self.backend
+                        .flush_pending()
+                        .await
+                        .map_err(|error| Error::ExporterError {
+                            exporter: effect_handler.exporter_id(),
+                            kind: ExporterErrorKind::Shutdown,
+                            error: error.to_string(),
+                            source_detail: String::new(),
+                        })?;
                     while let Some((pdata, result)) = pending.next().await {
                         complete_publication(&effect_handler, pdata, result).await?;
                     }
@@ -908,6 +956,78 @@ mod tests {
                 .join("demo/generated/events/_delta_log/00000000000000000001.json")
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn core_shutdown_flushes_without_poisoning_shared_recovery() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let metrics = Arc::new(RuntimeMetrics::new(holder));
+        let config = DeltaExporterConfig {
+            base_path: directory.path().to_path_buf(),
+            routing: crate::config::RoutingStoreConfig::Memory,
+            commit: crate::config::CommitConfig::default(),
+            batching: FileBatchConfig {
+                max_age: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+            authority_timeout: std::time::Duration::from_secs(2),
+        };
+        let mut first = GenericDeltaExporter::with_batching(
+            config.base_path.clone(),
+            store as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions::default(),
+            config.batching.clone(),
+            Arc::clone(&metrics),
+        )
+        .expect("first");
+        Arc::get_mut(&mut first.backend)
+            .expect("exclusive backend")
+            .configuration = Some(config.clone());
+        BACKENDS
+            .lock()
+            .expect("registry")
+            .insert(config.base_path.clone(), Arc::downgrade(&first.backend));
+        let second = GenericDeltaExporter::shared(config.clone(), Arc::clone(&metrics)).expect("second");
+        let publication = first.stage(pdata(&lease, lease.fencing_epoch)).await.expect("stage");
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            first.backend.flush_pending().await.expect("core flush");
+            publication.wait().await.expect("publication");
+        })
+        .await
+        .expect("bounded partial flush");
+        drop(first);
+
+        let replacement = GenericDeltaExporter::shared(config, Arc::clone(&metrics)).expect("replacement");
+        assert!(Arc::ptr_eq(&replacement.backend, &second.backend));
+        assert!(!replacement.backend.draining.load(std::sync::atomic::Ordering::Acquire));
+        let publication = replacement
+            .stage(pdata(&lease, lease.fencing_epoch))
+            .await
+            .expect("recovered stage");
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            replacement.backend.flush_pending().await.expect("final flush");
+            publication.wait().await.expect("recovered publication");
+        })
+        .await
+        .expect("bounded final flush");
+        assert_eq!(
+            replacement.backend.capacity.batches.available_permits(),
+            replacement.backend.batching.global_capacity.batches as usize
+        );
+        let publication = replacement
+            .stage(pdata(&lease, lease.fencing_epoch))
+            .await
+            .expect("last stage");
+        drop(second);
+        drop(replacement);
+        tokio::time::timeout(std::time::Duration::from_secs(3), publication.wait())
+            .await
+            .expect("last core drains backend")
+            .expect("last publication");
+        assert!(metrics.prometheus().contains("arrowcol_delta_rows_total 6\n"));
     }
 
     /// Scenario: Two same-schema pdata batches reach the shared file-size threshold.

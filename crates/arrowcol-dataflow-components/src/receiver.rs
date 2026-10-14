@@ -598,12 +598,7 @@ async fn register_collector(
         })
         .await
         .map_err(|error| error.to_string())?;
-    if let Ok(pressure) = metrics.pressure() {
-        store
-            .publish_pressure(&pressure.rich)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
+    metrics.publish_pressure(store.as_ref()).await?;
     metrics.set_registered(true);
     Ok(())
 }
@@ -664,9 +659,7 @@ async fn registration_loop(
                 metrics.set_registered(store.register_collector(&registration).await.is_ok());
             }
             _ = pressure.tick() => {
-                if let Ok(snapshot) = metrics.pressure()
-                    && store.publish_pressure(&snapshot.rich).await.is_err()
-                {
+                if metrics.publish_pressure(store.as_ref()).await.is_err() {
                     metrics.set_registered(false);
                 }
             }
@@ -684,8 +677,8 @@ async fn finalize_registration(
         return;
     };
     let _ = store.set_collector_state(instance_id, state, now).await;
-    if let Ok(snapshot) = metrics.pressure() {
-        let _ = store.publish_pressure(&snapshot.rich).await;
+    if metrics.publish_pressure(store.as_ref()).await.is_err() {
+        metrics.set_registered(false);
     }
 }
 
@@ -958,6 +951,35 @@ mod tests {
         let send = sender.send(1, pdata);
         assert!(tokio::time::timeout(Duration::from_millis(20), send).await.is_err());
         gate.add_permits(1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_core_registration_and_pressure_writes_are_ordered() {
+        let holder = CollectorInstanceId::new();
+        let metrics = Arc::new(RuntimeMetrics::new(holder));
+        metrics.configure_receiver(4, 1_000_000_000, 1_000_000, 1_000, 10, 10);
+        let config: FlightReceiverConfig = serde_json::from_value(serde_json::json!({
+            "listening_addr": "127.0.0.1:32010",
+            "admin_listening_addr": "127.0.0.1:32011",
+            "catalog": {"type": "memory"},
+            "routing": {"type": "memory"},
+            "registration": {
+                "instance_key": "concurrent-cores",
+                "flight_endpoint": "127.0.0.1:32010"
+            }
+        }))
+        .expect("config");
+        let store: Arc<dyn RoutingStore> = Arc::new(MemoryRoutingStore::default());
+        let (first, second) = tokio::join!(
+            register_collector(&store, &config, holder, &metrics),
+            register_collector(&store, &config, holder, &metrics)
+        );
+        first.expect("first core");
+        second.expect("second core");
+        for result in futures::future::join_all((0..64).map(|_| metrics.publish_pressure(store.as_ref()))).await {
+            result.expect("strictly advancing publication");
+        }
+        assert!(metrics.healthy());
     }
 
     /// Scenario: A downstream DFE route fails after a Flight batch was decoded.

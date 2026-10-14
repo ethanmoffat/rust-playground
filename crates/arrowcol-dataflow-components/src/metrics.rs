@@ -6,9 +6,9 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use arrowcol_catalog::SchemaVersion;
 use arrowcol_protocol::{
     BasisPoints, Capability, CollectorInstanceId, ImplementationPool, Measurement, PositiveMeasurement, PressureGauge,
-    ProtocolVersion, TableIdentity,
+    ProtocolVersion, TableIdentity, UnixMillis,
 };
-use arrowcol_routing::{RichPressureSnapshot, SubsystemState, TablePressure};
+use arrowcol_routing::{RichPressureSnapshot, RoutingStore, SubsystemState, TablePressure};
 use serde::Serialize;
 
 use crate::QUIVER_UNSUPPORTED_GAP;
@@ -77,6 +77,7 @@ pub struct RuntimeMetrics {
     max_pending_commits: AtomicU64,
     dfe_channel_capacity: AtomicU64,
     tables: Mutex<BTreeMap<TableIdentity, TableState>>,
+    pressure_publication: tokio::sync::Mutex<Option<UnixMillis>>,
 }
 
 impl RuntimeMetrics {
@@ -114,6 +115,7 @@ impl RuntimeMetrics {
             max_pending_commits: AtomicU64::new(1),
             dfe_channel_capacity: AtomicU64::new(1),
             tables: Mutex::new(BTreeMap::new()),
+            pressure_publication: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -344,6 +346,24 @@ impl RuntimeMetrics {
                 feature_gap: QUIVER_UNSUPPORTED_GAP,
             },
         }
+    }
+
+    pub(crate) async fn publish_pressure(&self, store: &dyn RoutingStore) -> Result<(), String> {
+        let mut previous = self.pressure_publication.lock().await;
+        let mut snapshot = self.pressure()?;
+        while let Some(last) = *previous
+            && snapshot.rich.observed_at_unix_ms <= last
+        {
+            let wait = last.get() - snapshot.rich.observed_at_unix_ms.get() + 1;
+            tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+            snapshot = self.pressure()?;
+        }
+        // Reserve the timestamp before I/O, including when cancellation leaves its outcome unknown.
+        *previous = Some(snapshot.rich.observed_at_unix_ms);
+        store
+            .publish_pressure(&snapshot.rich)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Builds the bounded router pressure document and dashboard annotations.

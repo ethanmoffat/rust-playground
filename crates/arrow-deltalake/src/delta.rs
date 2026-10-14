@@ -218,6 +218,80 @@ mod io_tests {
         Ok(())
     }
 
+    /// Scenario: an external writer evolves metadata and checkpoints after a JSON-only base was cached.
+    /// Guarantees: the full loader observes new schema/fence versions and checkpoint corruption is surfaced.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn incremental_snapshot_falls_back_for_new_checkpoint() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let fence = Arc::new(RecordingFence::default());
+        let table = DeltaTable::open_with_fence(directory.path(), Arc::<RecordingFence>::clone(&fence))?;
+        let input = input_batch()?;
+        let mut file = table.new_file(input.schema())?;
+        file.write(&input).await?;
+        assert_eq!(file.finish().await?.version, 1);
+        let base = table.snapshot()?;
+        assert!(Arc::ptr_eq(&base, &table.snapshot()?));
+        let mut stale = table.new_file(input.schema())?;
+        stale.write(&input).await?;
+        let stale = stale.stage().await?;
+        let transaction = base
+            .alter_table()
+            .add_column(delta_kernel::schema::StructField::new(
+                "checkpoint_extra",
+                delta_kernel::schema::DataType::STRING,
+                true,
+            ))
+            .build(&table.engine, Box::new(DurableCommitter))?;
+        assert_eq!(committed(transaction.commit(&table.engine)?)?, 2);
+        let external = Snapshot::builder_for(table.url.as_str()).build(&table.engine)?;
+        let writer = external.create_checkpoint_writer(&table.engine)?;
+        let data = writer.checkpoint_data(&table.engine)?;
+        let state = data.state();
+        // Drain Kernel's lazy replay on the caller, not inside the asynchronous
+        // Parquet writer where it would recursively block the I/O workers.
+        let data = data
+            .map(|batch| batch.and_then(|batch| batch.apply_selection_vector()))
+            .collect::<DeltaResult<Vec<_>>>()?;
+        let checkpoint_url = writer.checkpoint_path()?;
+        table
+            .engine
+            .parquet_handler()
+            .write_parquet_file(checkpoint_url.clone(), Box::new(data.into_iter().map(Ok)))?;
+        let checkpoint = checkpoint_url
+            .to_file_path()
+            .map_err(|()| anyhow::anyhow!("invalid checkpoint URL"))?;
+        let state = Arc::into_inner(state).context("checkpoint state remains shared")?;
+        let statistics = delta_kernel::checkpoint::LastCheckpointHintStats::from_reconciliation_state(
+            state,
+            fs::metadata(&checkpoint)?.len(),
+            0,
+        )?;
+        writer.finalize(&table.engine, &statistics)?;
+        let log = directory.path().join("_delta_log");
+        assert!(log.join("_last_checkpoint").exists());
+        assert_eq!(table.version()?, 2);
+        assert!(table.snapshot()?.schema().field("checkpoint_extra").is_some());
+        assert!(table.commit_files(&[stale]).is_err());
+        assert!(
+            table
+                .snapshot_cache
+                .lock()
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+                .is_none()
+        );
+        let mut file = table.new_file(input.schema())?;
+        file.write(&input).await?;
+        assert_eq!(file.finish().await?.version, 3);
+        assert_eq!(
+            *fence.0.lock().map_err(|error| anyhow::anyhow!("{error}"))?,
+            vec![(0, 1), (2, 3)]
+        );
+        fs::write(checkpoint, b"corrupt checkpoint")?;
+        assert!(table.version().is_err());
+        Ok(())
+    }
+
     /// Scenario: thirteen tables accumulate 16 then 32 real appends, retaining every log across reopen.
     /// Guarantees: current-thread calls share one runtime, replay growing histories, and keep I/O workers bounded.
     #[tokio::test(flavor = "current_thread")]
@@ -682,20 +756,19 @@ impl DeltaTable {
                     .all(|(version, fingerprint)| files.get(version) == Some(fingerprint))
             })
         });
-        // No pinned version or connector-supplied freshness: Kernel lists storage
-        // on every update and replays all commits newer than the validated base.
+        // JSON-only bases need only the new listing tail. Both integrity scans
+        // still cover all history; a newly appearing checkpoint forces full loading.
+        // No pinned version or connector-supplied freshness is used.
         let snapshot = match &base {
-            Some(base) => Snapshot::builder_from(Arc::clone(&base.snapshot)).build(&self.engine)?,
+            Some(base) => Snapshot::builder_from(Arc::clone(&base.snapshot))
+                .skip_new_checkpoints()
+                .build(&self.engine)?,
             None => full_build()?,
         };
         let after = self.log_fingerprints()?;
         if let (Some(before), Some(mut after)) = (before, after) {
             after.retain(|version, _| *version <= snapshot.version());
-            let before = before
-                .into_iter()
-                .filter(|(version, _)| *version <= snapshot.version())
-                .collect::<LogFingerprints>();
-            if after == before {
+            if before.range(..=snapshot.version()).eq(after.iter()) {
                 *cache = Some(CachedSnapshot {
                     snapshot: Arc::clone(&snapshot),
                     files: after,
