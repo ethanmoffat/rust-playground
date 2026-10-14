@@ -211,7 +211,10 @@ impl CollectorStatus {
             && flags.lease_loop_ready
             && flags.delta_writable
             && self.drain.is_accepting()
-            && self.buffer.pressure().is_ok_and(|pressure| pressure.accepting)
+            && self
+                .buffer
+                .pressure()
+                .is_ok_and(|pressure| pressure.accepting && pressure.tables.iter().all(|table| !table.poisoned))
     }
 
     /// Builds the richer SQL routing pressure snapshot.

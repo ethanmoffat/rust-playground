@@ -280,6 +280,7 @@ enum SinkBehavior {
 
 struct FakeSink {
     behavior: Mutex<VecDeque<SinkBehavior>>,
+    leases: Mutex<HashMap<arrowcol_protocol::TableIdentity, TableLease>>,
     reasons: Arc<AsyncMutex<Vec<FlushReason>>>,
     expected_array: Mutex<Option<ArrayRef>>,
     zero_copy_seen: Arc<AtomicU8>,
@@ -290,6 +291,7 @@ impl FakeSink {
     fn succeeding() -> Arc<Self> {
         Arc::new(Self {
             behavior: Mutex::new(VecDeque::new()),
+            leases: Mutex::new(HashMap::new()),
             reasons: Arc::new(AsyncMutex::new(Vec::new())),
             expected_array: Mutex::new(None),
             zero_copy_seen: Arc::new(AtomicU8::new(0)),
@@ -316,6 +318,20 @@ impl FakeSink {
 
 #[async_trait]
 impl PublicationSink for FakeSink {
+    async fn current_lease(
+        &self,
+        table: &arrowcol_protocol::TableIdentity,
+        admitted: &TableLease,
+    ) -> Result<TableLease, SinkError> {
+        Ok(self
+            .leases
+            .lock()
+            .map_err(|_| SinkError::fenced("fake lease cache lock poisoned"))?
+            .get(table)
+            .cloned()
+            .unwrap_or_else(|| admitted.clone()))
+    }
+
     async fn begin(&self, context: PublicationContext) -> Result<Box<dyn PublicationSession>, SinkError> {
         self.reasons.lock().await.push(context.flush_reason);
         let behavior = self
@@ -399,6 +415,107 @@ impl PublicationSession for FakeSession {
             file_observation: observation,
         })
     }
+}
+
+#[tokio::test]
+async fn refreshes_renewed_lease_after_waiting_for_a_flush_slot() -> anyhow::Result<()> {
+    let first = validation("lease_blocker").await?;
+    let queued = validation("lease_waiter").await?;
+    let first_lease = lease(first.registered().identity())?;
+    let renewed = lease(queued.registered().identity())?;
+    let admitted = TableLease::new(
+        renewed.lease_id(),
+        renewed.table().clone(),
+        renewed.holder_instance_id(),
+        renewed.implementation_pool(),
+        renewed.fencing_token(),
+        renewed.issued_at_unix_ms(),
+        UnixMillis::new(now()?.get() + 1_000)?,
+    )?;
+    let receipts = Arc::new(FakeReceipts::default());
+    let sink = FakeSink::succeeding();
+    sink.leases
+        .lock()
+        .map_err(|_| anyhow::anyhow!("fake lease cache lock poisoned"))?
+        .insert(renewed.table().clone(), renewed);
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    sink.push(SinkBehavior::Block {
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    })?;
+    let mut config = config_large();
+    config.max_concurrent_flushes = 1;
+    config.max_rows_per_flush = 1;
+    let manager = manager(config, Arc::clone(&receipts), Arc::clone(&sink))?;
+    let (blocker, _) = admission(&first, &first_lease, &[1], &receipts).await?;
+    manager.admit(blocker).await?;
+    tokio::time::timeout(Duration::from_secs(2), started.notified()).await?;
+    let (waiting, _) = admission(&queued, &admitted, &[2], &receipts).await?;
+    let receipt_id = waiting.receipt.receipt_id;
+    manager.admit(waiting).await?;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(!admitted.is_active_at(now()?));
+    release.notify_waiters();
+    let report = tokio::time::timeout(Duration::from_secs(3), manager.shutdown()).await??;
+    assert!(report.incomplete.is_empty());
+    assert_eq!(
+        receipts
+            .receipt(receipt_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("queued receipt is missing"))?
+            .state,
+        ReceiptState::Published
+    );
+    assert_eq!(report.pressure.global.bytes, 0);
+    assert!(report.pressure.tables.iter().all(|table| !table.poisoned));
+    Ok(())
+}
+
+#[tokio::test]
+async fn lease_refresh_cannot_rebind_queued_work_to_new_ownership() -> anyhow::Result<()> {
+    for change in ["owner", "epoch", "lineage", "expired"] {
+        let validation = validation(&format!("lease_change_{change}")).await?;
+        let admitted = lease(validation.registered().identity())?;
+        let replacement = TableLease::new(
+            if change == "lineage" {
+                LeaseId::new()
+            } else {
+                admitted.lease_id()
+            },
+            admitted.table().clone(),
+            if change == "owner" {
+                CollectorInstanceId::new()
+            } else {
+                admitted.holder_instance_id()
+            },
+            admitted.implementation_pool(),
+            FencingToken::new(if change == "epoch" { 2 } else { 1 })?,
+            admitted.issued_at_unix_ms(),
+            if change == "expired" {
+                UnixMillis::new(now()?.get() - 1)?
+            } else {
+                admitted.expires_at_unix_ms()
+            },
+        )?;
+        let receipts = Arc::new(FakeReceipts::default());
+        let sink = FakeSink::succeeding();
+        sink.leases
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake lease cache lock poisoned"))?
+            .insert(admitted.table().clone(), replacement);
+        let mut config = config_large();
+        config.max_rows_per_flush = 1;
+        let manager = manager(config, Arc::clone(&receipts), Arc::clone(&sink))?;
+        let (delivery, _) = admission(&validation, &admitted, &[1], &receipts).await?;
+        manager.admit(delivery).await?;
+        let report = manager.shutdown().await?;
+        assert!(!report.incomplete.is_empty(), "{change}");
+        assert!(sink.reasons.lock().await.is_empty(), "{change}");
+        assert!(report.pressure.tables.iter().any(|table| table.poisoned), "{change}");
+        assert_eq!(report.pressure.global.bytes, 0, "{change}");
+    }
+    Ok(())
 }
 
 #[tokio::test]

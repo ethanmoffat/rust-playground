@@ -8,7 +8,8 @@ use arrow_deltalake::commit::{BatchedTable, CommitReceiptError};
 use arrow_deltalake::delta::{DeltaFileWriter, PublicationFenceErrorKind};
 use arrowcol_catalog::SchemaVersion;
 use arrowcol_protocol::{
-    DeltaPublicationResult, ErrorCode, Measurement, PublicationFence, SchemaFingerprint, TableIdentity, UnixMillis,
+    DeltaPublicationResult, ErrorCode, Measurement, PublicationFence, SchemaFingerprint, TableIdentity, TableLease,
+    UnixMillis,
 };
 use async_trait::async_trait;
 use thiserror::Error;
@@ -149,6 +150,14 @@ pub trait PublicationSession: Send {
 /// Storage-neutral factory for one flush session.
 #[async_trait]
 pub trait PublicationSink: Send + Sync {
+    /// Returns the current confirmed lease for a queued publication.
+    ///
+    /// Sinks without lease renewal retain the admitted lease. Renewing sinks
+    /// must preserve its owner, identity, and fencing generation.
+    async fn current_lease(&self, _table: &TableIdentity, admitted: &TableLease) -> Result<TableLease, SinkError> {
+        Ok(admitted.clone())
+    }
+
     /// Starts a table/schema/fence-specific streaming attempt.
     async fn begin(&self, context: PublicationContext) -> Result<Box<dyn PublicationSession>, SinkError>;
 }

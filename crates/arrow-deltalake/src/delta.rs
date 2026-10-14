@@ -17,6 +17,7 @@ use delta_kernel_default_engine::parquet::DataFileMetadata;
 use delta_kernel_default_engine::stats::FileStatsAccumulator;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder, build_add_file_metadata};
 use fs2::FileExt;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -46,6 +47,176 @@ mod io_tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashSet;
+
+    fn input_batch() -> Result<RecordBatch> {
+        Ok(RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![42]))],
+        )?)
+    }
+
+    #[derive(Default)]
+    struct RecordingFence(Mutex<Vec<(u64, u64)>>);
+
+    impl PublicationFence for RecordingFence {
+        fn check_before_commit(
+            &self,
+            context: &PublicationFenceContext<'_>,
+        ) -> std::result::Result<(), PublicationFenceError> {
+            self.0
+                .lock()
+                .map_err(|error| PublicationFenceError::check_failed(error.to_string()))?
+                .push((context.read_version(), context.proposed_version()));
+            Ok(())
+        }
+    }
+
+    /// Scenario: a warm snapshot is reused while an external transaction evolves the schema.
+    /// Guarantees: latest listing advances the base, staged old schemas fail, and fencing uses the fresh version.
+    #[tokio::test(flavor = "current_thread")]
+    async fn incremental_snapshot_observes_external_schema_and_fresh_fence() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let fence = Arc::new(RecordingFence::default());
+        let table = DeltaTable::open_with_fence(directory.path(), Arc::<RecordingFence>::clone(&fence))?;
+        let input = input_batch()?;
+        let mut file = table.new_file(input.schema())?;
+        file.write(&input).await?;
+        assert_eq!(file.finish().await?.version, 1);
+        let base = table.snapshot()?;
+        let unchanged = table.snapshot()?;
+        #[cfg(unix)]
+        assert!(Arc::ptr_eq(&base, &unchanged));
+        assert_eq!(unchanged.version(), 1);
+        let mut stale = table.new_file(input.schema())?;
+        stale.write(&input).await?;
+        let stale = stale.stage().await?;
+        // A Kernel writer bypasses the SDK lock and cache, as an external writer
+        // would. Its metadata change must be discovered before SDK publication.
+        let transaction = base
+            .alter_table()
+            .add_column(delta_kernel::schema::StructField::new(
+                "extra",
+                delta_kernel::schema::DataType::STRING,
+                true,
+            ))
+            .build(&table.engine, Box::new(DurableCommitter))?;
+        assert_eq!(committed(transaction.commit(&table.engine)?)?, 2);
+        assert_eq!(table.version()?, 2);
+        assert!(table.snapshot()?.schema().field("extra").is_some());
+        assert!(table.commit_files(&[stale]).is_err());
+        let mut file = table.new_file(input.schema())?;
+        file.write(&input).await?;
+        assert_eq!(file.finish().await?.version, 3);
+        assert_eq!(
+            *fence.0.lock().map_err(|error| anyhow::anyhow!("{error}"))?,
+            vec![(0, 1), (2, 3)]
+        );
+        Ok(())
+    }
+
+    /// Scenario: an external writer publishes after a warm snapshot's final freshness check.
+    /// Guarantees: atomic version creation still detects conflict and never retries or overwrites it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn incremental_snapshot_preserves_external_commit_conflict() -> Result<()> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ExternalCommitFence {
+            armed: AtomicBool,
+        }
+        impl PublicationFence for ExternalCommitFence {
+            fn check_before_commit(
+                &self,
+                context: &PublicationFenceContext<'_>,
+            ) -> std::result::Result<(), PublicationFenceError> {
+                if self.armed.swap(false, Ordering::SeqCst) {
+                    let publish = || -> std::io::Result<()> {
+                        let log = context.table_path().join("_delta_log");
+                        let append = fs::read(log.join(format!("{:020}.json", context.read_version())))?;
+                        let mut file = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(log.join(format!("{:020}.json", context.proposed_version())))?;
+                        file.write_all(&append)?;
+                        file.sync_all()
+                    };
+                    publish().map_err(|error| PublicationFenceError::check_failed(error.to_string()))?;
+                }
+                Ok(())
+            }
+        }
+        let directory = tempfile::tempdir()?;
+        let fence = Arc::new(ExternalCommitFence {
+            armed: AtomicBool::new(false),
+        });
+        let table = DeltaTable::open_with_fence(directory.path(), Arc::<ExternalCommitFence>::clone(&fence))?;
+        let input = input_batch()?;
+        let mut first = table.new_file(input.schema())?;
+        first.write(&input).await?;
+        assert_eq!(first.finish().await?.version, 1);
+        assert_eq!(table.version()?, 1);
+        let mut file = table.new_file(input.schema())?;
+        file.write(&input).await?;
+        fence.armed.store(true, Ordering::SeqCst);
+        let error = file.finish().await.err().context("expected external commit conflict")?;
+        assert!(error.to_string().contains("conflicted"));
+        assert_eq!(table.version()?, 2);
+        assert!(!directory.path().join("_delta_log/00000000000000000003.json").exists());
+        Ok(())
+    }
+
+    /// Scenario: historical JSON is corrupted without changing its length or modification time.
+    /// Guarantees: Unix identity/change-time checks invalidate the base and corruption remains visible.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn incremental_snapshot_does_not_mask_historical_corruption() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let table = DeltaTable::open(directory.path())?;
+        let input = input_batch()?;
+        table.new_file(input.schema())?;
+        let base = table.snapshot()?;
+        assert!(Arc::ptr_eq(&base, &table.snapshot()?));
+        let path = directory.path().join("_delta_log/00000000000000000000.json");
+        let metadata = fs::metadata(&path)?;
+        fs::write(&path, vec![b'!'; usize::try_from(metadata.len())?])?;
+        File::open(path)?.set_times(std::fs::FileTimes::new().set_modified(metadata.modified()?))?;
+        assert!(table.version().is_err());
+        assert!(table.new_file(input.schema()).is_err());
+        assert!(
+            table
+                .snapshot_cache
+                .lock()
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    /// Scenario: an otherwise unchanged local log gains a nonstandard entry.
+    /// Guarantees: unsupported layouts disable reuse without changing Kernel's normal loading behavior.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn incremental_snapshot_falls_back_for_nonstandard_layout() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let table = DeltaTable::open(directory.path())?;
+        table.new_file(input_batch()?.schema())?;
+        let base = table.snapshot()?;
+        assert!(Arc::ptr_eq(&base, &table.snapshot()?));
+        let extra = directory.path().join("_delta_log/cache-observer");
+        fs::write(&extra, b"not a Delta log")?;
+        assert_eq!(table.version()?, 0);
+        assert!(
+            table
+                .snapshot_cache
+                .lock()
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+                .is_none()
+        );
+        fs::remove_file(extra)?;
+        assert_eq!(table.version()?, 0);
+        assert!(Arc::ptr_eq(&table.snapshot()?, &table.snapshot()?));
+        Ok(())
+    }
 
     /// Scenario: thirteen tables accumulate 16 then 32 real appends, retaining every log across reopen.
     /// Guarantees: current-thread calls share one runtime, replay growing histories, and keep I/O workers bounded.
@@ -111,6 +282,69 @@ mod io_tests {
             #[cfg(target_os = "linux")]
             crate::delta_io::assert_worker_bound()?;
         }
+        Ok(())
+    }
+
+    /// Scenario: thirteen current-thread commit workers concurrently replay 650 retained logs per table.
+    /// Guarantees: read-ahead does not exhaust task admission, publication stays fresh, and workers stay bounded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn thirteen_concurrent_workers_replay_650_retained_logs() -> Result<()> {
+        use crate::commit::{BatchedTable, CommitOptions};
+        use std::time::{Duration, Instant};
+
+        initialize_shared_io()?;
+        let directory = tempfile::tempdir()?;
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![42]))],
+        )?;
+        for index in 0..13 {
+            let path = directory.path().join(index.to_string());
+            let table = DeltaTable::open(&path)?;
+            let mut file = table.new_file(input.schema())?;
+            file.write(&input).await?;
+            assert_eq!(file.finish().await?.version, 1);
+            // Append-only fixtures without metadata force schema replay back to
+            // version zero; these are synthetic histories, not 650 real appends.
+            let log = path.join("_delta_log");
+            let append = fs::read(log.join("00000000000000000001.json"))?;
+            for version in 2..650 {
+                fs::write(log.join(format!("{version:020}.json")), &append)?;
+            }
+        }
+        let barrier = Arc::new(tokio::sync::Barrier::new(13));
+        let started = Instant::now();
+        let operations = (0..13).map(|index| {
+            let path = directory.path().join(index.to_string());
+            let input = input.clone();
+            let barrier = Arc::clone(&barrier);
+            async move {
+                let table = BatchedTable::open(path, CommitOptions::default()).await?;
+                barrier.wait().await;
+                for version in 650..=651 {
+                    let mut file = table.new_file(input.schema()).await?;
+                    file.write(&input).await?;
+                    let append = file.stage().await?;
+                    assert_eq!(table.submit(append, true).await?.wait_typed().await?.version, version);
+                }
+                Ok::<_, anyhow::Error>(table)
+            }
+        });
+        let results = tokio::time::timeout(Duration::from_secs(60), futures::future::join_all(operations)).await?;
+        let tables = results.into_iter().collect::<Result<Vec<_>>>()?;
+        assert_eq!(tables.len(), 13);
+        #[cfg(target_os = "linux")]
+        crate::delta_io::assert_worker_bound()?;
+        for index in 0..13 {
+            let log = directory.path().join(index.to_string()).join("_delta_log");
+            assert!(log.join("00000000000000000000.json").exists());
+            assert!(log.join("00000000000000000649.json").exists());
+            assert!(log.join("00000000000000000651.json").exists());
+        }
+        println!(
+            "13 concurrent 650-log replays and 26 fresh commits completed in {:?}",
+            started.elapsed()
+        );
         Ok(())
     }
 
@@ -270,7 +504,24 @@ pub struct DeltaTable {
     engine: LocalEngine,
     _lock: File,
     commit_lock: Mutex<()>,
+    snapshot_cache: Mutex<Option<CachedSnapshot>>,
+    reuse_snapshots: bool,
     publication_fence: Option<Arc<dyn PublicationFence>>,
+}
+
+type LogFingerprints = BTreeMap<u64, LogFingerprint>;
+
+struct CachedSnapshot {
+    snapshot: SnapshotRef,
+    files: LogFingerprints,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LogFingerprint {
+    length: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
 }
 
 struct DurableCommitter;
@@ -332,6 +583,7 @@ impl DeltaTable {
             root,
             Arc::new(delta_kernel::object_store::local::LocalFileSystem::new()),
             None,
+            true,
         )
     }
 
@@ -344,6 +596,7 @@ impl DeltaTable {
             root,
             Arc::new(delta_kernel::object_store::local::LocalFileSystem::new()),
             Some(publication_fence),
+            true,
         )
     }
 
@@ -356,7 +609,7 @@ impl DeltaTable {
         root: impl AsRef<Path>,
         store: Arc<dyn delta_kernel::object_store::ObjectStore>,
     ) -> Result<Arc<Self>> {
-        Self::open_inner(root, store, None)
+        Self::open_inner(root, store, None, false)
     }
 
     /// Inject local-URL storage and a publication fence.
@@ -368,13 +621,14 @@ impl DeltaTable {
         store: Arc<dyn delta_kernel::object_store::ObjectStore>,
         publication_fence: Arc<dyn PublicationFence>,
     ) -> Result<Arc<Self>> {
-        Self::open_inner(root, store, Some(publication_fence))
+        Self::open_inner(root, store, Some(publication_fence), false)
     }
 
     fn open_inner(
         root: impl AsRef<Path>,
         store: Arc<dyn delta_kernel::object_store::ObjectStore>,
         publication_fence: Option<Arc<dyn PublicationFence>>,
+        reuse_snapshots: bool,
     ) -> Result<Arc<Self>> {
         fs::create_dir_all(root.as_ref())?;
         let root = fs::canonicalize(root)?;
@@ -398,12 +652,106 @@ impl DeltaTable {
             engine,
             _lock: lock,
             commit_lock: Mutex::new(()),
+            snapshot_cache: Mutex::new(None),
+            reuse_snapshots,
             publication_fence,
         }))
     }
 
     fn snapshot(&self) -> Result<SnapshotRef> {
-        Ok(Snapshot::builder_for(self.url.as_str()).build(&self.engine)?)
+        let full_build = || {
+            Snapshot::builder_for(self.url.as_str())
+                .build(&self.engine)
+                .map_err(anyhow::Error::new)
+        };
+        // Injected stores need not reflect filesystem metadata faithfully.
+        if !self.reuse_snapshots || !cfg!(unix) {
+            return full_build();
+        }
+        let mut cache = self
+            .snapshot_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Delta snapshot cache lock poisoned"))?;
+        let previous = cache.take();
+        let before = self.log_fingerprints()?;
+        let base = previous.filter(|previous| {
+            before.as_ref().is_some_and(|files| {
+                previous
+                    .files
+                    .iter()
+                    .all(|(version, fingerprint)| files.get(version) == Some(fingerprint))
+            })
+        });
+        // No pinned version or connector-supplied freshness: Kernel lists storage
+        // on every update and replays all commits newer than the validated base.
+        let snapshot = match &base {
+            Some(base) => Snapshot::builder_from(Arc::clone(&base.snapshot)).build(&self.engine)?,
+            None => full_build()?,
+        };
+        let after = self.log_fingerprints()?;
+        if let (Some(before), Some(mut after)) = (before, after) {
+            after.retain(|version, _| *version <= snapshot.version());
+            let before = before
+                .into_iter()
+                .filter(|(version, _)| *version <= snapshot.version())
+                .collect::<LogFingerprints>();
+            if after == before {
+                *cache = Some(CachedSnapshot {
+                    snapshot: Arc::clone(&snapshot),
+                    files: after,
+                });
+                return Ok(snapshot);
+            }
+        }
+        // Mutation during an incremental load invalidates its historical baseline.
+        // Never retain a snapshot with fingerprints captured after that mutation.
+        if base.is_some() {
+            return full_build();
+        }
+        Ok(snapshot)
+    }
+
+    fn log_fingerprints(&self) -> Result<Option<LogFingerprints>> {
+        let mut files = BTreeMap::new();
+        for entry in fs::read_dir(self.root.join("_delta_log"))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(version) = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .filter(|version| version.len() == 20 && version.bytes().all(|byte| byte.is_ascii_digit()))
+            else {
+                // Checkpoints, CRCs, and nonstandard log layouts keep the existing
+                // full-build behavior rather than adding cache rules for them.
+                return Ok(None);
+            };
+            let Ok(version) = version.parse::<u64>() else {
+                return Ok(None);
+            };
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            if !metadata.is_file() {
+                return Ok(None);
+            }
+            #[cfg(unix)]
+            let identity = {
+                use std::os::unix::fs::MetadataExt;
+                (metadata.dev(), metadata.ino(), metadata.ctime(), metadata.ctime_nsec())
+            };
+            files.insert(
+                version,
+                LogFingerprint {
+                    length: metadata.len(),
+                    modified: metadata.modified()?,
+                    #[cfg(unix)]
+                    identity,
+                },
+            );
+        }
+        Ok(Some(files))
     }
 
     fn ensure_schema(&self, incoming: SchemaRef) -> Result<SnapshotRef> {
@@ -458,9 +806,8 @@ impl DeltaTable {
             committed(transaction.commit(&self.engine)?)?;
             return self.snapshot();
         }
-        // Reuse only this freshly validated snapshot, never a cross-operation
-        // cache. Publication still rebuilds latest state to detect corruption
-        // and external schema changes/conflicts.
+        // Preparation and publication both refresh storage state; the cache only
+        // avoids re-parsing historical metadata after checking log integrity.
         Ok(snapshot)
     }
 

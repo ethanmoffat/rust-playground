@@ -270,6 +270,31 @@ mod tests {
         Ok(())
     }
 
+    /// Scenario: thirteen blocking callers hand off nested file I/O to the shared async workers.
+    /// Guarantees: this caller count fits both admission and the blocking pool without deadlocking.
+    #[tokio::test(flavor = "current_thread")]
+    async fn thirteen_blocking_callers_can_handoff_nested_file_io() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("input");
+        std::fs::write(&path, b"bounded nested I/O")?;
+        let executor = shared_executor()?;
+        let io_executor = Arc::clone(&executor);
+        executor.block_on(async move {
+            let tasks = (0..13).map(|_| {
+                let path = path.clone();
+                let nested_executor = Arc::clone(&io_executor);
+                io_executor.spawn_blocking(move || nested_executor.block_on(async move { tokio::fs::read(path).await }))
+            });
+            for result in futures::future::join_all(tasks).await {
+                assert_eq!(result??, b"bounded nested I/O");
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
+        #[cfg(target_os = "linux")]
+        assert_worker_bound()?;
+        Ok(())
+    }
+
     /// Scenario: far more blocking requests arrive than the process-wide pool limit.
     /// Guarantees: admission and thread growth stay bounded, and all requests complete.
     #[test]

@@ -108,6 +108,36 @@ configured 256-stream limit is aggregate, matching direct's 256 rather than
 multiplying with core count. Direct's durable receipt contract remains distinct
 from DFE's best-effort admission; tests do not weaken either delivery contract.
 
+### Fair runtime buffer profile
+
+The harness generates matching runtime policies without changing production
+defaults: **128 MiB process-global Arrow capacity**, **32 MiB per table** and
+**32 MiB per flush** for both collectors. Global row/batch limits are
+4,000,000/2,048; per-table limits are 1,000,000/512, preserving the existing
+1,000,000-row/512-batch flush thresholds within each table's capacity.
+Registration advertises these same process-global limits.
+
+DFE's exporter factories share one `DeltaBackend` keyed by Delta root, including
+its capacity and flush slots. The 128 MiB budget is applied **once per process**,
+not divided by or multiplied by its two cores. Adaptive sizing, age limits,
+flush row/batch thresholds, four concurrent flushes, commit policies, stream
+limits, delivery contracts and the two-CPU allocation are unchanged.
+
+Generated files are `direct-state-1/direct.yaml`, `dataflow-state-1/dataflow.yaml`
+and `router-state/compose-runtime.json` under the selected run directory. The
+last file is a minimal Compose override mounting the DFE runtime YAML read-only
+at its existing config path; it contains no secrets. The runner passes it as a
+second Compose file using `LOADTEST_COMPOSE_OVERRIDE_FILE`. External recovery
+commands must retain that override, otherwise DFE would revert to its production
+buffer defaults. Provenance records the generated policies and their hashes.
+Neither the production DFE config nor the direct template is rewritten.
+
+Logical Arrow capacity is not an RSS limit: decoded channels, runtime overhead,
+publication work and SDK schema replay also consume memory. The bounded profile
+and schema-cache follow-up passed the finite continuation7 resource qualification
+and independent frozen-output verification below. The
+earlier V2 measurements used the original 2 GiB profile.
+
 For a persistent continuous run with 30 seconds of warmup and all 13 tables:
 
 ```bash
@@ -169,15 +199,17 @@ observation is **not proof of absence of a heap leak or an indefinite memory
 guarantee**.
 
 Full live SQL receipt integration passed. Final independent validation of the
-frozen Delta roots **passed with exit 0** using the unchanged release reader:
+original frozen V2 Delta roots **passed with exit 0** using the unchanged release reader:
 13 schemas, complete rows, paired parity, receipts, routing, capabilities and
-6,042 Delta files. All 43,753 direct durable receipts are terminal published.
+6,042 Delta files. All 43,753 direct durable receipts at that historical boundary
+were terminal published. This historical validation does not validate later
+continuation output.
 The validator was built with
 `cargo build --locked --release --package arrowcol-loadgen` and run with
 `target/release/arrowcol-loadgen validate`, with the saved run environment
 injected.
 
-The retained `row-parity-verification.json` additionally verifies that all
+For the frozen V2 snapshot, the retained `row-parity-verification.json` verifies that all
 admitted rows are present, both pools have the same row-hash sets, and the 12
 non-probe tables have exact row counts and hash-multiset parity. The
 `active_sessions` table includes intentional admission/duplicate probes:
@@ -185,27 +217,132 @@ non-probe tables have exact row counts and hash-multiset parity. The
 **does not claim identical whole-pool row multiplicities**.
 
 Validated changes are published only after the full independent output check
-passes, and CI must be green at the published SHA.
+passes, and CI must be green at the published SHA. All 34 CI checks passed at
+`81a97d1`; that evidence applies only to that revision, not the later lease-refresh
+patch, incremental snapshot cache or publication-capacity waiting changes.
+Continuation7's independent output verification passed as documented below;
+green CI is still required at the later changes' own published SHA.
 
-The generator-only continuation uses the new logical run ID
-`memory-fair-20261014-v2-continuation3`, the existing debug load generator and
-unchanged workload settings. It preserves the V2 collectors, policies,
-historical run directories and SQL volumes rather than restarting this harness
-with the old ID. Continuation health was verified over five samples spanning
-40 seconds: both collectors returned readiness HTTP 200 with zero restarts,
-direct exports increased by 1,327,104 rows and DFE exports by 1,308,672 rows,
-with no NACKs or failures. DFE had 73 threads and 274.4 MiB RSS, below the
-512 MiB gate. This short live-progress check is separate from the completed
-finite soak and independent output validation.
+### Longer continuation failures and recovery
 
-Persistent continuation logs, samples and PID metadata are under
+`memory-fair-20261014-v2-continuation3` **failed after approximately 35 minutes**
+with direct routing pressure, despite its initially healthy progress. Direct
+shutdown exposed an expired cached flush-job lease after waiting for a flush
+slot, even though SQL control had renewed the actual lease. It left 42 buffered
+receipts and five incomplete groups without Delta publication. DFE remained
+around 249 MiB RSS (peak 305 MiB, up to 76 threads) with zero NACKs; this was not
+a DFE collector failure.
+
+The Direct fix refreshes the existing table lease after acquiring the flush
+slot. The table-lease manager requires the same publication fence and a valid
+renewal; it cannot acquire a new owner or epoch to authorize stale work.
+Regression coverage verifies renewal after a blocked slot and rejection of
+foreign owner, epoch, lineage and expired leases. Direct readiness also excludes
+poisoned tables. Passing these regressions does not establish the follow-up
+continuous qualification by itself: continuation7's finite resource evidence
+and independent frozen-output verification are documented separately below.
+
+Continuation4 did not qualify while the old generation's routing leases remained
+draining. Recovery used the existing `RoutingStore.transfer_drained_lease` API
+and normal eligibility/CAS/fencing checks, not manual SQL updates or deletion.
+
+`memory-fair-20261014-v2-continuation5` subsequently **failed the memory gate
+after approximately nine minutes** on retained histories: DFE reached 2,437 MiB
+RSS with 70 threads, 3,555 buffered batches and roughly 2.147 GB logical Arrow
+backlog; direct reached roughly 998 MiB RSS with a 1.4-million-row backlog. The
+generator was stopped gracefully; collectors, failure evidence and retained
+data were not deleted.
+
+Both collectors' original global capacity was 2 GiB, not 4 GiB for DFE: its
+backend was already shared across cores. Filling that permitted budget is
+incompatible with a 512 MiB RSS gate under slow retained-history schema replay.
+The matching 128 MiB runtime profile and incremental SDK schema-cache follow-up
+subsequently passed continuation7's finite resource gates, not an indefinite
+memory guarantee.
+
+Continuation6 was stopped after nine DFE NACKs despite initially healthy memory.
+Temporary publication-capacity exhaustion could reject work after best-effort
+admission. DFE now waits asynchronously for temporary exporter capacity instead
+of NACKing that work; oversized batches still reject immediately, and cancelled
+partial reservations return their capacity. This does not turn DFE admission
+into Direct's durable receipt contract.
+
+### Continuation7 verified finite resource and frozen-output qualification
+
+`memory-fair-20261014-v2-continuation7` **passed the strict resource qualification**
+on October 14, 2026: **2,711.043 seconds (45 minutes 11.043 seconds), 272 samples**,
+measured from **06:14:12.759 UTC to 06:59:23.802 UTC**. The workload remained all
+13 tables, eight lanes and 1,024 rows per batch, with two CPUs per collector and
+the shared process-global 128 MiB / per-table 32 MiB / per-flush 32 MiB profile.
+Evidence:
+`onelake/benchmark/memory-fair-20261014-v2/results/continuation7/memory-soak-verification.json`.
+
+| Collector | Mean RSS (MiB) | Peak RSS (MiB) | Maximum threads | Exported rows/s |
+| --- | ---: | ---: | ---: | ---: |
+| Direct | 202.6447 | 222.4844 | 33 | 35,652.84 |
+| DFE | 211.1987 | 223.8398 | 43 | 35,661.53 |
+
+The resource qualification observed no NACK, publication failure, readiness
+failure, restart or progress stall. Manifests recorded 94,355 paired logical
+batches with zero retries; the sampled window also contained five unpaired
+boundary entries. The separate full-run frozen-output verification below passed
+for every admitted batch, including batches outside the sampled window.
+Export rates are runtime-counter deltas, not independent Parquet row counts.
+Both pools reuse retained histories; they are not identical fresh table pools,
+and these measurements do not establish whole-history row-multiset equality.
+
+DFE's early RSS median was 203.4219 MiB and late median 219.3008 MiB:
+**+15.8789 MiB**, narrowly below the predeclared **16 MiB** growth gate. This is
+not flat memory, proof of no leak or a guarantee for longer runs. Direct and DFE
+remained below the finite RSS/thread gates in this observed interval only.
+
+The SDK now uses a fresh kernel snapshot builder from the previous snapshot
+for incremental replay. Its guarded optimization is limited to local Unix
+JSON transaction logs: historical log fingerprints include length, modification
+time, device, inode and change time. Unsupported cases or historical mutations
+fall back to a full snapshot build; errors propagate rather than silently
+serving stale state. This is not a general object-store freshness guarantee or
+content-hash verification of Parquet files. Historical fingerprint checks still
+scale **O(history)**; incremental schema replay does not make retained-history
+metadata scanning constant-time.
+
+**Independent continuation7 frozen-output verification PASSED with exit 0.**
+After graceful generator stop, flushed manifests, terminal published Direct
+receipts and both pools drained, the endpoint snapshot fixed the verification
+boundary. The independent reader verified scoped receipt evidence, exact
+regenerated SDK payloads and all canonical row-hash multiplicities in both
+Delta outputs:
+
+- **98,496,512 newly written rows per pool**, across all **13 schemas**.
+- **96,188 logical batches and 96,188 published Direct receipts** for the full
+  admitted run interval, not just the sampled resource window.
+- **6,733 Direct and 6,886 DFE new Parquet files**, excluding historical active
+  files; differing file layouts do not change verified row multiplicities.
+- Exact append-only commit/file containment between independent per-table
+  baseline and endpoint versions, with no reported validation failures.
+
+Session-only evidence bundle: `continuation-interval-20261014T070246Z-951136`,
+including `scope.json` and `scoped-containment-validation.json`.
+The output verifier explicitly does not check qualification duration; the
+separate 2,711.043-second resource report above supplies that evidence.
+This establishes exact parity for the new C7 interval, not identical retained
+whole-pool histories. The original 6,042-file validation remains distinct
+historical evidence. No new publication or CI-success claim is made here.
+
+A later continuation may run while that frozen interval is verified only after
+the endpoint capture completes. The verifier binds endpoint versions, schemas
+and file paths, excluding later continuation files. Preserve those frozen files:
+no vacuum, overwrite, removal or schema evolution during verification.
+
+Failed continuation3 logs, samples and PID metadata remain under
 `onelake/benchmark/memory-fair-20261014-v2/results/continuation3/`:
 `generator.log`, `sampler.log`, `resource-samples.jsonl` and `continuation.json`.
-Read the current `generatorPid` from that metadata rather than hard-coding a
-PID, confirm it still identifies the generator, then stop it gracefully:
+Do not signal the failed run's historical PID. For a running continuation, set
+`CONTINUATION_RESULTS` to its own results directory, read its `generatorPid`,
+confirm it still identifies the generator, then stop it gracefully:
 
 ```bash
-GENERATOR_PID=$(node -p 'JSON.parse(require("node:fs").readFileSync("onelake/benchmark/memory-fair-20261014-v2/results/continuation3/continuation.json", "utf8")).generatorPid')
+GENERATOR_PID=$(node -p 'JSON.parse(require("node:fs").readFileSync(require("node:path").join(process.argv[1], "continuation.json"), "utf8")).generatorPid' "${CONTINUATION_RESULTS:?Set the active continuation results directory}")
 kill -INT "$GENERATOR_PID"
 ```
 

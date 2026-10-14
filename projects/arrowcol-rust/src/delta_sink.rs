@@ -51,6 +51,21 @@ impl ProductionDeltaSink {
 
 #[async_trait]
 impl PublicationSink for ProductionDeltaSink {
+    async fn current_lease(
+        &self,
+        table: &arrowcol_protocol::TableIdentity,
+        admitted: &arrowcol_protocol::TableLease,
+    ) -> Result<arrowcol_protocol::TableLease, SinkError> {
+        let handle = self
+            .leases
+            .handle_for_fence(table, &admitted.publication_fence())
+            .await
+            .map_err(|error| SinkError::fenced(format!("refresh queued publication lease: {error:#}")))?;
+        handle
+            .current()
+            .map_err(|error| SinkError::fenced(format!("load confirmed publication lease: {error:#}")))
+    }
+
     async fn begin(&self, context: PublicationContext) -> Result<Box<dyn PublicationSession>, SinkError> {
         let handle = self
             .leases

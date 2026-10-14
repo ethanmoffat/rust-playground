@@ -17,6 +17,7 @@ import {
 } from './cli.js';
 import { startResourceSampler } from './resource-sampler.js';
 import { writeProvenance } from './provenance.js';
+import { benchmarkComposeFiles, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs } from './runtime-config.js';
 
 const workspace = realpathSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..'));
 const composeFile = path.join(workspace, 'projects/loadtest/compose.yaml');
@@ -84,14 +85,14 @@ function environment(directory: string): NodeJS.ProcessEnv {
 }
 
 function compose(project: string, env: NodeJS.ProcessEnv, args: string[], timeout = 300_000): string {
-  const files = ['--file', composeFile];
+  const files = benchmarkComposeFiles(composeFile, env);
   return run('docker', ['compose', '--project-name', project, ...files, ...args], env, timeout);
 }
 
 function composeToFile(project: string, env: NodeJS.ProcessEnv, args: string[], file: string): void {
   const fd = openSync(file, 'w');
   try {
-    const result = spawnSync('docker', ['compose', '--project-name', project, '--file', composeFile, ...args], {
+    const result = spawnSync('docker', ['compose', '--project-name', project, ...benchmarkComposeFiles(composeFile, env), ...args], {
       cwd: workspace, env, stdio: ['ignore', fd, 'inherit'], timeout: 600_000,
     });
     if (result.error || result.status !== 0) throw new Error(`docker compose ${args.join(' ')} failed: ${result.error?.message ?? result.status}`);
@@ -101,7 +102,7 @@ function composeToFile(project: string, env: NodeJS.ProcessEnv, args: string[], 
 }
 
 function composeInteractive(project: string, env: NodeJS.ProcessEnv, args: string[], timeout?: number): void {
-  const files = ['--file', composeFile];
+  const files = benchmarkComposeFiles(composeFile, env);
   const result = spawnSync('docker', ['compose', '--project-name', project, ...files, ...args], {
     cwd: workspace,
     env,
@@ -209,11 +210,15 @@ function writeDirectConfig(directory: string, service: string, network: Benchmar
   const generation = previous + 1;
   const address = network.direct;
   const template = readFileSync(path.join(workspace, 'projects/loadtest/config/direct.yaml.tmpl'), 'utf8');
-  const config = template
-    .replaceAll('__INSTANCE_KEY__', `loadtest-${service}`)
-    .replaceAll('__ADVERTISED_ENDPOINT__', `${address}:50051`)
-    .replaceAll('__GENERATION__', String(generation));
-  writeFileSync(path.join(state, 'direct.yaml'), config);
+  const runtime = buildBenchmarkRuntimeConfigs(template,
+    readFileSync(path.join(workspace, 'projects/arrowcol-dataflow-rust/config.yaml'), 'utf8'),
+    { instanceKey: `loadtest-${service}`, advertisedEndpoint: `${address}:50051`, generation });
+  writeFileSync(path.join(state, 'direct.yaml'), runtime.directYaml);
+  const dataflowState = path.join(directory, 'dataflow-state-1');
+  mkdirSync(dataflowState, { recursive: true });
+  writeFileSync(path.join(dataflowState, 'dataflow.yaml'), runtime.dataflowYaml);
+  writeFileSync(path.join(directory, 'router-state/compose-runtime.json'),
+    `${buildBenchmarkComposeOverride(hostPath(directory))}\n`);
   writeFileSync(generationFile, `${generation}\n`);
 }
 
@@ -242,6 +247,7 @@ function benchmarkEnvironment(
   return {
     ...environment(directory),
     LOADTEST_RUN_ID: options.runId,
+    LOADTEST_COMPOSE_OVERRIDE_FILE: path.join(directory, 'router-state/compose-runtime.json'),
     LOADTEST_WARMUP: `${options.warmupSeconds}s`,
     ...(options.measureSeconds === undefined ? {} : { LOADTEST_MEASURE: `${options.measureSeconds}s` }),
     LOADTEST_CAPTURE_SETTLE: `${options.captureSettleSeconds}s`,

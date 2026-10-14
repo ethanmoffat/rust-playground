@@ -6,6 +6,7 @@ import path from 'node:path';
 import YAML from 'yaml';
 
 import type { BenchmarkOptions } from './cli.js';
+import { benchmarkComposeFiles } from './runtime-config.js';
 
 export function sha256(text: string | Buffer): string {
   return createHash('sha256').update(text).digest('hex');
@@ -106,7 +107,7 @@ export function writeProvenance(
     'projects/arrowcol-dataflow-rust/config.yaml', 'projects/loadtest/config/router.yaml',
   ];
   const direct = YAML.parse(readFileSync(path.join(directory, 'direct-state-1/direct.yaml'), 'utf8')) as Document;
-  const dataflow = YAML.parse(readFileSync(path.join(workspace, files[2]), 'utf8')) as Document;
+  const dataflow = YAML.parse(readFileSync(path.join(directory, 'dataflow-state-1/dataflow.yaml'), 'utf8')) as Document;
   const revision = (root: string): Document => ({
     head: execute('git', ['-C', root, 'rev-parse', 'HEAD']).trim(),
     dirtyDiffSha256: sha256(execute('git', ['-C', root, 'diff', '--binary', 'HEAD'])),
@@ -119,6 +120,8 @@ export function writeProvenance(
     source: revision('.'), otelArrowSource: revision('submodules/otel-arrow'),
     configSha256: Object.fromEntries(files.map((file) => [file, sha256(readFileSync(path.join(workspace, file)))])),
     generatedDirectConfigSha256: sha256(readFileSync(path.join(directory, 'direct-state-1/direct.yaml'))),
+    generatedDataflowConfigSha256: sha256(readFileSync(path.join(directory, 'dataflow-state-1/dataflow.yaml'))),
+    runtimeComposeOverrideSha256: sha256(readFileSync(path.join(directory, 'router-state/compose-runtime.json'))),
     policies: safeCollectorPolicies(direct, dataflow),
     workload: {
       ...options, scenario: 'paired', tables: env.LOADTEST_TABLES?.split(',') ?? 'all schema fixtures (13 tables)',
@@ -134,7 +137,7 @@ export function writeProvenance(
   writeFileSync(output, `${JSON.stringify(provenance, null, 2)}\n`);
   try {
     const effective = JSON.parse(execute('docker', [
-      'compose', '--project-name', project, '--file', path.join(workspace, files[0]),
+      'compose', '--project-name', project, ...benchmarkComposeFiles(path.join(workspace, files[0]), env),
       '--profile', 'benchmark', 'config', '--format', 'json',
     ])) as Document;
     provenance.effectiveComposeSha256 = sha256(JSON.stringify(effective));
@@ -148,6 +151,7 @@ export function writeProvenance(
       resolvedPolicy: pipelineAllocation ?? groupAllocation ?? { type: 'core_count', count: cliCores },
       resolution: 'pipeline > group > CLI-overridden engine policy',
       streamLimitScope: 'process-wide shared permits across DFE receiver cores',
+      bufferBudgetScope: 'process-wide shared DeltaBackend keyed by base_path; no per-core division',
       aggregateMaxConcurrentStreams: dataflow.groups.arrowcol.pipelines.ingest.nodes.flight.config.registration.max_concurrent_streams,
     };
     // Resolve only the non-sensitive Flight message size override, not arbitrary environment strings.

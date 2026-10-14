@@ -219,8 +219,8 @@ impl DeltaBackend {
             decoded.envelope.source_schema_version,
             decoded.envelope.target_schema_version,
         );
-        let mut capacity = self.capacity.acquire(rows, bytes)?;
-        capacity.extend(owner.capacity.acquire(rows, bytes)?);
+        let mut capacity = self.capacity.acquire(rows, bytes).await?;
+        capacity.extend(owner.capacity.acquire(rows, bytes).await?);
         let (reply, receipt) = oneshot::channel();
         owner
             .sender
@@ -260,6 +260,7 @@ impl PendingDelta {
 }
 
 struct Capacity {
+    limits: BatchCapacity,
     bytes: Arc<Semaphore>,
     rows: Arc<Semaphore>,
     batches: Arc<Semaphore>,
@@ -268,27 +269,32 @@ struct Capacity {
 impl Capacity {
     fn new(limits: BatchCapacity) -> Self {
         Self {
+            limits,
             bytes: Arc::new(Semaphore::new(limits.bytes as usize)),
             rows: Arc::new(Semaphore::new(limits.rows as usize)),
             batches: Arc::new(Semaphore::new(limits.batches as usize)),
         }
     }
 
-    fn acquire(&self, rows: u64, bytes: u64) -> Result<Vec<OwnedSemaphorePermit>, ExportFailure> {
+    async fn acquire(&self, rows: u64, bytes: u64) -> Result<Vec<OwnedSemaphorePermit>, ExportFailure> {
         let rows = u32::try_from(rows).map_err(|error| ExportFailure::Permanent(error.to_string()))?;
         let bytes = u32::try_from(bytes).map_err(|error| ExportFailure::Permanent(error.to_string()))?;
-        [
+        if rows > self.limits.rows || bytes > self.limits.bytes {
+            return Err(ExportFailure::Transient(
+                "Arrow file buffering capacity exhausted: batch exceeds configured capacity".to_owned(),
+            ));
+        }
+        let mut permits = Vec::with_capacity(3);
+        for (capacity, amount) in [
             (Arc::clone(&self.bytes), bytes),
             (Arc::clone(&self.rows), rows),
             (Arc::clone(&self.batches), 1),
-        ]
-        .into_iter()
-        .map(|(capacity, amount)| {
-            capacity
-                .try_acquire_many_owned(amount)
-                .map_err(|error| ExportFailure::Transient(format!("Arrow file buffering capacity exhausted: {error}")))
-        })
-        .collect()
+        ] {
+            permits.push(capacity.acquire_many_owned(amount).await.map_err(|error| {
+                ExportFailure::Transient(format!("Arrow file buffering capacity unavailable: {error}"))
+            })?);
+        }
+        Ok(permits)
     }
 }
 
@@ -984,7 +990,37 @@ mod tests {
             .expect("publication");
     }
 
-    /// Scenario: A batch exceeds the configured row capacity after acquiring its byte permits.
+    /// Scenario: Admitted work temporarily exhausts publication capacity.
+    /// Guarantees: Work waits without a NACK, and cancellation refunds partial reservations.
+    #[tokio::test]
+    async fn temporary_capacity_waits_and_cancellation_refunds_reservations() {
+        let capacity = Arc::new(Capacity::new(BatchCapacity {
+            bytes: 16,
+            rows: 2,
+            batches: 2,
+        }));
+        let held = capacity.acquire(1, 8).await.expect("first reservation");
+        let mut queued = Box::pin(capacity.acquire(2, 8));
+        assert!(queued.as_mut().now_or_never().is_none());
+        assert_eq!(capacity.bytes.available_permits(), 0);
+        drop(queued);
+        assert_eq!(capacity.bytes.available_permits(), 8);
+        assert_eq!(capacity.rows.available_permits(), 1);
+        let mut queued = Box::pin(capacity.acquire(1, 16));
+        assert!(queued.as_mut().now_or_never().is_none());
+        drop(held);
+        let resumed = tokio::time::timeout(std::time::Duration::from_secs(2), queued)
+            .await
+            .expect("reservation resumed")
+            .expect("reservation succeeded");
+        assert_eq!(capacity.bytes.available_permits(), 0);
+        drop(resumed);
+        assert_eq!(capacity.bytes.available_permits(), 16);
+        assert_eq!(capacity.rows.available_permits(), 2);
+        assert_eq!(capacity.batches.available_permits(), 2);
+    }
+
+    /// Scenario: A batch exceeds the configured row capacity.
     /// Guarantees: Admission fails explicitly, refunds partial capacity, and never creates a data file.
     #[tokio::test]
     async fn exhausted_capacity_is_explicit_and_refunded() {

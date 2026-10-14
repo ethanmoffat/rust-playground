@@ -579,7 +579,23 @@ impl BufferManager {
         };
         let _permit = permit;
         let versions: Vec<_> = job.entries.iter().map(|entry| entry.receipt).collect();
-        let deadline = match receipt_deadline(&job.context.lease, self.config.receipt_lease_duration) {
+        let lease = match self.sink.current_lease(&job.context.table, &job.context.lease).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                return incomplete_job(job, error.message(), None, Some(error.message().to_owned()));
+            }
+        };
+        if !job.context.lease.publication_fence().matches_lease(&lease) {
+            let reason = "queued publication lease changed ownership";
+            return incomplete_job(job, reason, None, Some(reason.to_owned()));
+        }
+        if lease != job.context.lease
+            && let Err(error) = job.context.lease.validate_successor(&lease)
+        {
+            let reason = format!("queued publication lease renewal is invalid: {error}");
+            return incomplete_job(job, &reason, None, Some(reason.clone()));
+        }
+        let deadline = match receipt_deadline(&lease, self.config.receipt_lease_duration) {
             Ok(deadline) => deadline,
             Err(error) => {
                 return incomplete_job(job, error.message(), None, Some(error.message().to_owned()));

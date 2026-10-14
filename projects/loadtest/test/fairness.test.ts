@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import YAML from 'yaml';
+import { benchmarkComposeFiles, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs } from '../src/runtime-config.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const direct = YAML.parse(readFileSync(path.join(root, 'projects/loadtest/config/direct.yaml.tmpl'), 'utf8'));
@@ -48,4 +49,73 @@ test('direct retains durable lease/receipt contracts rather than downgrading to 
   assert(direct.receipts.receipt_lease_duration_ms > 0);
   assert.equal(nodes.flight.type, 'receiver:arrow_flight');
   assert.equal(nodes.delta.type, 'exporter:arrow_deltalake');
+});
+
+test('actual runtime builder applies matching process-wide 128 MiB budgets without per-core division', () => {
+  const directSource = readFileSync(path.join(root, 'projects/loadtest/config/direct.yaml.tmpl'), 'utf8');
+  const dataflowSource = readFileSync(path.join(root, 'projects/arrowcol-dataflow-rust/config.yaml'), 'utf8');
+  const runtime = buildBenchmarkRuntimeConfigs(directSource, dataflowSource, {
+    instanceKey: 'loadtest-direct-1', advertisedEndpoint: '10.89.0.21:50051', generation: 2,
+  });
+  const builtDirect = YAML.parse(runtime.directYaml);
+  const builtDataflow = YAML.parse(runtime.dataflowYaml);
+  const builtNodes = builtDataflow.groups.arrowcol.pipelines.ingest.nodes;
+  const batching = builtNodes.delta.config.batching;
+  assert.deepEqual(builtDirect.buffer.global_capacity, { bytes: 134217728, rows: 4000000, batches: 2048 });
+  assert.deepEqual(builtDirect.buffer.per_table_capacity, { bytes: 33554432, rows: 1000000, batches: 512 });
+  for (const key of ['global_capacity', 'per_table_capacity', 'max_arrow_memory_per_flush']) {
+    assert.deepEqual(batching[key], builtDirect.buffer[key], key);
+  }
+  assert.equal(batching.max_arrow_memory_per_flush, 33554432);
+  assert.equal(builtNodes.flight.config.registration.buffered_bytes_limit, 134217728);
+  assert.equal(builtNodes.flight.config.registration.buffered_rows_limit, 4000000);
+  assert.equal(builtNodes.flight.config.registration.buffered_batches_limit, 2048);
+  for (const key of ['max_rows_per_flush', 'max_batches_per_flush', 'max_concurrent_flushes', 'adaptive_file']) {
+    assert.deepEqual(batching[key], direct.buffer[key], key);
+    assert.deepEqual(builtDirect.buffer[key], direct.buffer[key], key);
+  }
+  assert.equal(builtDirect.buffer.max_age_ms, direct.buffer.max_age_ms);
+  assert.equal(batching.max_age, nodes.delta.config.batching.max_age);
+  assert.deepEqual(builtDirect.delta, direct.delta);
+  assert.deepEqual(builtNodes.delta.config.commit, nodes.delta.config.commit);
+  assert.deepEqual(builtDirect.receipts, direct.receipts);
+  assert.deepEqual(builtDirect.auth, direct.auth);
+  assert.equal(builtDirect.identity.generation, 2);
+  assert.equal(builtDirect.flight.max_concurrent_streams, 256);
+  assert.equal(builtNodes.flight.config.registration.max_concurrent_streams, 256);
+  for (const buffer of [builtDirect.buffer, batching]) {
+    assert(buffer.max_rows_per_flush <= buffer.per_table_capacity.rows);
+    assert(buffer.max_batches_per_flush <= buffer.per_table_capacity.batches);
+    assert(buffer.max_arrow_memory_per_flush <= buffer.per_table_capacity.bytes);
+    for (const key of ['bytes', 'rows', 'batches']) assert(buffer.per_table_capacity[key] <= buffer.global_capacity[key]);
+  }
+  assert.equal(YAML.parse(directSource).buffer.global_capacity.bytes, 2147483648);
+  assert.equal(YAML.parse(dataflowSource).groups.arrowcol.pipelines.ingest.nodes.delta.config.batching.global_capacity.bytes, 2147483648);
+  const retained = buildBenchmarkRuntimeConfigs(runtime.directYaml, dataflowSource);
+  assert.equal(YAML.parse(retained.directYaml).identity.generation, 2, 'budget construction does not advance restart generations');
+});
+
+test('DFE factory reuses the process-wide backend registry keyed by Delta root', () => {
+  const exporter = readFileSync(path.join(root, 'crates/arrowcol-dataflow-components/src/exporter.rs'), 'utf8');
+  assert.match(exporter, /type BackendRegistry = Mutex<HashMap<PathBuf, Weak<DeltaBackend>>>/u);
+  assert.match(exporter, /static BACKENDS: LazyLock<BackendRegistry>/u);
+  assert.match(exporter, /registry\.get\(&config\.base_path\)\.and_then\(Weak::upgrade\)/u);
+  assert.match(exporter, /return Ok\(Self \{ backend: existing \}\)/u);
+  assert.match(exporter, /GenericDeltaExporter::shared\(config, global_metrics\(\)\)/u);
+  assert.match(exporter, /capacity: Capacity::new\(config\.batching\.global_capacity\)/u);
+  assert.match(exporter, /flush_slots: Arc::new\(Semaphore::new\(config\.batching\.max_concurrent_flushes\)\)/u);
+});
+
+test('runtime Compose override mounts generated DFE policy without changing CPUs or base Compose', () => {
+  const directory = '/workspace-root/onelake/benchmark/fair-run';
+  const override = JSON.parse(buildBenchmarkComposeOverride(directory));
+  assert.deepEqual(Object.keys(override.services), ['dataflow-1']);
+  assert.deepEqual(override.services['dataflow-1'].volumes, [{
+    type: 'bind', source: `${directory}/dataflow-state-1/dataflow.yaml`,
+    target: '/etc/arrowcol-dataflow-rust/config.yaml', read_only: true,
+    bind: { create_host_path: false },
+  }]);
+  assert.deepEqual(benchmarkComposeFiles('compose.yaml', {}), ['--file', 'compose.yaml']);
+  assert.deepEqual(benchmarkComposeFiles('compose.yaml', { LOADTEST_COMPOSE_OVERRIDE_FILE: 'runtime.json' }),
+    ['--file', 'compose.yaml', '--file', 'runtime.json']);
 });
