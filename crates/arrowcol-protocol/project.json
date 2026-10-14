@@ -1,0 +1,27 @@
+{
+  "name": "arrowcol-protocol",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "crates/arrowcol-protocol/src",
+  "namedInputs": {
+    "default": ["{projectRoot}/**/*", "{workspaceRoot}/Cargo.toml", "{workspaceRoot}/Cargo.lock", "{workspaceRoot}/rust-toolchain.toml"]
+  },
+  "targets": {
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/clean.ts crates/arrowcol-protocol",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "format": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package arrowcol-protocol"}},
+    "format-check": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package arrowcol-protocol -- --check"}},
+    "lint": {"executor": "nx:run-commands", "options": {"command": "cargo clippy --locked --package arrowcol-protocol --all-targets -- -D warnings"}},
+    "build": {"executor": "nx:run-commands", "cache": false, "options": {"command": "cargo build --locked --package arrowcol-protocol"}},
+    "test": {"executor": "nx:run-commands", "options": {"command": "cargo test --locked --package arrowcol-protocol"}},
+    "verify": {"executor": "nx:run-commands", "dependsOn": ["format-check", "lint", "build", "test"], "options": {"commands": []}}
+  },
+  "tags": ["scope:rust", "type:library"]
+}

@@ -1,8 +1,10 @@
 services:
   workspace:
-    image: ghcr.io/mdrakiburrahman/rust-playground/devcontainer:7f22926fca8403f3ba6f832d69be03f7ba0660757aa81366778cc7cb4f5e98b7
+    image: ghcr.io/mdrakiburrahman/rust-playground/devcontainer:7a6c321bf956de1f7b2f1e9154d51b8e042542e9b8d2a5646c21d3d9f8abe36a
     command: sleep infinity
     init: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - type: bind
         source: ..

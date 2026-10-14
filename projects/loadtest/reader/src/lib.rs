@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, bail};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::Field;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn field_value(field: &Field) -> Value {
     match field {
@@ -73,6 +75,7 @@ pub async fn inspect(directory: &Path) -> Result<Value> {
         if !snapshot.metadata().partition_columns().is_empty() {
             bail!("partitioned inspection is not supported");
         }
+
         let schema = snapshot.schema();
         schemas.insert(table.clone(), serde_json::to_value(&schema)?);
         versions.insert(table.clone(), json!(snapshot.version()));
@@ -129,9 +132,209 @@ pub async fn inspect(directory: &Path) -> Result<Value> {
     )
 }
 
+/// Snapshot-selected summary for an independent Delta root.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SnapshotSummary {
+    pub files: usize,
+    pub tables: BTreeMap<String, TableSummary>,
+}
+
+/// One Delta table's schema, versions, active files, rows, bytes, and row multiset.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TableSummary {
+    pub schema: Value,
+    pub version: u64,
+    pub active_files: usize,
+    pub rows: u64,
+    pub bytes: u64,
+    pub minimum_file_bytes: u64,
+    pub maximum_file_bytes: u64,
+    pub row_hashes: BTreeMap<String, u64>,
+    pub files: Vec<FileSummary>,
+}
+
+/// One active Delta data file.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FileSummary {
+    pub path: String,
+    pub bytes: u64,
+    pub rows: u64,
+}
+
+/// Recursively opens every Delta table below a root and summarizes only files
+/// selected by each independent delta-rs snapshot.
+///
+/// # Errors
+///
+/// Rejects absent tables, symlinks, corrupt logs/data, path escapes, and
+/// non-local active files.
+pub async fn summarize(directory: &Path) -> Result<SnapshotSummary> {
+    let directory =
+        fs::canonicalize(directory).with_context(|| format!("canonicalize Delta root {}", directory.display()))?;
+    let roots = find_delta_roots(&directory)?;
+    if roots.is_empty() {
+        bail!("no Delta tables found in {}", directory.display());
+    }
+    let mut tables = BTreeMap::new();
+    let mut total_files = 0_usize;
+    for root in roots {
+        let relative = root.strip_prefix(&directory)?;
+        let identity = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(".");
+        if identity.is_empty() {
+            bail!("Delta table identity is empty");
+        }
+        let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table path"))?;
+        let delta = deltalake_core::open_table(url)
+            .await
+            .with_context(|| format!("open Delta table {identity}"))?;
+        let snapshot = delta.snapshot()?;
+        if !snapshot.metadata().partition_columns().is_empty() {
+            bail!("partitioned inspection is not supported");
+        }
+        let schema = serde_json::to_value(snapshot.schema())?;
+        let uris = delta.get_file_uris_by_partitions(&[]).await?;
+        let mut files = Vec::with_capacity(uris.len());
+        let mut rows = 0_u64;
+        let mut bytes = 0_u64;
+        let mut row_hashes = BTreeMap::<String, u64>::new();
+        for uri in uris {
+            let path = local_active_file(&root, &uri)?;
+            let size = fs::metadata(&path)?.len();
+            let reader = SerializedFileReader::new(File::open(&path)?)
+                .with_context(|| format!("open Parquet {}", path.display()))?;
+            let file_rows = u64::try_from(reader.metadata().file_metadata().num_rows())
+                .context("negative or overflowing Parquet row count")?;
+            for row in reader.get_row_iter(None)? {
+                let value = row_value(&row?);
+                let digest = format!("sha256:{}", hex::encode(Sha256::digest(serde_json::to_vec(&value)?)));
+                *row_hashes.entry(digest).or_default() += 1;
+            }
+            let relative = path
+                .strip_prefix(&root)?
+                .to_str()
+                .context("non-UTF8 data path")?
+                .to_owned();
+            files.push(FileSummary {
+                path: relative,
+                bytes: size,
+                rows: file_rows,
+            });
+            rows = rows.checked_add(file_rows).context("snapshot row count overflow")?;
+            bytes = bytes.checked_add(size).context("snapshot byte count overflow")?;
+        }
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        let minimum_file_bytes = files.iter().map(|file| file.bytes).min().unwrap_or(0);
+        let maximum_file_bytes = files.iter().map(|file| file.bytes).max().unwrap_or(0);
+        total_files += files.len();
+        if tables
+            .insert(
+                identity.clone(),
+                TableSummary {
+                    schema,
+                    version: snapshot.version(),
+                    active_files: files.len(),
+                    rows,
+                    bytes,
+                    minimum_file_bytes,
+                    maximum_file_bytes,
+                    row_hashes,
+                    files,
+                },
+            )
+            .is_some()
+        {
+            bail!("duplicate Delta table identity {identity}");
+        }
+    }
+    Ok(SnapshotSummary {
+        files: total_files,
+        tables,
+    })
+}
+
+fn find_delta_roots(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let metadata = fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("Delta snapshot traversal encountered a non-directory or symlink");
+        }
+        if current.join("_delta_log").is_dir() {
+            roots.push(current);
+            continue;
+        }
+        for entry in fs::read_dir(&current)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                bail!("Delta snapshot traversal rejects symlink {}", path.display());
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    roots.sort();
+    Ok(roots)
+}
+
+fn local_active_file(root: &Path, uri: &str) -> Result<PathBuf> {
+    let path = if uri.starts_with("file:") {
+        url::Url::parse(uri)?
+            .to_file_path()
+            .map_err(|()| anyhow::anyhow!("non-local data file"))?
+    } else if Path::new(uri).is_absolute() {
+        PathBuf::from(uri)
+    } else {
+        bail!("non-local data file URI {uri}");
+    };
+    let path = fs::canonicalize(path)?;
+    if !path.starts_with(root) {
+        bail!("data file escapes table root");
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(name: &str) -> Result<Self> {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = PathBuf::from(format!(
+                "target/loadtest-reader-tests/{}-{}-{sequence}",
+                std::process::id(),
+                name
+            ));
+            if path.exists() {
+                fs::remove_dir_all(&path)?;
+            }
+            fs::create_dir_all(&path)?;
+            Ok(Self(path))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// Scenario: binary identifiers contain zero and high-bit bytes.
     /// Guarantees: inspection preserves every byte as hexadecimal.
@@ -144,16 +347,18 @@ mod tests {
     /// Scenario: the requested output directory is absent.
     /// Guarantees: inspection fails rather than returning empty success.
     #[tokio::test]
-    async fn missing_directory_is_an_error() {
-        let missing = std::env::temp_dir().join(format!("parquet-missing-{}", std::process::id()));
+    async fn missing_directory_is_an_error() -> Result<()> {
+        let directory = TestDirectory::new("missing")?;
+        let missing = directory.path().join("absent");
         assert!(inspect(&missing).await.is_err());
+        Ok(())
     }
 
     /// Scenario: a directory contains no tables or only raw Parquet without a log.
     /// Guarantees: raw files cannot masquerade as committed Delta data.
     #[tokio::test]
     async fn empty_and_non_delta_are_errors() -> Result<()> {
-        let directory = tempfile::tempdir()?;
+        let directory = TestDirectory::new("invalid")?;
         assert!(inspect(directory.path()).await.is_err());
         fs::create_dir(directory.path().join("logs"))?;
         fs::write(directory.path().join("logs/broken.parquet"), b"not parquet")?;
@@ -171,7 +376,7 @@ mod tests {
         };
         use arrow_deltalake::delta::DeltaTableWriter;
         use std::sync::Arc;
-        let directory = tempfile::tempdir()?;
+        let directory = TestDirectory::new("interop")?;
         let root = directory.path().join("generic");
         let mut writer = DeltaTableWriter::open(&root)?;
         let input = RecordBatch::try_new(
@@ -205,6 +410,11 @@ mod tests {
         let rows = result["tables"]["generic"].as_array().context("missing rows")?;
         assert_eq!(rows.len(), 3);
         assert_eq!(rows.iter().filter(|row| row["name"].is_null()).count(), 2);
+        let summary = summarize(directory.path()).await?;
+        assert_eq!(summary.files, 2);
+        assert_eq!(summary.tables["generic"].rows, 3);
+        assert_eq!(summary.tables["generic"].active_files, 2);
+        assert!(summary.tables["generic"].bytes > 0);
         Ok(())
     }
 
@@ -218,7 +428,7 @@ mod tests {
         };
         use arrow_deltalake::delta::DeltaTableWriter;
         use std::sync::Arc;
-        let directory = tempfile::tempdir()?;
+        let directory = TestDirectory::new("lossless")?;
         let mut writer = DeltaTableWriter::open(directory.path().join("generic"))?;
         let input = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -259,7 +469,7 @@ mod tests {
         use arrow::datatypes::{DataType, Field};
         use arrow_deltalake::delta::DeltaTableWriter;
         use std::sync::Arc;
-        let directory = tempfile::tempdir()?;
+        let directory = TestDirectory::new("nested")?;
         let mut counts = ListBuilder::new(UInt64Builder::new());
         counts.values().append_value(u64::MAX);
         counts.values().append_value(1);

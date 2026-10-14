@@ -32,12 +32,10 @@ export function verifyCleanWorktree(
     runner,
     'git',
     gitArgs([
-      'ls-files',
-      '--other',
-      '--modified',
-      '--directory',
-      '--exclude-standard',
-      '--no-empty-directory',
+      'status',
+      '--porcelain=v1',
+      '--untracked-files=normal',
+      '--ignore-submodules=none',
     ]),
     { stdout: 'capture' },
   ).stdout.trim();
@@ -50,14 +48,19 @@ export function verifyCleanWorktree(
     `Verification left tracked modifications or unexpected untracked files:\n${changes}\n`,
   );
 
-  const diff = runChecked(
-    runner,
-    'git',
-    gitArgs(['--no-pager', 'diff', '--no-ext-diff', '--']),
-    { stdout: 'capture' },
-  ).stdout.trim();
-  if (diff) {
-    output.stderr(`\nTracked worktree diff:\n${diff}\n`);
+  for (const staged of [false, true]) {
+    const diff = runChecked(
+      runner,
+      'git',
+      gitArgs([
+        '--no-pager', 'diff', '--no-ext-diff',
+        ...(staged ? ['--cached'] : []), '--',
+      ]),
+      { stdout: 'capture' },
+    ).stdout.trim();
+    if (diff) {
+      output.stderr(`\nTracked ${staged ? 'staged' : 'worktree'} diff:\n${diff}\n`);
+    }
   }
 
   return false;

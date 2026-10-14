@@ -1,0 +1,545 @@
+export type ImplementationPool = 'direct' | 'dataflow';
+
+export type RoutingHeaders = Readonly<Record<
+  | 'x-arrowcol-protocol-version'
+  | 'x-arrowcol-implementation-pool'
+  | 'x-arrowcol-catalog'
+  | 'x-arrowcol-schema'
+  | 'x-arrowcol-table'
+  | 'x-arrowcol-schema-fingerprint',
+  string
+>>;
+
+export function routingMetadata(pool: ImplementationPool): RoutingHeaders {
+  const headers = Object.freeze({
+    'x-arrowcol-protocol-version': '1',
+    'x-arrowcol-implementation-pool': pool,
+    'x-arrowcol-catalog': TABLE_CATALOG,
+    'x-arrowcol-schema': TABLE_SCHEMA,
+    'x-arrowcol-table': TABLE_NAME,
+    'x-arrowcol-schema-fingerprint': SCHEMA_FINGERPRINT,
+  });
+  for (const [key, value] of Object.entries(headers)) {
+    validateMetadata(key, value);
+  }
+  return headers;
+}
+
+export interface DoPutPlan {
+  readonly grpcPath: typeof DO_PUT_PATH;
+  readonly descriptorPath: readonly string[];
+  readonly headers: RoutingHeaders;
+  readonly batch: RecordBatch;
+}
+
+export function createDoPutPlan(
+  batch: RecordBatch,
+  pool: ImplementationPool,
+): DoPutPlan {
+  if (!sameSchema(batch.schema, ARROW_SCHEMA)) {
+    throw new Error('record batch schema does not match generated schema');
+  }
+  return Object.freeze({
+    grpcPath: DO_PUT_PATH,
+    descriptorPath: Object.freeze([
+      TABLE_CATALOG,
+      TABLE_SCHEMA,
+      TABLE_NAME,
+      `v${SCHEMA_VERSION}`,
+    ]),
+    headers: routingMetadata(pool),
+    batch,
+  });
+}
+
+export type ReceiptId = string & { readonly __receiptId: unique symbol };
+
+export function parseReceiptId(
+  applicationMetadata: Uint8Array | string,
+): ReceiptId {
+  const text =
+    typeof applicationMetadata === 'string'
+      ? applicationMetadata
+      : new TextDecoder('utf-8', { fatal: true }).decode(applicationMetadata);
+  const candidate = UUID_PATTERN.test(text)
+    ? text
+    : receiptIdFromJson(text);
+  if (!UUID_PATTERN.test(candidate)) {
+    throw new Error('receipt ID must be a canonical UUID');
+  }
+  return candidate.toLowerCase() as ReceiptId;
+}
+
+export function receiptStatusUrl(
+  baseUrl: URL | string,
+  receiptId: ReceiptId,
+): string {
+  const url = new URL(baseUrl);
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('receipt base URL must use HTTP or HTTPS');
+  }
+  url.search = '';
+  url.hash = '';
+  const base = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
+  url.pathname = `${base}v1/receipts/${receiptId}`;
+  return url.toString();
+}
+
+function receiptIdFromJson(text: string): string {
+  const value: unknown = JSON.parse(text);
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    !('receipt_id' in value) ||
+    typeof value.receipt_id !== 'string'
+  ) {
+    throw new Error('receipt metadata must contain a string receipt_id');
+  }
+  return value.receipt_id;
+}
+
+function validateMetadata(key: string, value: string): void {
+  const maximum =
+    key === 'x-arrowcol-protocol-version' ||
+    key === 'x-arrowcol-implementation-pool'
+      ? 16
+      : key === 'x-arrowcol-schema-fingerprint'
+        ? 71
+        : 128;
+  if (
+    value.length === 0 ||
+    new TextEncoder().encode(value).length > maximum ||
+    /[^\x20-\x7e]/u.test(value)
+  ) {
+    throw new Error(
+      `invalid routing metadata ${key}: expected bounded printable ASCII`,
+    );
+  }
+}
+
+function sameSchema(left: Schema, right: Schema): boolean {
+  return left.toString() === right.toString();
+}
+
+function structType(fields: Field<DataType>[]): Struct {
+  return new Struct(fields);
+}
+
+function buildField(
+  field: Field,
+  values: readonly unknown[],
+  active: readonly boolean[],
+): Vector<DataType> {
+  if (values.length !== active.length) {
+    throw new Error('generated field value/activity length mismatch');
+  }
+  for (let index = 0; index < values.length; index += 1) {
+    if (active[index] && values[index] == null && !field.nullable) {
+      throw new Error(`non-nullable field ${field.name} received null`);
+    }
+  }
+  return buildVector(field.type, values);
+}
+
+function buildVector(
+  type: DataType,
+  values: readonly unknown[],
+): Vector<DataType> {
+  if (DataType.isBool(type)) {
+    assertValues(values, (value) => typeof value === 'boolean', 'boolean');
+    return vectorFromArray(values, type);
+  }
+  if (DataType.isInt(type)) {
+    validateIntValues(type, values);
+    return vectorFromArray(values, type);
+  }
+  if (DataType.isFloat(type)) {
+    assertValues(values, (value) => typeof value === 'number', 'floating point');
+    return vectorFromArray(values, type);
+  }
+  if (DataType.isUtf8(type) || DataType.isLargeUtf8(type) || DataType.isUtf8View(type)) {
+    assertValues(values, (value) => typeof value === 'string', 'UTF-8 string');
+    return vectorFromArray(values, type);
+  }
+  if (DataType.isBinary(type) || DataType.isLargeBinary(type) || DataType.isBinaryView(type)) {
+    assertValues(values, (value) => value instanceof Uint8Array, 'binary');
+    return vectorFromArray(values, type);
+  }
+  if (DataType.isFixedSizeBinary(type)) {
+    const { nullBitmap, nullCount } = validity(values);
+    const data = new Uint8Array(values.length * type.byteWidth);
+    values.forEach((value, index) => {
+      if (value == null) {
+        return;
+      }
+      if (!(value instanceof Uint8Array) || value.length !== type.byteWidth) {
+        throw new Error(
+          `fixed-size binary expected ${type.byteWidth} bytes at index ${index}`,
+        );
+      }
+      data.set(value, index * type.byteWidth);
+    });
+    return makeVector(
+      makeData({
+        type,
+        length: values.length,
+        nullCount,
+        nullBitmap,
+        data,
+      }),
+    );
+  }
+  if (DataType.isDate(type)) {
+    const { nullBitmap, nullCount } = validity(values);
+    if (type.unit === DateUnit.DAY) {
+      const data = new Int32Array(values.length);
+      values.forEach((value, index) => {
+        if (value != null) {
+          data[index] = exactInt32(value, 'date32');
+        }
+      });
+      return makeVector(
+        makeData({ type, length: values.length, nullCount, nullBitmap, data }),
+      );
+    }
+    const data = exactBigInt64(values, 'date64');
+    return makeVector(
+      makeData({ type, length: values.length, nullCount, nullBitmap, data }),
+    );
+  }
+  if (DataType.isTimestamp(type)) {
+    const { nullBitmap, nullCount } = validity(values);
+    const data = exactBigInt64(values, 'timestamp');
+    return makeVector(
+      makeData({ type, length: values.length, nullCount, nullBitmap, data }),
+    );
+  }
+  if (DataType.isTime(type)) {
+    assertValues(
+      values,
+      (value) =>
+        type.bitWidth === 32
+          ? isInt32(value)
+          : isInt64(value),
+      'time',
+    );
+    return vectorFromArray(values, type);
+  }
+  if (DataType.isDuration(type)) {
+    assertValues(values, isInt64, 'duration');
+    return vectorFromArray(values, type);
+  }
+  if (DataType.isDecimal(type)) {
+    const { nullBitmap, nullCount } = validity(values);
+    const data = decimal128Data(type, values);
+    return makeVector(
+      makeData({ type, length: values.length, nullCount, nullBitmap, data }),
+    );
+  }
+  if (DataType.isStruct(type)) {
+    const active = values.map((value) => value != null);
+    const children = type.children.map((field) => {
+      const childValues = values.map((value) => {
+        if (value == null) {
+          return null;
+        }
+        if (typeof value !== 'object') {
+          throw new Error('struct value must be an object');
+        }
+        return (value as Readonly<Record<string, unknown>>)[field.name];
+      });
+      return singleData(buildField(field, childValues, active));
+    });
+    const { nullBitmap, nullCount } = validity(values);
+    return makeVector(
+      makeData({
+        type,
+        length: values.length,
+        nullCount,
+        nullBitmap,
+        children,
+      }),
+    );
+  }
+  if (DataType.isList(type) || DataType.isLargeList(type)) {
+    const flattened: unknown[] = [];
+    const childActive: boolean[] = [];
+    const lengths: number[] = [];
+    for (const value of values) {
+      if (value == null) {
+        lengths.push(0);
+        continue;
+      }
+      if (!Array.isArray(value)) {
+        throw new Error('list value must be an array');
+      }
+      lengths.push(value.length);
+      for (const item of value) {
+        flattened.push(item);
+        childActive.push(true);
+      }
+    }
+    const child = singleData(
+      buildField(type.valueField, flattened, childActive),
+    );
+    const { nullBitmap, nullCount } = validity(values);
+    if (DataType.isLargeList(type)) {
+      const valueOffsets = listOffsets64(lengths);
+      return makeVector(
+        makeData({
+          type,
+          length: values.length,
+          nullCount,
+          nullBitmap,
+          valueOffsets,
+          child,
+        }),
+      );
+    }
+    const valueOffsets = listOffsets32(lengths);
+    return makeVector(
+      makeData({
+        type,
+        length: values.length,
+        nullCount,
+        nullBitmap,
+        valueOffsets,
+        child,
+      }),
+    );
+  }
+  if (DataType.isFixedSizeList(type)) {
+    const flattened: unknown[] = [];
+    const childActive: boolean[] = [];
+    for (const value of values) {
+      if (value == null) {
+        for (let index = 0; index < type.listSize; index += 1) {
+          flattened.push(null);
+          childActive.push(false);
+        }
+        continue;
+      }
+      if (!Array.isArray(value) || value.length !== type.listSize) {
+        throw new Error(
+          `fixed-size list expected ${type.listSize} values`,
+        );
+      }
+      for (const item of value) {
+        flattened.push(item);
+        childActive.push(true);
+      }
+    }
+    const child = singleData(
+      buildField(type.valueField, flattened, childActive),
+    );
+    const { nullBitmap, nullCount } = validity(values);
+    return makeVector(
+      makeData({
+        type,
+        length: values.length,
+        nullCount,
+        nullBitmap,
+        child,
+      }),
+    );
+  }
+  if (DataType.isMap(type)) {
+    const entries: unknown[] = [];
+    const lengths: number[] = [];
+    for (const value of values) {
+      if (value == null) {
+        lengths.push(0);
+        continue;
+      }
+      if (!Array.isArray(value)) {
+        throw new Error('map value must be an ordered entry array');
+      }
+      lengths.push(value.length);
+      for (const entry of value) {
+        if (typeof entry !== 'object' || entry === null) {
+          throw new Error('map entry must be an object');
+        }
+        entries.push(entry);
+      }
+    }
+    const child = singleData(
+      buildVector(type.childType, entries),
+    );
+    const { nullBitmap, nullCount } = validity(values);
+    return makeVector(
+      makeData({
+        type,
+        length: values.length,
+        nullCount,
+        nullBitmap,
+        valueOffsets: listOffsets32(lengths),
+        child,
+      }),
+    );
+  }
+  throw new Error(`unsupported generated Arrow data type ${type.toString()}`);
+}
+
+function validateIntValues(type: Int, values: readonly unknown[]): void {
+  if (type.bitWidth === 64) {
+    const minimum = type.isSigned ? I64_MIN : 0n;
+    const maximum = type.isSigned ? I64_MAX : U64_MAX;
+    assertValues(
+      values,
+      (value) =>
+        typeof value === 'bigint' && value >= minimum && value <= maximum,
+      '64-bit integer',
+    );
+    return;
+  }
+  const minimum = type.isSigned ? -(2 ** (type.bitWidth - 1)) : 0;
+  const maximum = type.isSigned
+    ? 2 ** (type.bitWidth - 1) - 1
+    : 2 ** type.bitWidth - 1;
+  assertValues(
+    values,
+    (value) =>
+      typeof value === 'number' &&
+      Number.isSafeInteger(value) &&
+      value >= minimum &&
+      value <= maximum,
+    'integer',
+  );
+}
+
+function assertValues(
+  values: readonly unknown[],
+  predicate: (value: unknown) => boolean,
+  expected: string,
+): void {
+  values.forEach((value, index) => {
+    if (value != null && !predicate(value)) {
+      throw new Error(`${expected} value expected at index ${index}`);
+    }
+  });
+}
+
+function exactInt32(value: unknown, expected: string): number {
+  if (!isInt32(value)) {
+    throw new Error(`${expected} must fit signed 32-bit physical storage`);
+  }
+  return value;
+}
+
+function isInt32(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value >= -0x8000_0000 &&
+    value <= 0x7fff_ffff
+  );
+}
+
+function isInt64(value: unknown): value is bigint {
+  return typeof value === 'bigint' && value >= I64_MIN && value <= I64_MAX;
+}
+
+function exactBigInt64(
+  values: readonly unknown[],
+  expected: string,
+): BigInt64Array {
+  const output = new BigInt64Array(values.length);
+  values.forEach((value, index) => {
+    if (value == null) {
+      return;
+    }
+    if (typeof value !== 'bigint' || value < I64_MIN || value > I64_MAX) {
+      throw new Error(`${expected} must fit signed 64-bit physical storage`);
+    }
+    output[index] = value;
+  });
+  return output;
+}
+
+function decimal128Data(
+  type: Decimal,
+  values: readonly unknown[],
+): Uint32Array {
+  const output = new Uint32Array(values.length * 4);
+  const maximum = 10n ** BigInt(type.precision) - 1n;
+  values.forEach((value, index) => {
+    if (value == null) {
+      return;
+    }
+    if (
+      typeof value !== 'bigint' ||
+      value < -maximum ||
+      value > maximum ||
+      value < I128_MIN ||
+      value > I128_MAX
+    ) {
+      throw new Error(
+        `decimal value at index ${index} exceeds precision ${type.precision}`,
+      );
+    }
+    let encoded = value < 0n ? TWO_TO_128 + value : value;
+    for (let word = 0; word < 4; word += 1) {
+      output[index * 4 + word] = Number(encoded & 0xffff_ffffn);
+      encoded >>= 32n;
+    }
+  });
+  return output;
+}
+
+function validity(values: readonly unknown[]): {
+  readonly nullBitmap: Uint8Array | undefined;
+  readonly nullCount: number;
+} {
+  let nullCount = 0;
+  const bitmap = new Uint8Array(Math.ceil(values.length / 8));
+  values.forEach((value, index) => {
+    if (value == null) {
+      nullCount += 1;
+    } else {
+      bitmap[index >> 3] |= 1 << (index & 7);
+    }
+  });
+  return {
+    nullBitmap: nullCount === 0 ? undefined : bitmap,
+    nullCount,
+  };
+}
+
+function listOffsets32(lengths: readonly number[]): Int32Array {
+  const offsets = new Int32Array(lengths.length + 1);
+  let total = 0;
+  lengths.forEach((length, index) => {
+    total += length;
+    if (total > 0x7fff_ffff) {
+      throw new Error('list or map offsets exceed signed 32-bit storage');
+    }
+    offsets[index + 1] = total;
+  });
+  return offsets;
+}
+
+function listOffsets64(lengths: readonly number[]): BigInt64Array {
+  const offsets = new BigInt64Array(lengths.length + 1);
+  let total = 0n;
+  lengths.forEach((length, index) => {
+    total += BigInt(length);
+    offsets[index + 1] = total;
+  });
+  return offsets;
+}
+
+function singleData(vector: Vector<DataType>): Data<DataType> {
+  if (vector.data.length !== 1 || vector.data[0] === undefined) {
+    throw new Error('generated Arrow vector must contain one contiguous data chunk');
+  }
+  return vector.data[0];
+}
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const I64_MIN = -(1n << 63n);
+const I64_MAX = (1n << 63n) - 1n;
+const U64_MAX = (1n << 64n) - 1n;
+const I128_MIN = -(1n << 127n);
+const I128_MAX = (1n << 127n) - 1n;
+const TWO_TO_128 = 1n << 128n;

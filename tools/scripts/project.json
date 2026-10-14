@@ -44,11 +44,101 @@
         "forwardAllArgs": false
       }
     },
+    "markdown-lint": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install markdownlint-cli2",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "markdown-lint-fix": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install markdownlint-cli2 --fix",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
     "ci-prepare": {
       "executor": "nx:run-commands",
       "cache": false,
       "options": {
         "command": "npx --no-install tsx tools/scripts/src/ci.ts prepare",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "ci-plan": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/ci-plan.ts",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "ci-build-environment": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/ci.ts build-environment",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "ci-environment-key": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/ci.ts environment-key",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "ci-start-artifact": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/ci.ts start-artifact",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "ci-verify-host": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/ci.ts verify-host",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "ci-export-images": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/ci.ts export-images",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "ci-export-reader": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/ci.ts export-reader",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "ci-import-integration": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/ci.ts import-integration",
         "cwd": "{workspaceRoot}",
         "forwardAllArgs": false
       }
@@ -123,6 +213,15 @@
         "command": "npx --no-install tsx tools/scripts/src/registry.ts public",
         "cwd": "{workspaceRoot}",
         "forwardAllArgs": true
+      }
+    },
+    "image-publish-plan": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/image-plan.ts",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
       }
     }
   },

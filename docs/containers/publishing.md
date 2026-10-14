@@ -1,12 +1,38 @@
 # Container publishing
 
-The repository publishes the devcontainer and sample runtime image to GHCR
-through Nx targets. Run local publication from the source-built devcontainer
-so the pinned toolchain, Docker Buildx support, GitHub CLI state, and repository
-scripts match the development environment.
+The repository publishes the devcontainer, four production Rust runtime
+images, and the retained `hello-world` sample image to GHCR through Nx targets.
+Run local publication from the source-built devcontainer so the pinned
+toolchain, Docker Buildx support, GitHub CLI state, and repository scripts match
+the development environment.
 
 These are expected operations and tag policies. They do not assert that CI or
 the publication workflows are currently green.
+
+No image is published by a checkout, local build, image smoke, or documentation
+change. This uncommitted workspace has not pushed an image. In the repository
+release path, GHCR publication begins only when
+`.github/workflows/publish-images.yml` runs on GitHub and verifies the remote
+manifests.
+
+## Production image names and local smoke
+
+| Project | GHCR image | Local non-publishing smoke |
+| --- | --- | --- |
+| `otelcol-rust` | `ghcr.io/mdrakiburrahman/rust-playground/otelcol-rust` | `npx --no-install nx run otelcol-rust:image-smoke` |
+| `arrowcol-rust` | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-rust` | `npx --no-install nx run arrowcol-rust:image-smoke` |
+| `arrowcol-dataflow-rust` | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust` | `npx --no-install nx run arrowcol-dataflow-rust:image-smoke` |
+| `arrowcol-router-rust` | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-router-rust` | `npx --no-install nx run arrowcol-router-rust:image-smoke` |
+
+Each smoke target builds or reuses the local `linux/amd64` `:dev` image and
+validates its embedded configuration and bounded startup/shutdown contract. It
+does not log in to GHCR and does not push.
+
+Published runtime tags are:
+
+- `branch-<sanitized-branch>` for the selected branch;
+- immutable `sha-<full-git-sha>`; and
+- `latest` only when the workflow publishes `main`.
 
 ## Authenticate to GHCR
 
@@ -43,27 +69,33 @@ printed by the helper, or written to repository files.
 
 ## Publish from the source-built devcontainer
 
-From WSL, the exact local branch/SHA runtime publication flow is:
+From WSL, the exact local branch/SHA runtime publication flow for one image is:
 
 ```bash
 npx nx run devcontainer:up-source
 npx --no-install devcontainer exec \
   --workspace-folder . \
   --config .devcontainer/source/devcontainer.json \
-  bash -lc 'npx nx run tools-scripts:registry-login -- --owner mdrakiburrahman --environment local && npx nx run hello-world:publish'
+  bash -lc 'npx nx run tools-scripts:registry-login -- --owner mdrakiburrahman --environment local && npx nx run otelcol-rust:publish'
 ```
 
-`hello-world:publish` resolves the current branch and full Git object ID, then
-pushes:
+The production runtime projects are:
 
-- a mutable sanitized branch tag;
+- `otelcol-rust`
+- `arrowcol-rust`
+- `arrowcol-dataflow-rust`
+- `arrowcol-router-rust`
+
+`hello-world` remains published as the repository sample. Every `publish`
+target resolves the current branch and full Git object ID, then pushes:
+
+- a mutable `branch-<sanitized-branch>` tag;
 - an immutable `sha-<full-git-sha>` tag.
 
-The `main` configuration intentionally replaces that tag set with the
-immutable SHA and `latest`:
+The `main` configuration adds `latest` while retaining both branch and SHA:
 
 ```bash
-npx nx run hello-world:publish:main
+npx nx run otelcol-rust:publish:main
 ```
 
 Use that configuration only for a `main` commit. The runtime workflow selects
@@ -123,7 +155,7 @@ npx nx run tools-scripts:registry-tags -- \
 npx nx run tools-scripts:registry-manifest -- \
   --owner mdrakiburrahman \
   --repository rust-playground \
-  --image hello-world \
+  --image otelcol-rust \
   --tag "sha-$(git rev-parse HEAD)"
 ```
 
@@ -139,7 +171,7 @@ npx nx run tools-scripts:registry-manifest -- \
 npx nx run tools-scripts:registry-manifest -- \
   --owner mdrakiburrahman \
   --repository rust-playground \
-  --image hello-world \
+  --image otelcol-rust \
   --tag latest
 ```
 
@@ -162,7 +194,7 @@ npx nx run tools-scripts:registry-public -- \
 npx nx run tools-scripts:registry-public -- \
   --owner mdrakiburrahman \
   --repository rust-playground \
-  --image hello-world
+  --image otelcol-rust
 ```
 
 A public package returns a `public` result. A private package exits with code
@@ -185,14 +217,33 @@ checks the `main` and `latest` manifests.
 
 `.github/workflows/publish-images.yml` runs on:
 
-- a push to `main` that changes the workflow, `hello-world`, any shared crate,
-  Cargo workspace inputs, root Node/Nx inputs, the Docker executor, or registry
-  tooling;
+- a push to `main` that changes the workflow, any published runtime project,
+  shared crate, the pinned `otel-arrow` submodule, Cargo workspace inputs, root
+  Node/Nx inputs, the Docker executor, or registry tooling;
 - manual `workflow_dispatch`.
 
-It smoke-tests the image, publishes SHA and `latest` for `main` (or branch and
-SHA for a non-main manual context), and verifies the resulting manifests.
+The workflow discovers the five source-built publication targets from the Nx
+graph, then builds and smoke-tests each matrix entry before authentication. It
+publishes branch and immutable SHA tags, adds `latest` on `main`, verifies the
+deterministic local publication manifest, and verifies every remote tag.
 Package visibility remains the explicit GitHub UI step described above.
+
+The five-target matrix contains the four production images listed above plus
+the retained `hello-world` sample image. The devcontainer is published by its
+separate workflow.
+
+## Image metadata and attestations
+
+The four production runtime Dockerfiles set OCI title, description, source,
+license, and revision labels. Local `:dev` builds use `revision=local`;
+publication targets pass the full Git SHA.
+
+The current `rust-playground-build:docker-build` executor does not expose
+Buildx SBOM or provenance attestation options. The workflow therefore does not
+emit SBOM/provenance attestations and does not request `id-token` permission.
+Adding attestations later requires executor schema/argv coverage plus manifest
+tests because attestations can change the published manifest shape. This is an
+explicitly documented omission, not an implicit claim that attestations exist.
 
 ## No-secret rules
 

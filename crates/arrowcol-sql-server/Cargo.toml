@@ -1,0 +1,23 @@
+[package]
+name = "arrowcol-sql-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cancellation-safe bounded SQL Server connection pooling for Arrow collectors"
+readme = "README.md"
+
+[dependencies]
+deadpool = { version = "0.12", default-features = false, features = ["managed", "rt_tokio_1"] }
+thiserror.workspace = true
+tiberius = { version = "0.13", default-features = false, features = ["chrono", "rustls", "tds73"] }
+tokio = { version = "1", features = ["net", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

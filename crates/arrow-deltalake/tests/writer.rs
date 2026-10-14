@@ -30,6 +30,46 @@ async fn parquet_preserves_schema() -> Result<()> {
     Ok(())
 }
 
+/// Scenario: top-level and nested arrays share one values buffer across repeated writes.
+/// Guarantees: completed observations count logical slices safely, including nested validity,
+/// without counting allocator capacity or deduplicating repeated logical columns.
+#[tokio::test]
+async fn parquet_reports_checked_logical_input_bytes() -> Result<()> {
+    use arrow::array::{ArrayRef, StructArray};
+    use arrow::buffer::NullBuffer;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("accounted.parquet");
+    let allocated = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])) as ArrayRef;
+    let values = allocated.slice(1, 3);
+    let nested_fields: arrow::datatypes::Fields = vec![Field::new("value", DataType::Int32, false)].into();
+    let nested = StructArray::try_new(
+        nested_fields.clone(),
+        vec![Arc::clone(&values)],
+        Some(NullBuffer::from(vec![true, false, true])),
+    )?;
+    let input = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("direct", DataType::Int32, false),
+            Field::new("nested", DataType::Struct(nested_fields), true),
+        ])),
+        vec![values, Arc::new(nested)],
+    )?;
+    let mut writer = ParquetFileWriter::create(&path, input.schema())?;
+    writer.write(&input).await?;
+    assert_eq!(writer.rows_written(), 3);
+    assert_eq!(writer.input_bytes_written(), 25);
+    writer.write(&input).await?;
+    let completed = writer.finish().await?;
+    let observation = completed.observation();
+
+    // Per batch: direct i32 values (12) + nested values (12) + nested validity (1).
+    assert_eq!(observation.rows, 6);
+    assert_eq!(observation.input_bytes, 50);
+    assert_eq!(observation.parquet_bytes, completed.bytes);
+    assert!(observation.parquet_bytes > 0);
+    Ok(())
+}
+
 /// Scenario: a caller writes a standalone Parquet file using a bare relative filename.
 /// Guarantees: completion synchronizes the directory without requiring a writable checkout or changing other tests' working directory.
 #[tokio::test]
@@ -105,6 +145,37 @@ fn lossless_normalization() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("not nanos"))?;
     assert_eq!(nanos.value(0), -1);
     assert!(nanos.is_null(1));
+    Ok(())
+}
+
+/// Scenario: Delta normalization widens and adds physical columns after input accounting.
+/// Guarantees: completed-file input bytes describe the caller's Arrow batch, not normalized storage.
+#[cfg(feature = "delta")]
+#[tokio::test]
+async fn delta_reports_pre_normalization_input_bytes() -> Result<()> {
+    use arrow_deltalake::delta::DeltaTable;
+    let directory = tempfile::tempdir()?;
+    let input = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("count", DataType::UInt64, false),
+            Field::new(
+                "time",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                false,
+            ),
+        ])),
+        vec![
+            Arc::new(UInt64Array::from(vec![u64::MAX])),
+            Arc::new(TimestampNanosecondArray::from(vec![1])),
+        ],
+    )?;
+    let table = DeltaTable::open(directory.path())?;
+    let mut writer = table.new_file(input.schema())?;
+    writer.write(&input).await?;
+    let append = writer.finish().await?;
+    assert_eq!(append.file.rows, 1);
+    assert_eq!(append.file.input_bytes, 16);
+    assert_eq!(append.file.observation().parquet_bytes, append.file.bytes);
     Ok(())
 }
 
@@ -205,17 +276,16 @@ async fn rejects_corrupt_and_non_delta_tables() -> Result<()> {
     std::fs::write(directory.path().join("raw.parquet"), b"not delta")?;
     let mut writer = DeltaTableWriter::open(directory.path())?;
     assert!(writer.write(&batch()?).await.is_err());
+    assert_eq!(std::fs::read(directory.path().join("raw.parquet"))?, b"not delta");
+    assert!(!directory.path().join("_delta_log").exists());
     drop(writer);
-    std::fs::remove_file(directory.path().join("raw.parquet"))?;
-    std::fs::create_dir(directory.path().join("_delta_log"))?;
-    std::fs::write(
-        directory.path().join("_delta_log/00000000000000000000.json"),
-        b"bad json",
-    )?;
-    let mut writer = DeltaTableWriter::open(directory.path())?;
+    let corrupt = tempfile::tempdir()?;
+    std::fs::create_dir(corrupt.path().join("_delta_log"))?;
+    std::fs::write(corrupt.path().join("_delta_log/00000000000000000000.json"), b"bad json")?;
+    let mut writer = DeltaTableWriter::open(corrupt.path())?;
     assert!(writer.write(&batch()?).await.is_err());
     assert_eq!(
-        std::fs::read(directory.path().join("_delta_log/00000000000000000000.json"))?,
+        std::fs::read(corrupt.path().join("_delta_log/00000000000000000000.json"))?,
         b"bad json"
     );
     Ok(())

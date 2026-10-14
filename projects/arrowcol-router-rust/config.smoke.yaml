@@ -1,0 +1,59 @@
+server:
+  listen: 0.0.0.0:50050
+  threads: 1
+  listener_tasks_per_fd: 1
+  grace_period_seconds: 1
+  graceful_shutdown_timeout_seconds: 15
+  state_directory: /var/run/arrowcol-router
+  h2:
+    max_concurrent_streams: 32
+    stream_window_bytes: 1048576
+    connection_window_bytes: 16777216
+    idle_timeout_seconds: 30
+
+sql_server:
+  host: 127.0.0.1
+  port: 9
+  database: smoke
+  username: smoke
+  password_file: /var/run/arrowcol-router/sql-password
+  trust_server_certificate: true
+  connect_timeout_ms: 100
+  command_timeout_ms: 100
+
+routing:
+  refresh_interval_ms: 250
+  max_snapshot_age_ms: 15000
+  max_future_skew_ms: 2000
+  max_table_entries: 16
+  max_oldest_buffer_age_ms: 60000
+  hard_pressure_bps: 9500
+  warmup_ms: 0
+  minimum_warmup_bps: 1000
+  lease_ttl_ms: 30000
+  readiness_max_staleness_ms: 30000
+
+auth:
+  authenticator: allow_all
+  edge_secret_file: /var/run/arrowcol-router/edge-hmac
+  internal_signing_secret_file: /var/run/arrowcol-router/internal-hmac
+  edge_signature_max_age_ms: 30000
+  internal_identity_ttl_ms: 30000
+
+upstream:
+  tls: false
+  sni: ""
+  max_h2_streams: 32
+  stream_window_bytes: 1048576
+  connection_window_bytes: 16777216
+  connection_timeout_ms: 100
+  total_connection_timeout_ms: 300
+  idle_timeout_seconds: 30
+  ping_interval_seconds: 5
+
+receipts:
+  max_batch_size: 16
+
+telemetry:
+  log_filter: info
+  json_logs: true

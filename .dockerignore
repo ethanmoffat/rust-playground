@@ -1,5 +1,6 @@
 .git
 .github
+.devcontainer
 .nx
 dev
 docs
@@ -10,4 +11,9 @@ tools
 .temp
 onelake
 **/.git
+**/.diagnostics
+**/.state
+**/.temp
+**/coverage
+**/secrets
 **/target

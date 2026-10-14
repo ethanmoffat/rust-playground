@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+/projects/arrowcol-infra/secrets/
+/projects/arrowcol-router-rust/secrets/
 
 # Node / Nx
 node_modules/
@@ -25,6 +27,10 @@ dist/
 logs/
 *.log
 out/
+
+# Deterministic SDK generation artifacts
+/crates/arrowcol-sdk-gen/.temp/
+/tools/libs/arrowcol-sdk-gen/.temp/
 
 # Local telemetry lake (demo data and isolated E2E runs)
 /onelake/

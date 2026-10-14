@@ -23,6 +23,7 @@ import {
 } from '../scripts/initialize.ts';
 import {
   runPostCreate,
+  parsePostCreateArguments,
   type PostCreateDependencies,
 } from '../scripts/post-create.ts';
 import {
@@ -62,12 +63,17 @@ test('normal and source configurations share workspace, user, and lifecycle beha
     'updateRemoteUserUID',
     'initializeCommand',
     'postCreateCommand',
+    'postStartCommand',
     'waitFor',
     'customizations',
   ]) {
     assert.deepEqual(source[key], normal[key], `configuration mismatch: ${key}`);
   }
   assert.equal(normal.dockerComposeFile, 'docker-compose.yml');
+  assert.equal(normal.waitFor, 'postStartCommand');
+  assert.deepEqual(normal.postStartCommand, [
+    'node', '.devcontainer/scripts/post-create.ts', '--permissions-only',
+  ]);
   assert.deepEqual(source.dockerComposeFile, [
     '../docker-compose.yml',
     '../docker-compose.local.yml',
@@ -282,7 +288,7 @@ test('Nx project exposes the complete devcontainer lifecycle', () => {
   }
 });
 
-test('initialize creates host credential directories and Compose environment state', () => {
+test('initialize creates host credential directories and writable mountpoints before Docker starts', () => {
   const directories: string[] = [];
   const files = new Map<string, string>();
   const dependencies: InitializeDependencies = {
@@ -302,6 +308,9 @@ test('initialize creates host credential directories and Compose environment sta
   assert.deepEqual(directories, [
     join('C:\\Users\\developer', '.azure'),
     join('C:\\Users\\developer', '.config', 'gh'),
+    join('C:\\repo', 'node_modules'),
+    join('C:\\repo', '.nx'),
+    join('C:\\repo', 'target'),
   ]);
   assert.equal(
     files.get(join('C:\\repo', '.devcontainer', '.env')),
@@ -395,33 +404,36 @@ test('post-create validates tools, installs pinned cargo-make, then runs npm ci'
       events.push(`execute:${command}:${args.join(' ')}:${cwd}`);
     },
     nodeVersion: 'v24.17.0',
+    inContainer: true,
     stdout() {},
   };
 
   runPostCreate({ dryRun: false }, dependencies, '/repo');
 
   assert.deepEqual(events, [
+    'capture:id:-u:/repo',
+    'capture:id:-g:/repo',
+    'execute:sudo:-n install -d -m 0755 -o 1000 -g 1000 /repo/node_modules /repo/.nx /repo/target /repo/.temp /repo/onelake /repo/projects/loadtest/.temp:/repo',
+    'execute:sudo:-n chown -R --no-dereference 1000:1000 /repo/node_modules /repo/.nx /repo/target /repo/.temp /repo/onelake /repo/projects/loadtest/.temp:/repo',
+    'execute:sudo:-n chmod -R u+rwX /repo/node_modules /repo/.nx /repo/target /repo/.temp /repo/onelake /repo/projects/loadtest/.temp:/repo',
     'capture:rustc:--version:/repo',
     'capture:rustfmt:--version:/repo',
     'capture:cargo:clippy --version:/repo',
     'exists:cargo-make',
     'execute:cargo:install cargo-make --version 0.37.24 --locked:/repo',
-    'capture:id:-u:/repo',
-    'capture:id:-g:/repo',
-    `execute:sudo:chown -R 1000:1000 ${join('/repo', 'node_modules')} ${join('/repo', '.nx')} ${join('/repo', 'target')}:/repo`,
     'execute:git:config --global --add safe.directory /repo:/repo',
     'execute:npm:ci:/repo',
   ]);
 });
 
-test('post-create replaces an unpinned cargo-make and fails wrong Rust early', () => {
+test('post-create replaces an unpinned cargo-make and rejects wrong Rust', () => {
   const executions: string[] = [];
   const dependencies: PostCreateDependencies = {
-    capture(command) {
+    capture(command, args) {
       if (command === 'rustc') {
         return 'rustc 1.96.1 (stable)\n';
       }
-      if (command === 'cargo-make') {
+      if (command === 'cargo' && args[0] === 'make') {
         return 'cargo-make 0.37.23\n';
       }
       if (command === 'id') {
@@ -436,12 +448,15 @@ test('post-create replaces an unpinned cargo-make and fails wrong Rust early', (
       executions.push(`${command} ${args.join(' ')}`);
     },
     nodeVersion: 'v24.0.0',
+    inContainer: true,
     stdout() {},
   };
   runPostCreate({ dryRun: false }, dependencies, '/repo');
   assert.deepEqual(executions, [
+    'sudo -n install -d -m 0755 -o 1000 -g 1000 /repo/node_modules /repo/.nx /repo/target /repo/.temp /repo/onelake /repo/projects/loadtest/.temp',
+    'sudo -n chown -R --no-dereference 1000:1000 /repo/node_modules /repo/.nx /repo/target /repo/.temp /repo/onelake /repo/projects/loadtest/.temp',
+    'sudo -n chmod -R u+rwX /repo/node_modules /repo/.nx /repo/target /repo/.temp /repo/onelake /repo/projects/loadtest/.temp',
     'cargo install cargo-make --version 0.37.24 --locked --force',
-    `sudo chown -R 1000:1000 ${join('/repo', 'node_modules')} ${join('/repo', '.nx')} ${join('/repo', 'target')}`,
     'git config --global --add safe.directory /repo',
     'npm ci',
   ]);
@@ -453,6 +468,7 @@ test('post-create replaces an unpinned cargo-make and fails wrong Rust early', (
         {
           ...dependencies,
           capture(command) {
+            if (command === 'id') return '1000\n';
             return command === 'rustc' ? 'rustc 1.95.0 (stable)\n' : 'ok\n';
           },
         },
@@ -460,6 +476,30 @@ test('post-create replaces an unpinned cargo-make and fails wrong Rust early', (
       ),
     /Expected Rust 1\.96\.1/u,
   );
+});
+
+test('post-create reuses a preinstalled pinned cargo plugin using cargo make, not the plugin binary directly', () => {
+  const captures: string[] = [];
+  const executions: string[] = [];
+  runPostCreate({ dryRun: false }, {
+    capture(command, args) {
+      const invocation = `${command} ${args.join(' ')}`;
+      captures.push(invocation);
+      if (invocation === 'rustc --version') return 'rustc 1.96.1 (stable)\n';
+      if (invocation === 'cargo make --version') return 'cargo-make 0.37.24\n';
+      if (invocation === 'rustfmt --version' || invocation === 'cargo clippy --version') return 'ok\n';
+      if (invocation === 'id -u' || invocation === 'id -g') return '1000\n';
+      throw new Error(`Unexpected tool probe: ${invocation}`);
+    },
+    commandExists() { return true; },
+    execute(command, args) { executions.push(`${command} ${args.join(' ')}`); },
+    nodeVersion: 'v24.0.0',
+    inContainer: true,
+    stdout() {},
+  }, '/repo');
+  assert.ok(captures.includes('cargo make --version'));
+  assert.ok(!executions.some((command) => command.startsWith('cargo install')));
+  assert.ok(executions.includes('npm ci'));
 });
 
 test('post-create dry-run is dependency-free and side-effect free', () => {
@@ -477,6 +517,7 @@ test('post-create dry-run is dependency-free and side-effect free', () => {
         assert.fail('dry-run must not execute commands');
       },
       nodeVersion: 'v24.0.0',
+      inContainer: false,
       stdout(message) {
         output.push(message);
       },
@@ -485,6 +526,46 @@ test('post-create dry-run is dependency-free and side-effect free', () => {
   );
   assert.match(output.join(''), /cargo-make 0\.37\.24/u);
   assert.match(output.join(''), /npm ci/u);
+});
+
+test('post-start repairs permissions without requiring Rust or reinstalling dependencies', () => {
+  const executions: string[] = [];
+  const dependencies: PostCreateDependencies = {
+    capture(command, args) {
+      assert.equal(command, 'id');
+      return args[0] === '-u' ? '1001\n' : '1002\n';
+    },
+    commandExists() { assert.fail('permission repair must not inspect tools'); },
+    execute(command, args) { executions.push(`${command} ${args.join(' ')}`); },
+    inContainer: true,
+    nodeVersion: 'v24.0.0',
+    stdout() {},
+  };
+  const options = parsePostCreateArguments(['--permissions-only']);
+  runPostCreate(options, dependencies, '/repo');
+  assert.equal(executions.length, 3);
+  assert.match(executions[0] ?? '', /^sudo -n install .* -o 1001 -g 1002 /u);
+  assert.match(executions[1] ?? '', /^sudo -n chown -R --no-dereference 1001:1002 /u);
+  assert.match(executions[2] ?? '', /^sudo -n chmod -R u\+rwX /u);
+  assert.throws(
+    () => runPostCreate(options, { ...dependencies, inContainer: false }, '/repo'),
+    /inside the devcontainer, not on the WSL host/u,
+  );
+  assert.throws(
+    () => runPostCreate(options, { ...dependencies, capture() { return '0\n'; } }, '/repo'),
+    /loadtest does not support root/u,
+  );
+  assert.throws(
+    () => runPostCreate(options, { ...dependencies, capture() { return 'invalid\n'; } }, '/repo'),
+    /Unable to determine/u,
+  );
+  assert.throws(
+    () => runPostCreate(options, {
+      ...dependencies,
+      execute() { throw new Error('sudo permission repair failed'); },
+    }, '/repo'),
+    /sudo permission repair failed/u,
+  );
 });
 
 test('down discovers unique workspace Compose projects and removes only those projects', () => {

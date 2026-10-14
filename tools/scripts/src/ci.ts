@@ -7,19 +7,26 @@ import { Command } from 'commander';
 
 import {
   cleanupDevcontainer,
+  buildCiEnvironment,
   createCiLabel,
+  exportImages,
+  exportReader,
+  importIntegrationArtifacts,
+  identifyCiEnvironment,
   type DevcontainerKind,
   prepareCiEnvironment,
   startDevcontainer,
   systemFileSystem,
   type CiFileSystem,
   verifyDevcontainer,
+  verifyHost,
 } from './ci-lib.js';
 import {
   CommandError,
   type CommandRunner,
   SpawnCommandRunner,
 } from './process.js';
+import { requireImageReference } from './ci-plan.js';
 
 const repositoryRoot = fileURLToPath(new URL('../../..', import.meta.url));
 
@@ -51,10 +58,48 @@ export function createCiProgram(dependencies: CiCliDependencies): Command {
 
   addStartCommand(program, 'source', dependencies);
   addStartCommand(program, 'published', dependencies);
+  addStartCommand(program, 'artifact', dependencies);
+
+  program
+    .command('environment-key')
+    .description('Fingerprint the exact source inputs for immutable CI environment reuse.')
+    .action(() => {
+      const definition = identifyCiEnvironment(workflowWorkspace(dependencies), dependencies.fileSystem);
+      dependencies.fileSystem.appendFile(
+        requiredEnvironment('GITHUB_OUTPUT', dependencies.env),
+        `key=${definition.key}\n`,
+      );
+    });
+
+  program
+    .command('build-environment')
+    .description('Build the locked source environment once and export it for CI shards.')
+    .action(() => {
+      buildCiEnvironment({
+        githubOutput: requiredEnvironment('GITHUB_OUTPUT', dependencies.env),
+        workspace: workflowWorkspace(dependencies),
+      }, dependencies.runner, dependencies.fileSystem);
+    });
+
+  program
+    .command('verify-host')
+    .description('Verify one dependency-closed Nx shard on the host.')
+    .action(() => {
+      const task = selectedTasks(dependencies.env);
+      if (task === undefined) {
+        throw new Error('CI_TASK or CI_TASKS must be set.');
+      }
+      verifyHost({
+        task,
+        workspace: workflowWorkspace(dependencies),
+        dockerCache: integrationEnabled(dependencies.env.CI_DOCKER_CACHE, 'CI_DOCKER_CACHE'),
+        integration: integrationEnabled(dependencies.env.CI_INTEGRATION),
+      }, dependencies.runner);
+    });
 
   program
     .command('verify')
-    .description('Run every Nx verification target in the exact CI container.')
+    .description('Run one Nx shard, or every verification target, in the exact CI container.')
     .action(() => {
       verifyDevcontainer(
         {
@@ -62,9 +107,43 @@ export function createCiProgram(dependencies: CiCliDependencies): Command {
             'CONTAINER_ID',
             dependencies.env,
           ),
+          task: selectedTasks(dependencies.env),
+          integration: integrationEnabled(dependencies.env.CI_INTEGRATION),
         },
         dependencies.runner,
       );
+    });
+
+  program
+    .command('export-images')
+    .description('Export source-built runtime images and their exact identities.')
+    .action(() => {
+      exportImages({
+        images: imageReferences(dependencies.env.CI_IMAGE_REFS),
+        key: requiredEnvironment('CI_ARTIFACT_KEY', dependencies.env),
+        workspace: workflowWorkspace(dependencies),
+      }, dependencies.runner, dependencies.fileSystem);
+    });
+
+  program
+    .command('export-reader')
+    .description('Export independently built integration binaries, retaining executable permissions.')
+    .action(() => {
+      exportReader({
+        containerId: requiredEnvironment('CONTAINER_ID', dependencies.env),
+        workspace: workflowWorkspace(dependencies),
+      }, dependencies.runner, dependencies.fileSystem);
+    });
+
+  program
+    .command('import-integration')
+    .description('Load and validate the exact images and binaries required by E2E.')
+    .action(() => {
+      importIntegrationArtifacts({
+        images: imageReferences(dependencies.env.CI_IMAGE_REFS),
+        workspace: workflowWorkspace(dependencies),
+        host: integrationEnabled(dependencies.env.CI_INTEGRATION_HOST, 'CI_INTEGRATION_HOST'),
+      }, dependencies.runner, dependencies.fileSystem);
     });
 
   program
@@ -109,7 +188,9 @@ function addStartCommand(
     .description(
       kind === 'source'
         ? 'Build and start the source devcontainer Compose override.'
-        : 'Start the immutable published devcontainer image.',
+        : kind === 'artifact'
+          ? 'Start the source-built CI artifact without rebuilding or pulling an image.'
+          : 'Start the immutable published devcontainer image.',
     )
     .action(() => {
       startDevcontainer(
@@ -125,6 +206,7 @@ function addStartCommand(
           ),
           runId: requiredEnvironment('GITHUB_RUN_ID', dependencies.env),
           workspace: workflowWorkspace(dependencies),
+          image: dependencies.env.CI_ARTIFACT_IMAGE,
         },
         dependencies.runner,
         dependencies.fileSystem,
@@ -154,7 +236,35 @@ function cleanupLabels(
   return [
     createCiLabel(runId, runAttempt, 'source'),
     createCiLabel(runId, runAttempt, 'published'),
+    createCiLabel(runId, runAttempt, 'artifact'),
   ];
+}
+
+function imageReferences(value: string | undefined): readonly string[] {
+  if (value === undefined) throw new Error('CI_IMAGE_REFS must be set.');
+  const parsed: unknown = JSON.parse(value);
+  if (!Array.isArray(parsed) || parsed.length === 0 ||
+      !parsed.every((image: unknown): image is string => typeof image === 'string')) {
+    throw new Error('CI_IMAGE_REFS must be a nonempty JSON array of image references.');
+  }
+  return parsed.map(requireImageReference);
+}
+
+function selectedTasks(env: Readonly<NodeJS.ProcessEnv>): string | readonly string[] | undefined {
+  const batch = normalizeOptional(env.CI_TASKS);
+  if (batch === undefined) return normalizeOptional(env.CI_TASK);
+  const parsed: unknown = JSON.parse(batch);
+  if (!Array.isArray(parsed) || parsed.length === 0 ||
+      !parsed.every((task: unknown): task is string => typeof task === 'string')) {
+    throw new Error('CI_TASKS must be a nonempty JSON array of Nx task IDs.');
+  }
+  return parsed;
+}
+
+function integrationEnabled(value: string | undefined, name = 'CI_INTEGRATION'): boolean {
+  if (value === undefined || value === 'false') return false;
+  if (value === 'true') return true;
+  throw new Error(`${name} must be true or false.`);
 }
 
 function workflowWorkspace(dependencies: CiCliDependencies): string {

@@ -1,0 +1,34 @@
+version: otel_dataflow/v1
+engine: {}
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: 1
+groups:
+  arrowcol:
+    pipelines:
+      ingest:
+        nodes:
+          flight:
+            type: receiver:arrow_flight
+            config:
+              listening_addr: "127.0.0.1:32110"
+              admin_listening_addr: "127.0.0.1:32111"
+              native_quiver: true
+              catalog:
+                type: memory
+              routing:
+                type: memory
+              registration:
+                instance_key: quiver-rejection
+                flight_endpoint: "127.0.0.1:32110"
+          delta:
+            type: exporter:arrow_deltalake
+            config:
+              base_path: /onelake
+              routing:
+                type: memory
+        connections:
+          - from: flight
+            to: delta

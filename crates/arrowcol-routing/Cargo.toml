@@ -1,0 +1,31 @@
+[package]
+name = "arrowcol-routing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQL-coordinated cached routing and pressure-aware table leases for Arrowcol"
+readme = "README.md"
+
+[dependencies]
+arrowcol-protocol = { path = "../arrowcol-protocol" }
+arrowcol-sql-server = { path = "../arrowcol-sql-server" }
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror.workspace = true
+tracing.workspace = true
+tiberius = { version = "0.13", default-features = false, features = ["chrono", "rustls", "tds73"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+anyhow.workspace = true
+
+[lints]
+workspace = true

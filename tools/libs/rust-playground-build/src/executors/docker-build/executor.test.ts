@@ -113,7 +113,15 @@ function baseOptions(
 }
 
 interface RuntimeProjectConfiguration {
+  readonly tags?: readonly string[];
   readonly targets: {
+    readonly image: {
+      readonly options: DockerBuildExecutorSchema;
+      readonly configurations: Record<string, Partial<DockerBuildExecutorSchema>>;
+    };
+    readonly 'image-smoke'?: {
+      readonly dependsOn?: readonly string[];
+    };
     readonly build: { readonly cache?: boolean };
     readonly publish: {
       readonly configurations?: {
@@ -124,11 +132,17 @@ interface RuntimeProjectConfiguration {
   };
 }
 
-function readRuntimeProject(): RuntimeProjectConfiguration {
+function readRuntimeProject(
+  project = 'hello-world',
+): RuntimeProjectConfiguration {
+  const projectPath =
+    project === 'hello-world'
+      ? 'bin/hello-world'
+      : `projects/${project}`;
   return JSON.parse(
     readFileSync(
       new URL(
-        '../../../../../../bin/hello-world/project.json',
+        `../../../../../../${projectPath}/project.json`,
         import.meta.url,
       ),
       'utf8',
@@ -205,6 +219,52 @@ test('builds a load command as an argument array and writes a scan manifest', as
   assert.equal(harness.information.length, 1);
   assert.match(harness.information[0] ?? '', /PROJECT=<redacted>/u);
   assert.doesNotMatch(harness.information[0] ?? '', /PROJECT=hello-world/u);
+});
+
+test('imports and exports external BuildKit caches with token expansion and literal argv', async () => {
+  const context = createContext();
+  const harness = createHarness();
+  const result = await runDockerBuildExecutorWithDependencies(baseOptions({
+    cacheFrom: ['type=gha,version=2,scope={projectName}'],
+    cacheTo: ['type=local,dest={absWorkspaceRoot}/cache,mode=max', 'LITERAL=$(not-a-shell)'],
+  }), context, harness.dependencies);
+  assert.deepEqual(result, { success: true });
+  const args = harness.invocations[0]?.args ?? [];
+  const start = args.indexOf('--cache-from');
+  assert.deepEqual(args.slice(start, start + 6), [
+    '--cache-from', 'type=gha,version=2,scope=hello-world',
+    '--cache-to', `type=local,dest=${path.resolve(context.root)}/cache,mode=max`,
+    '--cache-to', 'LITERAL=$(not-a-shell)',
+  ]);
+});
+
+test('actual CI image configuration retains dev tags and complete BuildKit cache specifications', async () => {
+  const image = readRuntimeProject().targets.image;
+  const configuration = image.configurations['ci-verify'];
+  assert.ok(configuration);
+  assert.equal(configuration.tags, undefined);
+  const harness = createHarness();
+  const result = await runDockerBuildExecutorWithDependencies(
+    { ...image.options, ...configuration }, createContext(), harness.dependencies,
+  );
+  assert.deepEqual(result, { success: true });
+  const args = harness.invocations[0]?.args ?? [];
+  assert.ok(args.includes('ghcr.io/mdrakiburrahman/rust-playground/hello-world:dev'));
+  assert.equal(args.filter((argument) => argument === '--cache-from').length, 1);
+  assert.equal(args.filter((argument) => argument === '--cache-to').length, 1);
+  assert.ok(args.includes('type=gha,version=2,scope=hello-world-image'));
+  assert.ok(args.includes('type=gha,version=2,scope=hello-world-image,mode=max'));
+  assert.ok(!args.includes('version=2'));
+});
+
+test('invalid external cache values are rejected before any Docker command', async () => {
+  const harness = createHarness();
+  const result = await runDockerBuildExecutorWithDependencies(
+    baseOptions({ cacheFrom: [' '] }), createContext(), harness.dependencies,
+  );
+  assert.deepEqual(result, { success: false });
+  assert.equal(harness.invocations.length, 0);
+  assert.ok(harness.errors.some((message) => /cache-from/u.test(message)));
 });
 
 test('pushes multiple platforms and expands sanitized CI Git tokens', async () => {
@@ -922,6 +982,8 @@ test('publishes a complete strict executor schema', () => {
   assert.deepEqual(schema.required, ['file', 'image', 'tags', 'output']);
   assert.deepEqual(Object.keys(schema.properties ?? {}).sort(), [
     'buildArgs',
+    'cacheFrom',
+    'cacheTo',
     'context',
     'file',
     'image',
@@ -964,10 +1026,77 @@ test('configures runtime publication namespaces, immutability, and uncached Carg
   );
   assert.deepEqual(
     helloWorldProject.targets.publish.configurations?.main?.tags,
-    ['sha-{gitSha}', 'latest'],
+    ['{gitBranchTag}', 'sha-{gitSha}', 'latest'],
   );
   assert.equal(helloWorldProject.targets.build.cache, false);
   assert.equal(greetingProject.targets.build.cache, false);
+});
+
+test('all production runtime projects expose cached image, smoke, and guarded publish targets', () => {
+  for (const project of [
+    'otelcol-rust',
+    'arrowcol-rust',
+    'arrowcol-dataflow-rust',
+    'arrowcol-router-rust',
+  ]) {
+    const configuration = readRuntimeProject(project);
+    assert.ok(
+      configuration.tags?.includes('type:runtime-image'),
+      project,
+    );
+    assert.deepEqual(
+      configuration.targets.image.options.platforms,
+      ['linux/amd64'],
+      project,
+    );
+    assert.equal(
+      configuration.targets.image.options.output,
+      'load',
+      project,
+    );
+    assert.ok(
+      configuration.targets.image.options.manifestFile?.endsWith(
+        `${project}-load.txt`,
+      ),
+      project,
+    );
+    assert.ok(
+      configuration.targets.image.configurations['ci-verify']
+        ?.cacheFrom?.length,
+      project,
+    );
+    assert.deepEqual(
+      configuration.targets['image-smoke']?.dependsOn,
+      ['image'],
+      project,
+    );
+    assert.equal(
+      configuration.targets.publish.options.output,
+      'push',
+      project,
+    );
+    assert.equal(
+      configuration.targets.publish.options.requireCleanWorktree,
+      true,
+      project,
+    );
+    assert.deepEqual(
+      configuration.targets.publish.options.immutableTags,
+      ['sha-{gitSha}'],
+      project,
+    );
+    assert.ok(
+      configuration.targets.publish.options.manifestFile?.endsWith(
+        `${project}-publish.txt`,
+      ),
+      project,
+    );
+    assert.deepEqual(
+      configuration.targets.publish.configurations?.main?.tags,
+      ['{gitBranchTag}', 'sha-{gitSha}', 'latest'],
+      project,
+    );
+  }
 });
 
 test('actual runtime publish target bounds very long branch tags without collisions', async () => {

@@ -1,9 +1,11 @@
 //! Bounded, process-shared, per-table Delta publication.
 
-use crate::delta::{AppendResult, DeltaFileWriter, DeltaTable, StagedAppend};
+use crate::delta::{AppendResult, DeltaFileWriter, DeltaTable, PublicationFence, PublicationFenceError, StagedAppend};
 use anyhow::{Context, Result, bail};
 use arrow::datatypes::SchemaRef;
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -59,6 +61,7 @@ static TABLES: LazyLock<Mutex<HashMap<PathBuf, RegistryEntry>>> = LazyLock::new(
 /// One bounded commit worker, shared by all writers of a canonical local table.
 pub struct BatchedTable {
     options: CommitOptions,
+    publication_fence: Option<Arc<dyn PublicationFence>>,
     sender: mpsc::Sender<Request>,
     slots: Arc<Semaphore>,
     flush: watch::Sender<u64>,
@@ -67,19 +70,68 @@ pub struct BatchedTable {
 
 struct Publication {
     append: StagedAppend,
-    reply: oneshot::Sender<std::result::Result<AppendResult, String>>,
+    reply: oneshot::Sender<std::result::Result<AppendResult, CommitReceiptError>>,
     _slot: OwnedSemaphorePermit,
     force: bool,
 }
 
 enum Request {
-    Ready(oneshot::Sender<std::result::Result<(), String>>),
-    NewFile(SchemaRef, oneshot::Sender<std::result::Result<DeltaFileWriter, String>>),
+    Ready(oneshot::Sender<std::result::Result<(), CommitReceiptError>>),
+    NewFile(
+        SchemaRef,
+        oneshot::Sender<std::result::Result<DeltaFileWriter, CommitReceiptError>>,
+    ),
     Publish(Box<Publication>),
 }
 
 /// A submitted file's eventual durable Delta version.
-pub struct CommitReceipt(oneshot::Receiver<std::result::Result<AppendResult, String>>);
+pub struct CommitReceipt(oneshot::Receiver<std::result::Result<AppendResult, CommitReceiptError>>);
+
+/// Structured failure delivered to every waiter in a failed publication batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CommitReceiptError {
+    /// The caller-provided ownership check rejected the commit.
+    PublicationFenced(PublicationFenceError),
+    /// Delta preparation or commit failed.
+    CommitFailed { message: String },
+    /// The worker disappeared without delivering the batch result.
+    WorkerStopped,
+}
+
+impl CommitReceiptError {
+    fn commit_failed(message: impl Into<String>) -> Self {
+        Self::CommitFailed {
+            message: message.into(),
+        }
+    }
+
+    fn from_anyhow(error: anyhow::Error) -> Self {
+        error.downcast_ref::<PublicationFenceError>().map_or_else(
+            || Self::commit_failed(format!("{error:#}")),
+            |fence| Self::PublicationFenced(fence.clone()),
+        )
+    }
+}
+
+impl Display for CommitReceiptError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PublicationFenced(error) => Display::fmt(error, formatter),
+            Self::CommitFailed { message } => write!(formatter, "Delta commit failed: {message}"),
+            Self::WorkerStopped => formatter.write_str("Delta commit worker stopped before completion"),
+        }
+    }
+}
+
+impl Error for CommitReceiptError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::PublicationFenced(error) => Some(error),
+            Self::CommitFailed { .. } | Self::WorkerStopped => None,
+        }
+    }
+}
 
 impl CommitReceipt {
     /// Wait for publication, not merely queue admission.
@@ -87,10 +139,15 @@ impl CommitReceipt {
     /// # Errors
     /// Returns worker failure, conflict, or uncertain commit errors.
     pub async fn wait(self) -> Result<AppendResult> {
-        self.0
-            .await
-            .context("Delta commit worker stopped before completion")?
-            .map_err(anyhow::Error::msg)
+        self.wait_typed().await.map_err(anyhow::Error::new)
+    }
+
+    /// Wait for publication while preserving structured fence failures.
+    ///
+    /// # Errors
+    /// Returns a typed fence, commit, or worker-stopped error.
+    pub async fn wait_typed(self) -> std::result::Result<AppendResult, CommitReceiptError> {
+        self.0.await.unwrap_or(Err(CommitReceiptError::WorkerStopped))
     }
 }
 
@@ -100,6 +157,28 @@ impl BatchedTable {
     /// # Errors
     /// Rejects conflicting options, another process's writer, or filesystem/worker errors.
     pub async fn open(root: impl AsRef<Path>, options: CommitOptions) -> Result<Arc<Self>> {
+        Self::open_inner(root, options, None).await
+    }
+
+    /// Share local table ownership with a check at every data commit boundary.
+    ///
+    /// Reopening an in-process owner requires the same `Arc` fence instance.
+    ///
+    /// # Errors
+    /// Rejects conflicting options/fences, another writer, or filesystem/worker errors.
+    pub async fn open_with_fence(
+        root: impl AsRef<Path>,
+        options: CommitOptions,
+        publication_fence: Arc<dyn PublicationFence>,
+    ) -> Result<Arc<Self>> {
+        Self::open_inner(root, options, Some(publication_fence)).await
+    }
+
+    async fn open_inner(
+        root: impl AsRef<Path>,
+        options: CommitOptions,
+        publication_fence: Option<Arc<dyn PublicationFence>>,
+    ) -> Result<Arc<Self>> {
         options.validate()?;
         tokio::fs::create_dir_all(root.as_ref()).await?;
         let root = tokio::fs::canonicalize(root).await?;
@@ -108,8 +187,13 @@ impl BatchedTable {
                 let mut registry = TABLES.lock().map_err(|_| anyhow::anyhow!("Delta registry poisoned"))?;
                 if let Some(entry) = registry.get(&root) {
                     if let Some(owner) = entry.owner.upgrade() {
-                        if owner.options != options {
-                            bail!("conflicting Delta commit options for {}", root.display());
+                        if owner.options != options
+                            || !same_publication_fence(&owner.publication_fence, &publication_fence)
+                        {
+                            bail!(
+                                "conflicting Delta commit options or publication fence for {}",
+                                root.display()
+                            );
                         }
                         (Some(owner), entry.stopped.clone())
                     } else {
@@ -122,15 +206,17 @@ impl BatchedTable {
                     let owner = Arc::new(Self {
                         slots: Arc::new(Semaphore::new(options.max_pending_files)),
                         options: options.clone(),
+                        publication_fence: publication_fence.clone(),
                         sender,
                         flush,
                         draining: Arc::new(AtomicBool::new(false)),
                     });
                     let worker_root = root.clone();
                     let worker_options = options.clone();
+                    let worker_fence = publication_fence.clone();
                     let draining = Arc::clone(&owner.draining);
                     std::thread::Builder::new().name("delta-commit".into()).spawn(move || {
-                        run_worker(&worker_root, worker_options, receiver, flush_rx, draining);
+                        run_worker(&worker_root, worker_options, receiver, flush_rx, draining, worker_fence);
                         // Release the filesystem owner before permitting a replacement.
                         if let Ok(mut registry) = TABLES.lock()
                             && registry
@@ -173,7 +259,7 @@ impl BatchedTable {
         receive
             .await
             .context("Delta worker stopped during initialization")?
-            .map_err(anyhow::Error::msg)
+            .map_err(anyhow::Error::new)
     }
 
     /// Obtain a file without doing synchronous Kernel work on a collector core.
@@ -189,7 +275,7 @@ impl BatchedTable {
         receive
             .await
             .context("Delta worker stopped during file creation")?
-            .map_err(anyhow::Error::msg)
+            .map_err(anyhow::Error::new)
     }
 
     /// Admit one eligible durable file, waiting asynchronously when capacity is full.
@@ -224,16 +310,31 @@ impl BatchedTable {
     }
 }
 
+fn same_publication_fence(left: &Option<Arc<dyn PublicationFence>>, right: &Option<Arc<dyn PublicationFence>>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
 fn run_worker(
     root: &Path,
     options: CommitOptions,
     mut receiver: mpsc::Receiver<Request>,
     mut flush: watch::Receiver<u64>,
     draining: Arc<AtomicBool>,
+    publication_fence: Option<Arc<dyn PublicationFence>>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
-    let table = DeltaTable::open(root);
-    let mut failure = table.as_ref().err().map(|error| format!("{error:#}"));
+    let table = publication_fence.map_or_else(
+        || DeltaTable::open(root),
+        |publication_fence| DeltaTable::open_with_fence(root, publication_fence),
+    );
+    let mut failure = table
+        .as_ref()
+        .err()
+        .map(|error| CommitReceiptError::commit_failed(format!("{error:#}")));
     match runtime {
         Ok(runtime) => runtime.block_on(async {
             let mut batch = Vec::new();
@@ -296,10 +397,10 @@ fn run_worker(
                     }
                     Some(Request::NewFile(schema, reply)) => {
                         let result = match (&table, &failure) {
-                            (Ok(table), None) => table.new_file(schema).map_err(|error| format!("{error:#}")),
-                            _ => Err(failure
-                                .clone()
-                                .unwrap_or_else(|| "Delta table initialization failed".into())),
+                            (Ok(table), None) => table.new_file(schema).map_err(CommitReceiptError::from_anyhow),
+                            _ => Err(failure.clone().unwrap_or_else(|| {
+                                CommitReceiptError::commit_failed("Delta table initialization failed")
+                            })),
                         };
                         if let Err(error) = &result {
                             failure = Some(error.clone());
@@ -331,7 +432,7 @@ fn run_worker(
             }
         }),
         Err(error) => {
-            let message = format!("Delta worker runtime failed: {error}");
+            let message = CommitReceiptError::commit_failed(format!("Delta worker runtime failed: {error}"));
             while let Some(request) = receiver.blocking_recv() {
                 match request {
                     Request::Ready(reply) => {
@@ -349,15 +450,21 @@ fn run_worker(
     }
 }
 
-fn publish_batch(table: &Result<Arc<DeltaTable>>, batch: &mut Vec<Publication>, failure: &mut Option<String>) {
+fn publish_batch(
+    table: &Result<Arc<DeltaTable>>,
+    batch: &mut Vec<Publication>,
+    failure: &mut Option<CommitReceiptError>,
+) {
     if batch.is_empty() {
         return;
     }
     let publications = std::mem::take(batch);
     let (appends, replies): (Vec<_>, Vec<_>) = publications.into_iter().map(|p| (p.append, (p.reply, p._slot))).unzip();
     let result = match (table, failure.as_ref()) {
-        (Ok(table), None) => table.commit_files(&appends).map_err(|error| format!("{error:#}")),
-        _ => Err(failure.clone().unwrap_or_else(|| "Delta table unavailable".into())),
+        (Ok(table), None) => table.commit_files(&appends).map_err(CommitReceiptError::from_anyhow),
+        _ => Err(failure
+            .clone()
+            .unwrap_or_else(|| CommitReceiptError::commit_failed("Delta table unavailable"))),
     };
     if let Err(error) = &result {
         *failure = Some(error.clone());

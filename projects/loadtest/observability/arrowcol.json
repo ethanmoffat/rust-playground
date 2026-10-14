@@ -1,0 +1,144 @@
+{
+  "uid": "arrowcol",
+  "title": "ArrowCol: direct vs dataflow",
+  "schemaVersion": 39,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Rows ingested / s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "rps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(arrowcol_direct_received_rows_total[30s])",
+          "legendFormat": "direct"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(arrowcol_received_rows_total[30s])",
+          "legendFormat": "dataflow"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Rows exported / s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "rps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(arrowcol_direct_exported_rows_total[30s])",
+          "legendFormat": "direct"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(arrowcol_delta_rows_total[30s])",
+          "legendFormat": "dataflow"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "CPU (cores)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(container_cpu_usage_seconds_total{container_label_com_docker_compose_service=\"direct-1\"}[30s]))",
+          "legendFormat": "direct"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(container_cpu_usage_seconds_total{container_label_com_docker_compose_service=\"dataflow-1\"}[30s]))",
+          "legendFormat": "dataflow"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "RAM",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(container_memory_working_set_bytes{container_label_com_docker_compose_service=\"direct-1\"})",
+          "legendFormat": "direct"
+        },
+        {
+          "refId": "B",
+          "expr": "max(container_memory_working_set_bytes{container_label_com_docker_compose_service=\"dataflow-1\"})",
+          "legendFormat": "dataflow"
+        }
+      ]
+    }
+  ]
+}

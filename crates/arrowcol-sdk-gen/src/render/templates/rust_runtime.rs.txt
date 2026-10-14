@@ -1,0 +1,586 @@
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+enum Cell {
+    Boolean(bool),
+    Int8(i8),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    UInt8(u8),
+    UInt16(u16),
+    UInt32(u32),
+    UInt64(u64),
+    Float32(f32),
+    Float64(f64),
+    Bytes(Vec<u8>),
+    String(String),
+    Decimal128(i128),
+    Struct(Vec<Option<Cell>>),
+    List(Vec<Option<Cell>>),
+    Map(Vec<(Cell, Option<Cell>)>),
+}
+
+/// Generated model, Arrow construction, metadata, Flight, or receipt failure.
+#[derive(Debug, Error)]
+pub enum SdkError {
+    #[error("required field {0} was not supplied")]
+    MissingRequiredField(&'static str),
+    #[error("generated value for {expected} had the wrong model variant")]
+    ModelTypeMismatch { expected: &'static str },
+    #[error("fixed-size list expected {expected} values but received {actual}")]
+    FixedSizeListLength { expected: usize, actual: usize },
+    #[error("list or map offsets exceed the Arrow physical offset range")]
+    OffsetOverflow,
+    #[error("unsupported generated Arrow data type {0}")]
+    UnsupportedDataType(String),
+    #[error("invalid routing metadata {key}: {reason}")]
+    InvalidMetadata {
+        key: &'static str,
+        reason: String,
+    },
+    #[error("invalid receipt metadata: {0}")]
+    InvalidReceipt(String),
+    #[error("receipt base URL cannot carry hierarchical path segments")]
+    InvalidReceiptBaseUrl,
+    #[error(transparent)]
+    Arrow(#[from] ArrowError),
+    #[error(transparent)]
+    Flight(#[from] FlightError),
+    #[error(transparent)]
+    Tonic(#[from] tonic::Status),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Url(#[from] url::ParseError),
+    #[error(transparent)]
+    Uuid(#[from] uuid::Error),
+}
+
+/// Collector implementation pool encoded into validated routing metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImplementationPool {
+    Direct,
+    Dataflow,
+}
+
+impl ImplementationPool {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Dataflow => "dataflow",
+        }
+    }
+}
+
+/// Canonical validated routing metadata for this generated table SDK.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutingMetadata {
+    pool: ImplementationPool,
+}
+
+impl RoutingMetadata {
+    /// Returns the six canonical ASCII gRPC metadata pairs.
+    #[must_use]
+    pub fn ascii_pairs(&self) -> [(&'static str, String); 6] {
+        [
+            ("x-arrowcol-protocol-version", "1".to_owned()),
+            (
+                "x-arrowcol-implementation-pool",
+                self.pool.as_str().to_owned(),
+            ),
+            ("x-arrowcol-catalog", TABLE_CATALOG.to_owned()),
+            ("x-arrowcol-schema", TABLE_SCHEMA.to_owned()),
+            ("x-arrowcol-table", TABLE_NAME.to_owned()),
+            (
+                "x-arrowcol-schema-fingerprint",
+                SCHEMA_FINGERPRINT.to_owned(),
+            ),
+        ]
+    }
+}
+
+/// Constructs and revalidates routing metadata for this generated table.
+///
+/// # Errors
+///
+/// Returns an error if a generated constant violates the bounded ASCII wire contract.
+pub fn routing_metadata(pool: ImplementationPool) -> Result<RoutingMetadata, SdkError> {
+    let metadata = RoutingMetadata { pool };
+    for (key, value) in metadata.ascii_pairs() {
+        validate_metadata(key, &value)?;
+    }
+    Ok(metadata)
+}
+
+/// Returns the canonical Arrow Flight path descriptor.
+#[must_use]
+pub fn flight_descriptor() -> FlightDescriptor {
+    FlightDescriptor::new_path(vec![
+        TABLE_CATALOG.to_owned(),
+        TABLE_SCHEMA.to_owned(),
+        TABLE_NAME.to_owned(),
+        format!("v{SCHEMA_VERSION}"),
+    ])
+}
+
+/// Encodes exact-schema record batches as an Arrow Flight `DoPut` stream.
+#[must_use]
+pub fn encode_do_put<S>(batches: S) -> FlightDataEncoder
+where
+    S: Stream<Item = Result<RecordBatch, FlightError>> + Send + 'static,
+{
+    FlightDataEncoderBuilder::new()
+        .with_schema(arrow_schema())
+        .with_flight_descriptor(Some(flight_descriptor()))
+        .build(batches)
+}
+
+/// Adds validated routing metadata to a `DoPut` request.
+///
+/// # Errors
+///
+/// Returns an error if metadata cannot be represented by tonic's ASCII metadata types.
+pub fn decorate_do_put_request<T>(
+    mut request: Request<T>,
+    pool: ImplementationPool,
+) -> Result<Request<T>, SdkError> {
+    for (key, value) in routing_metadata(pool)?.ascii_pairs() {
+        let metadata_key = MetadataKey::<Ascii>::from_str(key).map_err(|error| SdkError::InvalidMetadata {
+            key,
+            reason: error.to_string(),
+        })?;
+        let metadata_value =
+            MetadataValue::try_from(value.as_str()).map_err(|error| SdkError::InvalidMetadata {
+                key,
+                reason: error.to_string(),
+            })?;
+        request.metadata_mut().insert(metadata_key, metadata_value);
+    }
+    Ok(request)
+}
+
+/// Builds a bounded convenience request for a finite collection of record batches.
+///
+/// This helper validates every batch schema and buffers encoded `FlightData`.
+/// Streaming callers should use [`encode_do_put`] and [`decorate_do_put_request`].
+///
+/// # Errors
+///
+/// Returns an error for a schema mismatch, encoding failure, or invalid metadata.
+pub async fn do_put_request<I>(
+    batches: I,
+    pool: ImplementationPool,
+) -> Result<Request<impl Stream<Item = FlightData> + Send + 'static>, SdkError>
+where
+    I: IntoIterator<Item = RecordBatch>,
+    I::IntoIter: Send + 'static,
+{
+    let expected = arrow_schema();
+    let batches = batches.into_iter().map(move |batch| {
+        if batch.schema() == expected {
+            Ok(batch)
+        } else {
+            Err(FlightError::ProtocolError(
+                "record batch schema does not match generated schema".to_owned(),
+            ))
+        }
+    });
+    let encoded = encode_do_put(futures::stream::iter(batches))
+        .try_collect::<Vec<_>>()
+        .await?;
+    decorate_do_put_request(Request::new(futures::stream::iter(encoded)), pool)
+}
+
+/// Invokes Arrow Flight `DoPut` with a bounded finite collection of batches.
+///
+/// # Errors
+///
+/// Returns an error for local validation/encoding or a tonic RPC failure.
+pub async fn do_put<I>(
+    client: &mut FlightServiceClient<Channel>,
+    batches: I,
+    pool: ImplementationPool,
+) -> Result<Response<Streaming<PutResult>>, SdkError>
+where
+    I: IntoIterator<Item = RecordBatch>,
+    I::IntoIter: Send + 'static,
+{
+    let request = do_put_request(batches, pool).await?;
+    client.do_put(request).await.map_err(SdkError::from)
+}
+
+/// Validated server-generated receipt identifier.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ReceiptId(Uuid);
+
+impl ReceiptId {
+    #[must_use]
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ReceiptId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for ReceiptId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self)
+    }
+}
+
+/// Parses a raw UUID or JSON `{"receipt_id":"..."}` `PutResult` payload.
+///
+/// # Errors
+///
+/// Returns an error for non-UTF-8, malformed JSON, or a non-canonical UUID.
+pub fn parse_receipt_id(application_metadata: &[u8]) -> Result<ReceiptId, SdkError> {
+    let text = std::str::from_utf8(application_metadata)
+        .map_err(|error| SdkError::InvalidReceipt(error.to_string()))?;
+    if let Ok(receipt) = ReceiptId::from_str(text) {
+        return Ok(receipt);
+    }
+    #[derive(Deserialize)]
+    struct ReceiptWire {
+        receipt_id: String,
+    }
+    let wire: ReceiptWire = serde_json::from_str(text)?;
+    ReceiptId::from_str(&wire.receipt_id).map_err(SdkError::from)
+}
+
+/// Builds the canonical HTTP receipt status URL below an external service base URL.
+///
+/// # Errors
+///
+/// Returns an error for a non-HTTP(S) or non-hierarchical base URL.
+pub fn receipt_status_url(base: &Url, receipt_id: ReceiptId) -> Result<Url, SdkError> {
+    if !matches!(base.scheme(), "http" | "https") {
+        return Err(SdkError::InvalidReceiptBaseUrl);
+    }
+    let mut output = base.clone();
+    output.set_query(None);
+    output.set_fragment(None);
+    {
+        let mut segments = output
+            .path_segments_mut()
+            .map_err(|_| SdkError::InvalidReceiptBaseUrl)?;
+        let receipt = receipt_id.to_string();
+        segments.pop_if_empty();
+        segments.extend(["v1", "receipts", receipt.as_str()]);
+    }
+    Ok(output)
+}
+
+fn validate_metadata(key: &'static str, value: &str) -> Result<(), SdkError> {
+    let maximum = match key {
+        "x-arrowcol-protocol-version" | "x-arrowcol-implementation-pool" => 16,
+        "x-arrowcol-schema-fingerprint" => 71,
+        _ => 128,
+    };
+    if value.is_empty()
+        || value.len() > maximum
+        || !value.is_ascii()
+        || value.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(SdkError::InvalidMetadata {
+            key,
+            reason: format!("value must be non-empty bounded ASCII (maximum {maximum} bytes)"),
+        });
+    }
+    Ok(())
+}
+
+fn build_array(data_type: &DataType, values: &[Option<Cell>]) -> Result<ArrayRef, SdkError> {
+    let array: ArrayRef = match data_type {
+        DataType::Boolean => Arc::new(BooleanArray::from(collect_cells(values, "bool", |cell| {
+            if let Cell::Boolean(value) = cell { Some(*value) } else { None }
+        })?)),
+        DataType::Int8 => Arc::new(Int8Array::from(collect_cells(values, "int8", |cell| {
+            if let Cell::Int8(value) = cell { Some(*value) } else { None }
+        })?)),
+        DataType::Int16 => Arc::new(Int16Array::from(collect_cells(values, "int16", |cell| {
+            if let Cell::Int16(value) = cell { Some(*value) } else { None }
+        })?)),
+        DataType::Int32 => Arc::new(Int32Array::from(collect_cells(values, "int32", |cell| {
+            if let Cell::Int32(value) = cell { Some(*value) } else { None }
+        })?)),
+        DataType::Int64 => Arc::new(Int64Array::from(collect_cells(values, "int64", |cell| {
+            if let Cell::Int64(value) = cell { Some(*value) } else { None }
+        })?)),
+        DataType::UInt8 => Arc::new(UInt8Array::from(collect_cells(values, "uint8", |cell| {
+            if let Cell::UInt8(value) = cell { Some(*value) } else { None }
+        })?)),
+        DataType::UInt16 => Arc::new(UInt16Array::from(collect_cells(values, "uint16", |cell| {
+            if let Cell::UInt16(value) = cell { Some(*value) } else { None }
+        })?)),
+        DataType::UInt32 => Arc::new(UInt32Array::from(collect_cells(values, "uint32", |cell| {
+            if let Cell::UInt32(value) = cell { Some(*value) } else { None }
+        })?)),
+        DataType::UInt64 => Arc::new(UInt64Array::from(collect_cells(values, "uint64", |cell| {
+            if let Cell::UInt64(value) = cell { Some(*value) } else { None }
+        })?)),
+        DataType::Float32 => Arc::new(Float32Array::from(collect_cells(values, "float32", |cell| {
+            if let Cell::Float32(value) = cell { Some(*value) } else { None }
+        })?)),
+        DataType::Float64 => Arc::new(Float64Array::from(collect_cells(values, "float64", |cell| {
+            if let Cell::Float64(value) = cell { Some(*value) } else { None }
+        })?)),
+        DataType::Timestamp(unit, timezone) => {
+            let values = collect_cells(values, "timestamp", |cell| {
+                if let Cell::Int64(value) = cell { Some(*value) } else { None }
+            })?;
+            match unit {
+                TimeUnit::Second => Arc::new(TimestampSecondArray::from(values).with_timezone_opt(timezone.clone())),
+                TimeUnit::Millisecond => Arc::new(TimestampMillisecondArray::from(values).with_timezone_opt(timezone.clone())),
+                TimeUnit::Microsecond => Arc::new(TimestampMicrosecondArray::from(values).with_timezone_opt(timezone.clone())),
+                TimeUnit::Nanosecond => Arc::new(TimestampNanosecondArray::from(values).with_timezone_opt(timezone.clone())),
+            }
+        }
+        DataType::Date32 => Arc::new(Date32Array::from(collect_cells(values, "date32", |cell| {
+            if let Cell::Int32(value) = cell { Some(*value) } else { None }
+        })?)),
+        DataType::Date64 => Arc::new(Date64Array::from(collect_cells(values, "date64", |cell| {
+            if let Cell::Int64(value) = cell { Some(*value) } else { None }
+        })?)),
+        DataType::Time32(unit) => {
+            let values = collect_cells(values, "time32", |cell| {
+                if let Cell::Int32(value) = cell { Some(*value) } else { None }
+            })?;
+            match unit {
+                TimeUnit::Second => Arc::new(Time32SecondArray::from(values)),
+                TimeUnit::Millisecond => Arc::new(Time32MillisecondArray::from(values)),
+                _ => return Err(SdkError::UnsupportedDataType(data_type.to_string())),
+            }
+        }
+        DataType::Time64(unit) => {
+            let values = collect_cells(values, "time64", |cell| {
+                if let Cell::Int64(value) = cell { Some(*value) } else { None }
+            })?;
+            match unit {
+                TimeUnit::Microsecond => Arc::new(Time64MicrosecondArray::from(values)),
+                TimeUnit::Nanosecond => Arc::new(Time64NanosecondArray::from(values)),
+                _ => return Err(SdkError::UnsupportedDataType(data_type.to_string())),
+            }
+        }
+        DataType::Duration(unit) => {
+            let values = collect_cells(values, "duration", |cell| {
+                if let Cell::Int64(value) = cell { Some(*value) } else { None }
+            })?;
+            match unit {
+                TimeUnit::Second => Arc::new(DurationSecondArray::from(values)),
+                TimeUnit::Millisecond => Arc::new(DurationMillisecondArray::from(values)),
+                TimeUnit::Microsecond => Arc::new(DurationMicrosecondArray::from(values)),
+                TimeUnit::Nanosecond => Arc::new(DurationNanosecondArray::from(values)),
+            }
+        }
+        DataType::Binary => Arc::new(BinaryArray::from(collect_binary(values)?)),
+        DataType::LargeBinary => Arc::new(LargeBinaryArray::from(collect_binary(values)?)),
+        DataType::BinaryView => Arc::new(BinaryViewArray::from(collect_binary(values)?)),
+        DataType::FixedSizeBinary(width) => {
+            let mut builder = FixedSizeBinaryBuilder::with_capacity(values.len(), *width);
+            for value in values {
+                match value {
+                    None => builder.append_null(),
+                    Some(Cell::Bytes(value)) => builder.append_value(value)?,
+                    Some(_) => return Err(SdkError::ModelTypeMismatch { expected: "fixed_size_binary" }),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Utf8 => Arc::new(StringArray::from(collect_strings(values)?)),
+        DataType::LargeUtf8 => Arc::new(LargeStringArray::from(collect_strings(values)?)),
+        DataType::Utf8View => Arc::new(StringViewArray::from(collect_strings(values)?)),
+        DataType::Decimal128(precision, scale) => Arc::new(
+            Decimal128Array::from(collect_cells(values, "decimal128", |cell| {
+                if let Cell::Decimal128(value) = cell { Some(*value) } else { None }
+            })?)
+            .with_precision_and_scale(*precision, *scale)?,
+        ),
+        DataType::Struct(fields) => Arc::new(build_struct(fields, values)?),
+        DataType::List(field) => Arc::new(build_list::<i32>(field, values, false)?),
+        DataType::LargeList(field) => Arc::new(build_list::<i64>(field, values, true)?),
+        DataType::FixedSizeList(field, size) => Arc::new(build_fixed_size_list(field, *size, values)?),
+        DataType::Map(field, ordered) => Arc::new(build_map(field, *ordered, values)?),
+        _ => return Err(SdkError::UnsupportedDataType(data_type.to_string())),
+    };
+    Ok(array)
+}
+
+fn collect_cells<T>(
+    values: &[Option<Cell>],
+    expected: &'static str,
+    convert: impl Fn(&Cell) -> Option<T>,
+) -> Result<Vec<Option<T>>, SdkError> {
+    values
+        .iter()
+        .map(|value| match value {
+            None => Ok(None),
+            Some(value) => convert(value)
+                .map(Some)
+                .ok_or(SdkError::ModelTypeMismatch { expected }),
+        })
+        .collect()
+}
+
+fn collect_strings(values: &[Option<Cell>]) -> Result<Vec<Option<&str>>, SdkError> {
+    values
+        .iter()
+        .map(|value| match value {
+            None => Ok(None),
+            Some(Cell::String(value)) => Ok(Some(value.as_str())),
+            Some(_) => Err(SdkError::ModelTypeMismatch { expected: "string" }),
+        })
+        .collect()
+}
+
+fn collect_binary(values: &[Option<Cell>]) -> Result<Vec<Option<&[u8]>>, SdkError> {
+    values
+        .iter()
+        .map(|value| match value {
+            None => Ok(None),
+            Some(Cell::Bytes(value)) => Ok(Some(value.as_slice())),
+            Some(_) => Err(SdkError::ModelTypeMismatch { expected: "binary" }),
+        })
+        .collect()
+}
+
+fn build_struct(fields: &Fields, values: &[Option<Cell>]) -> Result<StructArray, SdkError> {
+    let mut child_values = vec![Vec::with_capacity(values.len()); fields.len()];
+    for value in values {
+        match value {
+            None => {
+                for child in &mut child_values {
+                    child.push(None);
+                }
+            }
+            Some(Cell::Struct(children)) if children.len() == fields.len() => {
+                for (target, child) in child_values.iter_mut().zip(children) {
+                    target.push(child.clone());
+                }
+            }
+            Some(Cell::Struct(_)) => {
+                return Err(SdkError::ModelTypeMismatch {
+                    expected: "struct field count",
+                });
+            }
+            Some(_) => return Err(SdkError::ModelTypeMismatch { expected: "struct" }),
+        }
+    }
+    let arrays = fields
+        .iter()
+        .zip(child_values)
+        .map(|(field, values)| build_array(field.data_type(), &values))
+        .collect::<Result<Vec<_>, _>>()?;
+    StructArray::try_new_with_length(fields.clone(), arrays, null_buffer(values), values.len())
+        .map_err(SdkError::from)
+}
+
+fn build_list<O>(
+    field: &Arc<Field>,
+    values: &[Option<Cell>],
+    large: bool,
+) -> Result<arrow_array::GenericListArray<O>, SdkError>
+where
+    O: arrow_array::OffsetSizeTrait,
+{
+    let mut flat = Vec::new();
+    let mut offsets = Vec::with_capacity(values.len() + 1);
+    offsets.push(O::from_usize(0).ok_or(SdkError::OffsetOverflow)?);
+    for value in values {
+        match value {
+            None => {}
+            Some(Cell::List(items)) => flat.extend(items.iter().cloned()),
+            Some(_) => return Err(SdkError::ModelTypeMismatch { expected: "list" }),
+        }
+        offsets.push(O::from_usize(flat.len()).ok_or(SdkError::OffsetOverflow)?);
+    }
+    let child = build_array(field.data_type(), &flat)?;
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
+    if large != O::IS_LARGE {
+        return Err(SdkError::UnsupportedDataType("list offset width mismatch".to_owned()));
+    }
+    arrow_array::GenericListArray::<O>::try_new(field.clone(), offsets, child, null_buffer(values))
+        .map_err(SdkError::from)
+}
+
+fn build_fixed_size_list(
+    field: &Arc<Field>,
+    size: i32,
+    values: &[Option<Cell>],
+) -> Result<FixedSizeListArray, SdkError> {
+    let size_usize = usize::try_from(size).map_err(|_| SdkError::FixedSizeListLength {
+        expected: 0,
+        actual: 0,
+    })?;
+    let mut flat = Vec::with_capacity(values.len().saturating_mul(size_usize));
+    for value in values {
+        match value {
+            None => flat.extend(std::iter::repeat_n(None, size_usize)),
+            Some(Cell::List(items)) if items.len() == size_usize => {
+                flat.extend(items.iter().cloned());
+            }
+            Some(Cell::List(items)) => {
+                return Err(SdkError::FixedSizeListLength {
+                    expected: size_usize,
+                    actual: items.len(),
+                });
+            }
+            Some(_) => return Err(SdkError::ModelTypeMismatch { expected: "fixed_size_list" }),
+        }
+    }
+    let child = build_array(field.data_type(), &flat)?;
+    FixedSizeListArray::try_new(field.clone(), size, child, null_buffer(values)).map_err(SdkError::from)
+}
+
+fn build_map(field: &Arc<Field>, ordered: bool, values: &[Option<Cell>]) -> Result<MapArray, SdkError> {
+    let DataType::Struct(entry_fields) = field.data_type() else {
+        return Err(SdkError::UnsupportedDataType(field.data_type().to_string()));
+    };
+    if entry_fields.len() != 2 {
+        return Err(SdkError::UnsupportedDataType(field.data_type().to_string()));
+    }
+    let mut keys = Vec::new();
+    let mut map_values = Vec::new();
+    let mut offsets = Vec::with_capacity(values.len() + 1);
+    offsets.push(0_i32);
+    for value in values {
+        match value {
+            None => {}
+            Some(Cell::Map(entries)) => {
+                for (key, value) in entries {
+                    keys.push(Some(key.clone()));
+                    map_values.push(value.clone());
+                }
+            }
+            Some(_) => return Err(SdkError::ModelTypeMismatch { expected: "map" }),
+        }
+        offsets.push(i32::try_from(keys.len()).map_err(|_| SdkError::OffsetOverflow)?);
+    }
+    let key_array = build_array(entry_fields[0].data_type(), &keys)?;
+    let value_array = build_array(entry_fields[1].data_type(), &map_values)?;
+    let entries = StructArray::try_new_with_length(
+        entry_fields.clone(),
+        vec![key_array, value_array],
+        None,
+        keys.len(),
+    )?;
+    MapArray::try_new(
+        field.clone(),
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        entries,
+        null_buffer(values),
+        ordered,
+    )
+    .map_err(SdkError::from)
+}
+
+fn null_buffer(values: &[Option<Cell>]) -> Option<NullBuffer> {
+    let validity = values.iter().map(Option::is_some).collect::<Vec<_>>();
+    validity.iter().any(|valid| !valid).then(|| NullBuffer::from(validity))
+}

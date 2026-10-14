@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import type {
   CommandOptions,
   CommandResult,
@@ -8,6 +10,9 @@ export const GHCR_HOST = 'ghcr.io';
 export const DEFAULT_BRANCH = 'main';
 
 const packagePageSize = 100;
+const registryTagMaximumLength = 128;
+const branchTagPrefix = 'branch-';
+const branchTagHashLength = 16;
 const containerSegmentPattern =
   /^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*$/u;
 const ownerPattern = /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$/u;
@@ -194,6 +199,22 @@ export function loginToRegistry(
 }
 
 export function sanitizeBranchName(branch: string): string {
+  return sanitizeBranchNameToLength(branch, registryTagMaximumLength);
+}
+
+export function createRegistryBranchTag(branch: string): string {
+  return validateRegistryTag(
+    `${branchTagPrefix}${sanitizeBranchNameToLength(
+      branch,
+      registryTagMaximumLength - branchTagPrefix.length,
+    )}`,
+  );
+}
+
+function sanitizeBranchNameToLength(
+  branch: string,
+  maximumLength: number,
+): string {
   const branchName = normalizeBranchName(branch);
   const sanitized = branchName
     .normalize('NFKD')
@@ -201,15 +222,26 @@ export function sanitizeBranchName(branch: string): string {
     .replace(/[^a-z0-9._-]+/gu, '-')
     .replace(/[._-]{2,}/gu, '-')
     .replace(/^[._-]+|[._-]+$/gu, '');
-  const truncated = sanitized.slice(0, 128).replace(/[._-]+$/gu, '');
 
-  if (!truncated) {
+  if (!sanitized || sanitized === 'head') {
     throw new RegistryCommandError(
       `Branch name "${branchName}" does not contain characters usable in a container tag.`,
     );
   }
 
-  return validateRegistryTag(truncated);
+  if (sanitized.length <= maximumLength) {
+    return validateRegistryTag(sanitized);
+  }
+
+  const hash = createHash('sha256')
+    .update(branchName.normalize('NFKD'), 'utf8')
+    .digest('hex')
+    .slice(0, branchTagHashLength);
+  const readableLength = maximumLength - hash.length - 1;
+  const readablePrefix = sanitized
+    .slice(0, readableLength)
+    .replace(/[._-]+$/gu, '');
+  return validateRegistryTag(`${readablePrefix}-${hash}`);
 }
 
 export function createRegistryTagMetadata(options: {
@@ -221,7 +253,7 @@ export function createRegistryTagMetadata(options: {
   const defaultBranch = normalizeBranchName(
     options.defaultBranch ?? DEFAULT_BRANCH,
   );
-  const branchTag = sanitizeBranchName(branch);
+  const branchTag = createRegistryBranchTag(branch);
   const gitSha = normalizeGitSha(options.gitSha);
   const shaTag = `sha-${gitSha}`;
   const isDefaultBranch = branch === defaultBranch;
@@ -576,7 +608,11 @@ function normalizeContainerSegment(value: string, label: string): string {
 }
 
 function normalizeBranchName(value: string): string {
-  const normalized = value.trim().replace(/^refs\/heads\//u, '');
+  const normalized = value
+    .trim()
+    .replace(/^refs\/heads\//iu, '')
+    .replace(/^refs\/remotes\/[^/]+\//iu, '')
+    .replace(/^origin\//iu, '');
   if (!normalized) {
     throw new RegistryCommandError('Branch name must not be empty.');
   }

@@ -160,6 +160,14 @@
         "manifestFile": "{absWorkspaceRoot}/target/images/hello-world-load.txt"
       },
       "configurations": {
+        "ci-verify": {
+          "cacheFrom": [
+            "type=gha,version=2,scope={projectName}-image"
+          ],
+          "cacheTo": [
+            "type=gha,version=2,scope={projectName}-image,mode=max"
+          ]
+        },
         "ci": {
           "tags": [
             "sha-{gitSha}"
@@ -223,6 +231,7 @@
       "configurations": {
         "main": {
           "tags": [
+            "{gitBranchTag}",
             "sha-{gitSha}",
             "latest"
           ]
@@ -235,6 +244,7 @@
   },
   "tags": [
     "scope:rust",
-    "type:application"
+    "type:application",
+    "type:runtime-image"
   ]
 }

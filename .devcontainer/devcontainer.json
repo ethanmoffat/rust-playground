@@ -18,7 +18,26 @@
     "node",
     ".devcontainer/scripts/post-create.ts"
   ],
-  "waitFor": "postCreateCommand",
+  "postStartCommand": [
+    "node",
+    ".devcontainer/scripts/post-create.ts",
+    "--permissions-only"
+  ],
+  "waitFor": "postStartCommand",
+  "portsAttributes": {
+    "14333": {
+      "label": "SQL Server (loadtest; published on the Docker host, reached via WSL localhost)",
+      "onAutoForward": "ignore"
+    },
+    "3000": {
+      "label": "Grafana (loadtest; published on the Docker host, reached via WSL localhost)",
+      "onAutoForward": "ignore"
+    },
+    "9444": {
+      "label": "Portainer (loadtest; published on the Docker host, reached via WSL localhost)",
+      "onAutoForward": "ignore"
+    }
+  },
   "customizations": {
     "vscode": {
       "extensions": [

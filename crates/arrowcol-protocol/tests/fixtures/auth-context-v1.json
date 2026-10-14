@@ -1,0 +1,14 @@
+{
+  "protocol_version": 1,
+  "principal": {
+    "subject": "collector-client-17",
+    "issuer": "https://identity.example.test",
+    "scopes": [
+      "arrow.write",
+      "receipt.read"
+    ]
+  },
+  "method": "bearer_token",
+  "authenticated_at_unix_ms": 1791737000000,
+  "expires_at_unix_ms": 1791740600000
+}

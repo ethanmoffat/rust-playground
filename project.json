@@ -3,6 +3,18 @@
   "$schema": "./node_modules/nx/schemas/project-schema.json",
   "projectType": "library",
   "implicitDependencies": [
+    "arrowcol-buffer",
+    "arrowcol-receipts",
+    "arrowcol-catalog",
+    "arrowcol-protocol",
+    "arrowcol-flight",
+    "arrowcol-routing",
+    "arrowcol-sql-server",
+    "arrowcol-dataflow-components",
+    "arrowcol-dataflow-rust",
+    "arrowcol-router-rust",
+    "arrowcol-rust",
+    "arrowcol-sdk-gen",
     "arrow-deltalake",
     "otel-deltalake-exporter",
     "otelcol-rust",
@@ -20,6 +32,18 @@
       "dependsOn": [
         {
           "projects": [
+            "arrowcol-buffer",
+            "arrowcol-receipts",
+            "arrowcol-catalog",
+            "arrowcol-protocol",
+            "arrowcol-flight",
+            "arrowcol-routing",
+            "arrowcol-sql-server",
+            "arrowcol-dataflow-components",
+            "arrowcol-dataflow-rust",
+            "arrowcol-router-rust",
+            "arrowcol-rust",
+            "arrowcol-sdk-gen",
             "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
@@ -27,6 +51,7 @@
             "hello-world",
             "loadtest",
             "auth-automation",
+            "arrowcol-sdk-gen-tool",
             "rust-playground-build",
             "tools-scripts",
             "devcontainer"
@@ -49,6 +74,18 @@
       "dependsOn": [
         {
           "projects": [
+            "arrowcol-buffer",
+            "arrowcol-receipts",
+            "arrowcol-catalog",
+            "arrowcol-protocol",
+            "arrowcol-flight",
+            "arrowcol-routing",
+            "arrowcol-sql-server",
+            "arrowcol-dataflow-components",
+            "arrowcol-dataflow-rust",
+            "arrowcol-router-rust",
+            "arrowcol-rust",
+            "arrowcol-sdk-gen",
             "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
@@ -72,6 +109,18 @@
       "dependsOn": [
         {
           "projects": [
+            "arrowcol-buffer",
+            "arrowcol-receipts",
+            "arrowcol-catalog",
+            "arrowcol-protocol",
+            "arrowcol-flight",
+            "arrowcol-routing",
+            "arrowcol-sql-server",
+            "arrowcol-dataflow-components",
+            "arrowcol-dataflow-rust",
+            "arrowcol-router-rust",
+            "arrowcol-rust",
+            "arrowcol-sdk-gen",
             "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
@@ -95,6 +144,24 @@
       "dependsOn": [
         {
           "projects": [
+            "tools-scripts"
+          ],
+          "target": "markdown-lint"
+        },
+        {
+          "projects": [
+            "arrowcol-buffer",
+            "arrowcol-receipts",
+            "arrowcol-catalog",
+            "arrowcol-protocol",
+            "arrowcol-flight",
+            "arrowcol-routing",
+            "arrowcol-sql-server",
+            "arrowcol-dataflow-components",
+            "arrowcol-dataflow-rust",
+            "arrowcol-router-rust",
+            "arrowcol-rust",
+            "arrowcol-sdk-gen",
             "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
@@ -109,7 +176,25 @@
         "commands": []
       },
       "metadata": {
-        "description": "Run strict Clippy checks for every Rust package."
+        "description": "Lint first-party Markdown and run strict Clippy checks for every Rust package."
+      }
+    },
+    "fail-on-untracked-files": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        {
+          "projects": [
+            "tools-scripts"
+          ],
+          "target": "clean-worktree"
+        }
+      ],
+      "options": {
+        "commands": []
+      },
+      "metadata": {
+        "description": "Reject tracked changes and unexpected untracked files after verification."
       }
     },
     "build": {
@@ -118,6 +203,18 @@
       "dependsOn": [
         {
           "projects": [
+            "arrowcol-buffer",
+            "arrowcol-receipts",
+            "arrowcol-catalog",
+            "arrowcol-protocol",
+            "arrowcol-flight",
+            "arrowcol-routing",
+            "arrowcol-sql-server",
+            "arrowcol-dataflow-components",
+            "arrowcol-dataflow-rust",
+            "arrowcol-router-rust",
+            "arrowcol-rust",
+            "arrowcol-sdk-gen",
             "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
@@ -127,7 +224,9 @@
           "target": "build"
         },
         {
-          "projects": ["loadtest"],
+          "projects": [
+            "loadtest"
+          ],
           "target": "reader-build"
         }
       ],
@@ -144,6 +243,18 @@
       "dependsOn": [
         {
           "projects": [
+            "arrowcol-buffer",
+            "arrowcol-receipts",
+            "arrowcol-catalog",
+            "arrowcol-protocol",
+            "arrowcol-flight",
+            "arrowcol-routing",
+            "arrowcol-sql-server",
+            "arrowcol-dataflow-components",
+            "arrowcol-dataflow-rust",
+            "arrowcol-router-rust",
+            "arrowcol-rust",
+            "arrowcol-sdk-gen",
             "arrow-deltalake",
             "otel-deltalake-exporter",
             "otelcol-rust",
@@ -169,7 +280,10 @@
         "{workspaceRoot}/Cargo.lock",
         "{workspaceRoot}/crates/*/Cargo.toml",
         "{workspaceRoot}/bin/*/Cargo.toml",
+        "{workspaceRoot}/projects/arrowcol-dataflow-rust/Cargo.toml",
+        "{workspaceRoot}/projects/loadtest/loadgen/Cargo.toml",
         "{workspaceRoot}/projects/loadtest/reader/Cargo.toml",
+        "{workspaceRoot}/projects/arrowcol-rust/Cargo.toml",
         "{workspaceRoot}/projects/otelcol-rust/Cargo.toml",
         "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/**/Cargo.toml"
       ],
@@ -192,8 +306,14 @@
         "{workspaceRoot}/crates/*/src/**/*",
         "{workspaceRoot}/bin/*/Cargo.toml",
         "{workspaceRoot}/bin/*/src/**/*",
+        "{workspaceRoot}/projects/arrowcol-dataflow-rust/Cargo.toml",
+        "{workspaceRoot}/projects/arrowcol-dataflow-rust/src/**/*",
+        "{workspaceRoot}/projects/loadtest/loadgen/Cargo.toml",
+        "{workspaceRoot}/projects/loadtest/loadgen/src/**/*",
         "{workspaceRoot}/projects/loadtest/reader/Cargo.toml",
         "{workspaceRoot}/projects/loadtest/reader/src/**/*",
+        "{workspaceRoot}/projects/arrowcol-rust/Cargo.toml",
+        "{workspaceRoot}/projects/arrowcol-rust/src/**/*",
         "{workspaceRoot}/projects/otelcol-rust/Cargo.toml",
         "{workspaceRoot}/projects/otelcol-rust/src/**/*",
         "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/**/*.rs",

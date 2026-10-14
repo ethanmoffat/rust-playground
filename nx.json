@@ -1,6 +1,9 @@
 {
   "$schema": "./node_modules/nx/schemas/nx-schema.json",
   "useDaemonProcess": false,
+  "tui": {
+    "enabled": false
+  },
   "plugins": [
     {
       "plugin": "./tools/libs/rust-playground-build/src/index.ts"

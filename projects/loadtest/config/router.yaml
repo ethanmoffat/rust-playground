@@ -1,0 +1,59 @@
+server:
+  listen: 0.0.0.0:50050
+  threads: 4
+  listener_tasks_per_fd: 1
+  grace_period_seconds: 10
+  graceful_shutdown_timeout_seconds: 300
+  state_directory: /state
+  h2:
+    max_concurrent_streams: 512
+    stream_window_bytes: 1048576
+    connection_window_bytes: 33554432
+    idle_timeout_seconds: 60
+
+sql_server:
+  host: sqlserver
+  port: 1433
+  database: arrowcol
+  username: arrowcol_app
+  password_file: /run/secrets/arrowcol-app-password
+  trust_server_certificate: true
+  connect_timeout_ms: 5000
+  command_timeout_ms: 15000
+
+routing:
+  refresh_interval_ms: 500
+  max_snapshot_age_ms: 15000
+  max_future_skew_ms: 2000
+  max_table_entries: 256
+  max_oldest_buffer_age_ms: 86400000
+  hard_pressure_bps: 10000
+  warmup_ms: 1
+  minimum_warmup_bps: 9500
+  lease_ttl_ms: 86400000
+  readiness_max_staleness_ms: 30000
+
+auth:
+  authenticator: allow_all
+  edge_secret_file: /run/secrets/edge-hmac
+  internal_signing_secret_file: /run/secrets/internal-hmac
+  edge_signature_max_age_ms: 30000
+  internal_identity_ttl_ms: 30000
+
+upstream:
+  tls: false
+  sni: ""
+  max_h2_streams: 128
+  stream_window_bytes: 1048576
+  connection_window_bytes: 33554432
+  connection_timeout_ms: 1000
+  total_connection_timeout_ms: 3000
+  idle_timeout_seconds: 60
+  ping_interval_seconds: 15
+
+receipts:
+  max_batch_size: 256
+
+telemetry:
+  log_filter: info,arrowcol_router_rust=debug
+  json_logs: true

@@ -1,11 +1,19 @@
 import {
   appendFileSync,
+  existsSync,
   mkdirSync,
+  readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 
+import {
+  requireImageReference,
+  verificationArguments,
+} from './ci-plan.js';
 import {
   CommandError,
   type CommandRunner,
@@ -22,13 +30,19 @@ const containerIdFormat = '{{ .Id }}';
 const containerIdPattern = /^[a-f0-9]{12,64}$/u;
 const containerWorkspace = '/workspaces/rust-playground';
 const ciLabelFormat = `{{ index .Config.Labels "${CI_LABEL_NAME}" }}`;
-const ciLabelValuePattern = /^\d+-\d+-(?:source|published)$/u;
+const ciLabelValuePattern = /^\d+-\d+-(?:source|published|artifact)$/u;
+const artifactImagePattern = /^rust-playground-ci:env-[a-f0-9]{64}$/u;
+const artifactKeyPattern = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/u;
+const imageIdPattern = /^sha256:[a-f0-9]{64}$/u;
 
-export type DevcontainerKind = 'published' | 'source';
+export type DevcontainerKind = 'artifact' | 'published' | 'source';
 
 export interface CiFileSystem {
   appendFile(filePath: string, contents: string): void;
   ensurePrivateDirectory(directoryPath: string): void;
+  fileExists(filePath: string): boolean;
+  readDirectory(directoryPath: string): readonly string[];
+  readFile(filePath: string): string;
   removeFile(filePath: string): void;
   writePrivateFile(filePath: string, contents: string): void;
 }
@@ -39,6 +53,13 @@ export const systemFileSystem: CiFileSystem = {
   },
   ensurePrivateDirectory(directoryPath) {
     mkdirSync(directoryPath, { mode: 0o700, recursive: true });
+  },
+  fileExists: existsSync,
+  readDirectory(directoryPath) {
+    return readdirSync(directoryPath);
+  },
+  readFile(filePath) {
+    return readFileSync(filePath, 'utf8');
   },
   removeFile(filePath) {
     rmSync(filePath, { force: true });
@@ -76,6 +97,7 @@ export interface StartOptions {
   readonly runAttempt: string;
   readonly runId: string;
   readonly workspace: string;
+  readonly image?: string;
 }
 
 export function startDevcontainer(
@@ -95,6 +117,9 @@ export function startDevcontainer(
     start_kind: options.kind,
   });
 
+  if (options.kind === 'artifact') {
+    prepareArtifactRuntime(options, runner, fileSystem);
+  }
   const upArgs = createDevcontainerUpArgs(options, ciLabel);
   const upResult = runner.run('npx', upArgs, {
     cwd: options.workspace,
@@ -144,6 +169,9 @@ export function startDevcontainer(
 
 export interface VerifyOptions {
   readonly containerId: string;
+  readonly task?: string | readonly string[];
+  readonly parallel?: number;
+  readonly integration?: boolean;
 }
 
 export function verifyDevcontainer(
@@ -151,6 +179,13 @@ export function verifyDevcontainer(
   runner: CommandRunner,
 ): void {
   const containerId = requireCanonicalContainerId(options.containerId);
+  const args = verificationArguments(options.task, options.parallel);
+  if (options.integration) {
+    if (options.task !== 'loadtest:e2e') {
+      throw new Error('Only loadtest:e2e may use prebuilt integration artifacts.');
+    }
+    args.push('--excludeTaskDependencies');
+  }
   runChecked(runner, 'docker', [
     'exec',
     '--user',
@@ -171,7 +206,214 @@ export function verifyDevcontainer(
     containerId,
     'bash',
     '-lc',
-    'npx nx run-many -t verify --all --parallel=1 && npx nx run tools-scripts:clean-worktree',
+    'npx --no-install nx "$@" && npx --no-install nx run rust:fail-on-untracked-files --outputStyle=static',
+    'ci-verify',
+    ...args,
+  ]);
+}
+
+export function verifyHost(
+  options: {
+    readonly task: string | readonly string[];
+    readonly parallel?: number;
+    readonly workspace: string;
+    readonly dockerCache?: boolean;
+    readonly integration?: boolean;
+  },
+  runner: CommandRunner,
+): void {
+  const args = verificationArguments(options.task, options.parallel);
+  if (options.integration) {
+    if (options.task !== 'loadtest:e2e') throw new Error('Only loadtest:e2e may use prebuilt integration artifacts.');
+    args.push('--excludeTaskDependencies');
+  }
+  if (options.dockerCache) {
+    if (
+      typeof options.task !== 'string' ||
+      !options.task.endsWith(':image')
+    ) {
+      throw new Error('BuildKit caching requires an image task.');
+    }
+    args.push('--configuration=ci-verify');
+  }
+  runChecked(runner, 'npx', ['--no-install', 'nx', ...args], { cwd: options.workspace });
+  runChecked(runner, 'npx', [
+    '--no-install', 'nx', 'run', 'rust:fail-on-untracked-files', '--outputStyle=static',
+  ], { cwd: options.workspace });
+}
+
+export function buildCiEnvironment(
+  options: {
+    readonly githubOutput: string;
+    readonly workspace: string;
+  },
+  runner: CommandRunner,
+  fileSystem: CiFileSystem,
+): void {
+  const { baseImage, image, key } = identifyCiEnvironment(options.workspace, fileSystem);
+  const directory = path.join(options.workspace, '.temp', 'ci', 'environment');
+  fileSystem.ensurePrivateDirectory(directory);
+  const archive = path.join(directory, 'environment.tar.zst');
+  const manifest = path.join(directory, 'environment.json');
+  if (fileSystem.fileExists(archive) || fileSystem.fileExists(manifest)) {
+    if (!fileSystem.fileExists(archive) || !fileSystem.fileExists(manifest)) {
+      throw new Error('The cached source environment is incomplete.');
+    }
+    const metadata = readEnvironmentManifest(manifest, fileSystem);
+    if (metadata.image !== image) throw new Error('Cached source environment fingerprint mismatch.');
+    runChecked(runner, 'docker', ['load', '--input', archive]);
+    verifyEnvironmentImage(image, metadata.id, runner);
+  } else {
+    runChecked(runner, 'npx', [
+      '--no-install', 'nx', 'run', 'devcontainer:build', '--excludeTaskDependencies',
+    ], { cwd: options.workspace });
+    runChecked(runner, 'docker', [
+      'build', '--builder', 'default', '--file', '.github/ci/Dockerfile',
+      '--build-arg', `SOURCE_DEVCONTAINER=${baseImage}`, '--tag', image, '.',
+    ], { cwd: options.workspace });
+    const id = requireImageId(runChecked(runner, 'docker', [
+      'image', 'inspect', '--format', '{{ .Id }}', image,
+    ], { stdout: 'capture' }).stdout);
+    const tar = path.join(directory, 'environment.tar');
+    runChecked(runner, 'docker', ['save', '--output', tar, image]);
+    runChecked(runner, 'zstd', ['--threads=0', '--fast=3', '--rm', '--force', tar, '-o', archive]);
+    fileSystem.writePrivateFile(manifest, JSON.stringify({ image, id }));
+  }
+  appendStepOutputs(fileSystem, options.githubOutput, { image, key });
+}
+
+export function identifyCiEnvironment(
+  workspace: string,
+  fileSystem: CiFileSystem,
+): { readonly baseImage: string; readonly image: string; readonly key: string } {
+  const hash = fileSystem.readFile(path.join(workspace, '.devcontainer', 'content-hash.txt')).trim();
+  if (!/^[a-f0-9]{64}$/u.test(hash)) throw new Error('Invalid source devcontainer content hash.');
+  const fingerprint = createHash('sha256');
+  for (const file of [
+    '.dockerignore',
+    '.devcontainer/Dockerfile',
+    '.devcontainer/devcontainer.build.json',
+    '.devcontainer/devcontainer-lock.json',
+    '.devcontainer/source/devcontainer.json',
+    '.devcontainer/source/devcontainer-lock.json',
+    '.github/ci/Dockerfile',
+  ]) {
+    fingerprint.update(file).update('\0').update(fileSystem.readFile(path.join(workspace, file))).update('\0');
+  }
+  fingerprint.update(hash);
+  const key = fingerprint.digest('hex');
+  return {
+    baseImage: `ghcr.io/mdrakiburrahman/rust-playground/devcontainer:${hash}`,
+    image: `rust-playground-ci:env-${key}`,
+    key,
+  };
+}
+
+export function exportImages(
+  options: {
+    readonly images: readonly string[];
+    readonly key: string;
+    readonly workspace: string;
+  },
+  runner: CommandRunner,
+  fileSystem: CiFileSystem,
+): void {
+  const key = requireArtifactKey(options.key);
+  if (options.images.length === 0) throw new Error('No runtime images to export.');
+  const images = options.images.map((reference) => ({
+    reference: requireImageReference(reference),
+    id: requireImageId(runChecked(runner, 'docker', [
+      'image', 'inspect', '--format', '{{ .Id }}', reference,
+    ], { stdout: 'capture' }).stdout),
+  }));
+  const directory = path.join(options.workspace, '.temp', 'ci', 'images');
+  fileSystem.ensurePrivateDirectory(directory);
+  runChecked(runner, 'docker', [
+    'save', '--output', path.join(directory, `${key}.tar`), ...options.images,
+  ]);
+  fileSystem.writePrivateFile(path.join(directory, `${key}.json`), JSON.stringify({ images }));
+}
+
+export function importIntegrationArtifacts(
+  options: {
+    readonly images: readonly string[];
+    readonly workspace: string;
+    readonly host?: boolean;
+  },
+  runner: CommandRunner,
+  fileSystem: CiFileSystem,
+): void {
+  if (options.images.length === 0) throw new Error('Expected runtime images must be specified.');
+  const expected = new Set(options.images.map(requireImageReference));
+  const directory = path.join(options.workspace, '.temp', 'ci', 'images');
+  const files = fileSystem.readDirectory(directory);
+  const manifests = files.filter((file) => file.endsWith('.json')).sort();
+  if (manifests.length === 0 || files.length !== manifests.length * 2) {
+    throw new Error('Runtime image artifacts are missing or incomplete.');
+  }
+  const imported = new Set<string>();
+  for (const manifest of manifests) {
+    const key = requireArtifactKey(manifest.slice(0, -'.json'.length));
+    if (!files.includes(`${key}.tar`)) throw new Error(`Missing image archive: ${key}`);
+    const value: unknown = JSON.parse(fileSystem.readFile(path.join(directory, manifest)));
+    if (!isRecord(value) || !Array.isArray(value.images) || value.images.length === 0) {
+      throw new Error(`Invalid runtime image manifest: ${manifest}`);
+    }
+    const images = value.images.map((image: unknown) => {
+      if (!isRecord(image) || typeof image.reference !== 'string' || typeof image.id !== 'string') {
+        throw new Error(`Invalid runtime image entry: ${manifest}`);
+      }
+      const reference = requireImageReference(image.reference);
+      const id = requireImageId(image.id);
+      if (!expected.has(reference) || imported.has(reference)) {
+        throw new Error(`Unexpected or duplicate runtime image: ${reference}`);
+      }
+      imported.add(reference);
+      return { reference, id };
+    });
+    runChecked(runner, 'docker', ['load', '--input', path.join(directory, `${key}.tar`)]);
+    for (const image of images) {
+      const actual = requireImageId(runChecked(runner, 'docker', [
+        'image', 'inspect', '--format', '{{ .Id }}', image.reference,
+      ], { stdout: 'capture' }).stdout);
+      if (actual !== image.id) throw new Error(`Runtime image identity mismatch: ${image.reference}`);
+    }
+  }
+  if (imported.size !== expected.size) throw new Error('A required runtime image artifact is missing.');
+  const target = options.host
+    ? path.join(options.workspace, 'target', 'debug')
+    : path.join(options.workspace, 'target', 'ci', 'build', 'debug');
+  fileSystem.ensurePrivateDirectory(target);
+  runChecked(runner, 'tar', [
+    '--extract', '--file', path.join(options.workspace, '.temp', 'ci', 'reader.tar'),
+    '--directory', target,
+    'delta-inspect',
+    'arrowcol-loadgen',
+    'arrowcol-sdk-gen',
+  ]);
+  for (const binary of [
+    'delta-inspect',
+    'arrowcol-loadgen',
+    'arrowcol-sdk-gen',
+  ]) {
+    runChecked(runner, 'test', ['-x', path.join(target, binary)]);
+  }
+}
+
+export function exportReader(
+  options: { readonly containerId: string; readonly workspace: string },
+  runner: CommandRunner,
+  fileSystem: CiFileSystem,
+): void {
+  const containerId = requireCanonicalContainerId(options.containerId);
+  fileSystem.ensurePrivateDirectory(path.join(options.workspace, '.temp', 'ci'));
+  runChecked(runner, 'docker', [
+    'exec', '--user', 'vscode', '--workdir', containerWorkspace, containerId,
+    'tar', '--create', '--file', '.temp/ci/reader.tar',
+    '--directory', 'target/debug',
+    'delta-inspect',
+    'arrowcol-loadgen',
+    'arrowcol-sdk-gen',
   ]);
 }
 
@@ -196,6 +438,7 @@ export function cleanupDevcontainer(
         new Set([recordedProject]),
         options.workspace,
         runner,
+        fileSystem,
       );
       return;
     }
@@ -237,12 +480,15 @@ export function cleanupDevcontainer(
       }
     }
 
-    removeComposeProjects(projects, options.workspace, runner);
+    removeComposeProjects(projects, options.workspace, runner, fileSystem);
     for (const containerId of standaloneContainers) {
       runChecked(runner, 'docker', ['rm', '--force', containerId]);
     }
   } finally {
     fileSystem.removeFile(ciEnvironmentFile(options.workspace));
+    for (const filename of ['devcontainer.json', 'compose.json']) {
+      fileSystem.removeFile(path.join(options.workspace, '.temp', 'ci', filename));
+    }
   }
 }
 
@@ -293,10 +539,10 @@ function createDevcontainerUpArgs(
   options: StartOptions,
   ciLabel: string,
 ): string[] {
-  const configFile =
-    options.kind === 'source'
-      ? path.join('source', 'devcontainer.json')
-      : 'devcontainer.json';
+  const configFile = options.kind === 'artifact'
+    ? path.join(options.workspace, '.temp', 'ci', 'devcontainer.json')
+    : path.join(options.workspace, '.devcontainer',
+      options.kind === 'source' ? path.join('source', 'devcontainer.json') : 'devcontainer.json');
   const args = [
     '--no-install',
     'devcontainer',
@@ -304,13 +550,94 @@ function createDevcontainerUpArgs(
     '--workspace-folder',
     options.workspace,
     '--config',
-    path.join(options.workspace, '.devcontainer', configFile),
+    configFile,
   ];
   if (options.kind === 'source') {
     args.push('--frozen-lockfile');
   }
   args.push('--id-label', ciLabel);
   return args;
+}
+
+function prepareArtifactRuntime(
+  options: StartOptions,
+  runner: CommandRunner,
+  fileSystem: CiFileSystem,
+): void {
+  const expected = identifyCiEnvironment(options.workspace, fileSystem);
+  if (options.image === undefined || options.image !== expected.image) {
+    throw new Error('CI artifact image must match the source environment fingerprint of this checkout.');
+  }
+  const metadata = readEnvironmentManifest(
+    path.join(options.workspace, '.temp', 'ci', 'environment', 'environment.json'), fileSystem,
+  );
+  if (metadata.image !== options.image) throw new Error('Source environment artifact manifest mismatch.');
+  verifyEnvironmentImage(options.image, metadata.id, runner);
+  const base: unknown = JSON.parse(fileSystem.readFile(
+    path.join(options.workspace, '.devcontainer', 'devcontainer.json'),
+  ));
+  if (!isRecord(base)) throw new Error('Invalid base devcontainer configuration.');
+  const directory = path.join(options.workspace, '.temp', 'ci');
+  fileSystem.ensurePrivateDirectory(directory);
+  const cache = path.join(options.workspace, 'target', 'ci');
+  for (const name of ['build', 'cargo']) {
+    fileSystem.ensurePrivateDirectory(path.join(cache, name));
+  }
+  const compose = path.join(directory, 'compose.json');
+  fileSystem.writePrivateFile(compose, JSON.stringify({
+    services: {
+      workspace: {
+        image: options.image,
+        pull_policy: 'never',
+        volumes: [
+          { type: 'bind', source: path.join(cache, 'build'), target: `${containerWorkspace}/target` },
+          { type: 'bind', source: path.join(cache, 'cargo'), target: '/usr/local/cargo' },
+          { type: 'volume', source: 'cargo_bins', target: '/usr/local/cargo/bin', read_only: true },
+        ],
+      },
+    },
+    volumes: { cargo_bins: {} },
+  }));
+  fileSystem.writePrivateFile(path.join(directory, 'devcontainer.json'), JSON.stringify({
+    ...base,
+    dockerComposeFile: [path.join(options.workspace, '.devcontainer', 'docker-compose.yml'), compose],
+  }));
+}
+
+function readEnvironmentManifest(
+  manifest: string,
+  fileSystem: CiFileSystem,
+): { readonly image: string; readonly id: string } {
+  const value: unknown = JSON.parse(fileSystem.readFile(manifest));
+  if (!isRecord(value) || typeof value.image !== 'string' || !artifactImagePattern.test(value.image) ||
+      typeof value.id !== 'string') {
+    throw new Error('Invalid source environment artifact manifest.');
+  }
+  return { image: value.image, id: requireImageId(value.id) };
+}
+
+function verifyEnvironmentImage(image: string, expectedId: string, runner: CommandRunner): void {
+  const actual = requireImageId(runChecked(runner, 'docker', [
+    'image', 'inspect', '--format', '{{ .Id }}', image,
+  ], { stdout: 'capture' }).stdout);
+  if (actual !== expectedId) throw new Error('Source environment image identity mismatch.');
+}
+
+function requireArtifactKey(key: string): string {
+  if (!artifactKeyPattern.test(key) || key.includes('..')) {
+    throw new Error(`Invalid CI artifact key: ${key}`);
+  }
+  return key;
+}
+
+function requireImageId(id: string): string {
+  const normalized = id.trim();
+  if (!imageIdPattern.test(normalized)) throw new Error(`Invalid Docker image ID: ${id}`);
+  return normalized;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function inspectStartedContainer(
@@ -423,11 +750,13 @@ function removeComposeProjects(
   projects: ReadonlySet<string>,
   workspace: string,
   runner: CommandRunner,
+  fileSystem: CiFileSystem,
 ): void {
   const devcontainerDirectory = path.join(workspace, '.devcontainer');
   const composeFile = path.join(devcontainerDirectory, 'docker-compose.yml');
+  const runtimeFile = path.join(workspace, '.temp', 'ci', 'compose.json');
   for (const project of projects) {
-    runChecked(runner, 'docker', [
+    const args = [
       'compose',
       '--project-name',
       project,
@@ -435,10 +764,12 @@ function removeComposeProjects(
       devcontainerDirectory,
       '--file',
       composeFile,
+      ...(fileSystem.fileExists(runtimeFile) ? ['--file', runtimeFile] : []),
       'down',
       '--volumes',
       '--remove-orphans',
-    ]);
+    ];
+    runChecked(runner, 'docker', args);
   }
 }
 

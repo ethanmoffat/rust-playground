@@ -1,0 +1,28 @@
+[package]
+name = "arrowcol-buffer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded zero-copy Arrow batch buffering and durable publication coordination"
+readme = "README.md"
+
+[dependencies]
+arrow = { version = "58.3", default-features = false }
+arrowcol-catalog = { path = "../arrowcol-catalog" }
+arrowcol-protocol = { path = "../arrowcol-protocol" }
+arrowcol-receipts = { path = "../arrowcol-receipts" }
+arrow-deltalake = { path = "../arrow-deltalake" }
+async-trait = "0.1"
+thiserror.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+uuid = "1"
+
+[dev-dependencies]
+anyhow.workspace = true
+futures = "0.3"
+
+[lints]
+workspace = true

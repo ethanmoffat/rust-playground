@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  createRegistryBranchTag,
   createRegistryImage,
   createRegistryTagMetadata,
   encodePackageName,
@@ -210,13 +211,13 @@ test('creates reusable branch, immutable SHA, and main/latest metadata', () => {
     gitSha: sha,
   });
 
-  assert.equal(metadata.branchTag, 'main');
+  assert.equal(metadata.branchTag, 'branch-main');
   assert.equal(metadata.gitSha, sha.toLowerCase());
   assert.equal(metadata.shaTag, `sha-${sha.toLowerCase()}`);
   assert.equal(metadata.isDefaultBranch, true);
   assert.equal(metadata.publishLatest, true);
   assert.deepEqual(metadata.tags, [
-    { immutable: false, kind: 'branch', value: 'main' },
+    { immutable: false, kind: 'branch', value: 'branch-main' },
     {
       immutable: true,
       kind: 'git-sha',
@@ -225,7 +226,7 @@ test('creates reusable branch, immutable SHA, and main/latest metadata', () => {
     { immutable: false, kind: 'latest', value: 'latest' },
   ]);
   assert.deepEqual(metadata.values, [
-    'main',
+    'branch-main',
     `sha-${sha.toLowerCase()}`,
     'latest',
   ]);
@@ -238,10 +239,14 @@ test('sanitizes feature branches without publishing latest', () => {
   });
 
   assert.equal(sanitizeBranchName('Feature/Add Registry@V2'), 'feature-add-registry-v2');
-  assert.equal(metadata.branchTag, 'feature-add-registry-v2');
+  assert.equal(
+    createRegistryBranchTag('Feature/Add Registry@V2'),
+    'branch-feature-add-registry-v2',
+  );
+  assert.equal(metadata.branchTag, 'branch-feature-add-registry-v2');
   assert.equal(metadata.publishLatest, false);
   assert.deepEqual(metadata.values, [
-    'feature-add-registry-v2',
+    'branch-feature-add-registry-v2',
     `sha-${'b'.repeat(40)}`,
   ]);
   assert.throws(
@@ -252,6 +257,18 @@ test('sanitizes feature branches without publishing latest', () => {
       }),
     /full 40- or 64-character/u,
   );
+});
+
+test('bounds branch aliases with a deterministic collision-resistant suffix', () => {
+  const shared = `feature/${'a'.repeat(180)}`;
+  const first = createRegistryBranchTag(`${shared}-one`);
+  const repeated = createRegistryBranchTag(`${shared}-one`);
+  const second = createRegistryBranchTag(`${shared}-two`);
+
+  assert.equal(first.length, 128);
+  assert.match(first, /^branch-[a-z0-9-]+-[a-f0-9]{16}$/u);
+  assert.equal(repeated, first);
+  assert.notEqual(second, first);
 });
 
 test('normalizes GHCR coordinates and encodes nested package names', () => {

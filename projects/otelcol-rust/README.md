@@ -8,6 +8,7 @@ Arrow/Delta SDK and adapter live in rust-playground, not in the fork.
 git submodule update --init --recursive
 npx --no-install nx run otelcol-rust:build
 npx --no-install nx run otelcol-rust:config-check
+npx --no-install nx run otelcol-rust:image
 npx --no-install nx run otelcol-rust:image-smoke
 ```
 
@@ -33,8 +34,7 @@ prevent false joins across cores and after restart. This is an experimental
 append-only local writer, not a production or cross-table durability guarantee.
 
 `otelcol-rust:run` is for a native collector invocation; its config expects a
-writable `/onelake`. Prefer `loadtest:up` for the managed local mount and sample
-traffic. Native build artifacts stay in root `target/`.
+writable `/onelake`.  Native build artifacts stay in root `target/`.
 
 ## Toolchain and build prerequisites
 
@@ -45,7 +45,17 @@ Native builds need `protoc`; the source devcontainer includes
 or install that package before native collector builds. The collector
 Dockerfile includes its own prerequisites.
 
-## Editing the fork
+The runtime image is pinned to `linux/amd64`, runs as UID/GID `10001`, keeps
+the checked-in configuration read-only, and owns writable `/onelake`. The image
+smoke target validates the DFE capability graph, starts the collector without
+cloud credentials, and requires pipeline readiness through the admin API.
+Publication is clean-worktree guarded:
+
+```bash
+npx --no-install nx run otelcol-rust:publish
+```
+
+## Editing the submodule
 
 Initialize the full source and nested proto submodules after cloning or
 switching to this change:
@@ -55,34 +65,35 @@ git submodule update --init --recursive
 ```
 
 CI checks out the committed gitlink SHA, not a moving branch tip. Ordinary
-initialization leaves the submodule detached. Attach it to the exploration
-branch before local development:
+initialization leaves the submodule detached. Create a local working branch
+before editing:
 
 ```bash
-git -C submodules/otel-arrow switch dev/mdrrahman/explore
+git -C submodules/otel-arrow switch -c arrowcol-work
 ```
 
-If that branch is not yet local, create it from the remote tracking branch:
+If the local branch already exists:
 
 ```bash
-git -C submodules/otel-arrow switch --track origin/dev/mdrrahman/explore
+git -C submodules/otel-arrow switch arrowcol-work
 ```
 
 Native and image builds consume local source, including uncommitted edits;
 no remote Cargo git dependency bypasses the submodule. After editing, rebuild
-and restart the two-container demo with `npx --no-install nx run loadtest:up`.
+the images you use.
 See [loadtest](../loadtest/README.md) for observing and testing the result.
 
-To incorporate remote changes without discarding local work:
+To inspect and deliberately move to a reviewed upstream commit without
+discarding local work:
 
 ```bash
 git -C submodules/otel-arrow fetch origin
-git -C submodules/otel-arrow switch dev/mdrrahman/explore
-git -C submodules/otel-arrow merge --ff-only origin/dev/mdrrahman/explore
+git -C submodules/otel-arrow log --oneline --decorate -20 origin/main
+git -C submodules/otel-arrow merge --ff-only <reviewed-commit>
 git submodule update --init --recursive
 ```
 
-Push your collector commits to the fork first, then stage and commit
+Push your collector commits to an authorized remote first, then stage and commit
 `submodules/otel-arrow` in rust-playground to pin the new SHA. Run
 `npx --no-install nx run loadtest:e2e` before pushing the superproject.
 Do not use `git submodule update --remote` in CI or reset a dirty submodule.

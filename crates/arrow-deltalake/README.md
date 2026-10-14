@@ -45,6 +45,39 @@ async fn append(batch: &arrow::array::RecordBatch) -> anyhow::Result<()> {
 
 Standalone `flush` / `close` commits immediately; no collection window.
 
+## Completion accounting and adaptive rotation
+
+Every successful batch write is checked into per-file counters before it is
+reported as accepted. `CompletedFile::observation()` returns a path-independent
+`{ rows, input_bytes, parquet_bytes }` value; `StagedAppend::observation()` makes
+the same counters available before Delta publication. Input bytes describe the
+caller's logical Arrow slices (including nested validity and values), not
+allocator capacity or Delta's normalized physical columns. Shared buffers count
+once per logical reference, so the value remains useful as the denominator for
+Parquet compression and file-size control.
+
+`AdaptiveFileSizeEstimator` learns only from completed files. It owns no
+`RecordBatch` and returns a bounded logical-input threshold for the caller's
+next file:
+
+```rust
+use arrow_deltalake::sizing::{
+    AdaptiveFileSizeConfig, AdaptiveFileSizeEstimator,
+};
+
+let mut sizing = AdaptiveFileSizeEstimator::new(
+    AdaptiveFileSizeConfig::default(), // 128 MiB compressed target
+)?;
+let completed = writer.finish().await?;
+let next_input_target = sizing.observe(completed.observation())?;
+```
+
+The configuration includes minimum/maximum input clamps, a finite cold-start
+Parquet/input ratio, conservative EWMA weight, and ratio bounds. Zero counters,
+NaN/infinite settings, inverted bounds, and unsafe divisions are rejected.
+Callers can use `record_batch_logical_bytes`, or the streaming writers'
+`input_bytes_written()`, to compare the current file with the returned target.
+
 ## Cross-core batching
 
 ```text
@@ -107,6 +140,21 @@ ownership is released.
 Data files are synced before publication. Conflicts and uncertain outcomes
 are explicit errors; orphan files remain for inspection. The 10-second
 collection window is not a visibility bound: dependency waves add latency.
+
+## Publication fencing
+
+`PublicationFence` is a synchronous, storage-agnostic hook for caller-owned
+lease or generation state. Open with `DeltaTable::open_with_fence` or
+`BatchedTable::open_with_fence`; after the append transaction and file actions
+are prepared, the hook runs under the local commit lock immediately before the
+versioned Delta log commit. The crate has no SQL/client dependency and performs
+no fence retry.
+
+A rejected batched transaction is never made visible. Every receipt in that
+transaction receives `CommitReceiptError::PublicationFenced` through
+`wait_typed()`; the coordinator is then poisoned just like other uncertain or
+commit failures. Existing `wait()` remains available and wraps the typed error
+in `anyhow::Error`.
 
 ## Arrow representation
 

@@ -11,6 +11,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  CommandError,
   type CommandOptions,
   type CommandResult,
   type CommandRunner,
@@ -76,6 +77,7 @@ test('reports tracked and untracked changes plus the tracked diff', () => {
   const runner = new FakeRunner([
     success('generated.ts\ntracked.rs\n'),
     success('diff --git a/tracked.rs b/tracked.rs\n'),
+    success('diff --git a/staged.rs b/staged.rs\n'),
   ]);
   const output = new FakeOutput();
 
@@ -83,10 +85,11 @@ test('reports tracked and untracked changes plus the tracked diff', () => {
   assert.match(output.errors.join(''), /generated\.ts/u);
   assert.match(output.errors.join(''), /tracked\.rs/u);
   assert.match(output.errors.join(''), /diff --git/u);
+  assert.match(output.errors.join(''), /Tracked staged diff/u);
   runner.assertComplete();
 });
 
-test('honors repository ignore rules through git ls-files', () => {
+test('checks index, worktree, and submodules while honoring Git ignore rules', () => {
   const runner = new FakeRunner([success()]);
 
   verifyCleanWorktree(runner);
@@ -94,15 +97,22 @@ test('honors repository ignore rules through git ls-files', () => {
   assert.deepEqual(runner.calls[0], {
     command: 'git',
     args: [
-      'ls-files',
-      '--other',
-      '--modified',
-      '--directory',
-      '--exclude-standard',
-      '--no-empty-directory',
+      'status',
+      '--porcelain=v1',
+      '--untracked-files=normal',
+      '--ignore-submodules=none',
     ],
     options: { stdout: 'capture' },
   });
+  runner.assertComplete();
+});
+
+test('propagates Git failures instead of accepting an unknown worktree state', () => {
+  const runner = new FakeRunner([{ exitCode: 7, stdout: '', stderr: 'Git failed' }]);
+  assert.throws(
+    () => verifyCleanWorktree(runner),
+    (error: unknown) => error instanceof CommandError && error.exitCode === 7,
+  );
   runner.assertComplete();
 });
 
@@ -171,6 +181,39 @@ test('detects real artifacts, ignores ignored files, and cleans its fixture', ()
 
     rmSync(untrackedFile);
     assert.equal(verifyCleanWorktree(runner, undefined, repository), true);
+
+    writeFileSync(trackedFile, 'staged\n');
+    git(['add', 'tracked.txt']);
+    const stagedOutput = new FakeOutput();
+    assert.equal(verifyCleanWorktree(runner, stagedOutput, repository), false);
+    assert.match(stagedOutput.errors.join(''), /Tracked staged diff/u);
+    assert.match(stagedOutput.errors.join(''), /\+staged/u);
+
+    // A worktree restored to HEAD must not hide a different staged version.
+    writeFileSync(trackedFile, 'clean\n');
+    assert.equal(verifyCleanWorktree(runner, new FakeOutput(), repository), false);
+    git(['add', 'tracked.txt']);
+    assert.equal(verifyCleanWorktree(runner, undefined, repository), true);
+
+    rmSync(trackedFile);
+    const deletedOutput = new FakeOutput();
+    assert.equal(verifyCleanWorktree(runner, deletedOutput, repository), false);
+    assert.match(deletedOutput.errors.join(''), /tracked\.txt/u);
+    git(['add', 'tracked.txt']);
+    assert.equal(verifyCleanWorktree(runner, new FakeOutput(), repository), false);
+    writeFileSync(trackedFile, 'clean\n');
+    git(['add', 'tracked.txt']);
+
+    git(['mv', 'tracked.txt', 'renamed.txt']);
+    const renamedOutput = new FakeOutput();
+    assert.equal(verifyCleanWorktree(runner, renamedOutput, repository), false);
+    assert.match(renamedOutput.errors.join(''), /renamed\.txt/u);
+    git(['mv', 'renamed.txt', 'tracked.txt']);
+    assert.equal(verifyCleanWorktree(runner, undefined, repository), true);
+
+    writeFileSync(untrackedFile, 'staged addition\n');
+    git(['add', 'generated.txt']);
+    assert.equal(verifyCleanWorktree(runner, new FakeOutput(), repository), false);
   } finally {
     rmSync(repository, { force: true, recursive: true });
     rmSync(scratchRoot, { force: true, recursive: true });
