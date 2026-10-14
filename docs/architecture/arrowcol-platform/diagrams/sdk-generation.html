@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Arrowcol | One schema. Two typed SDKs.</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0b1220; color: #ecf3ff; font-family: system-ui, sans-serif; }
+    main { max-width: 1360px; margin: auto; padding: 38px 32px 24px; }
+    header { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 22px; }
+    .eyebrow { color: #76dccb; font-size: 11px; font-weight: 650; letter-spacing: 2px; margin-bottom: 10px; }
+    h1 { font-size: clamp(30px, 3.8vw, 46px); line-height: 1.15; letter-spacing: -1.5px; margin: 0 0 10px; }
+    header p { margin: 0; color: #b1bfd4; font-size: 16px; }
+    code { font-family: ui-monospace, monospace; }
+    .setting { color: #b8c7dd; font-size: 12px; padding: 9px 13px; border: 1px solid #35465f; border-radius: 8px; white-space: nowrap; }
+    .canvas { overflow-x: auto; border: 1px solid #304159; border-radius: 18px; background: #101b2c; }
+    svg { display: block; width: 100%; min-width: 980px; }
+    svg text { font-family: system-ui, sans-serif; text-anchor: middle; }
+    .label { fill: #edf4ff; font-size: 20px; font-weight: 700; }
+    .small { fill: #b1bfd4; font-size: 13px; }
+    .tiny { fill: #91a7c4; font-size: 11px; }
+    .flow { font-size: 13px; font-weight: 650; }
+    .icon { fill: none; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+    .note { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; padding: 17px 4px; font-size: 13px; color: #b1bfd4; }
+    .note strong { color: #80e2b6; }
+    .warning { color: #edc58b; }
+    footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; color: #859bb9; font-size: 11px; }
+    a { color: #9cb5d4; text-underline-offset: 3px; }
+    a:focus-visible, .canvas:focus-visible { outline: 3px solid #73d5f7; outline-offset: 4px; }
+    @media (max-width: 700px) { main { padding: 24px 16px; } header { align-items: start; flex-direction: column; gap: 14px; } header p { font-size: 14px; } }
+    @media print { body { print-color-adjust: exact; -webkit-print-color-adjust: exact; } main { padding: 10px; } svg { min-width: 0; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div><div class="eyebrow">DDL -> IMMUTABLE ARTIFACTS -> TYPED CLIENTS</div><h1>One schema. Two typed SDKs.</h1><p>Normalize once, validate every artifact, render both languages.</p></div>
+    <code class="setting">custom renderers &middot; no protoc</code>
+  </header>
+  <div class="canvas" tabindex="0" role="region" aria-label="SDK generation diagram; scroll horizontally on small screens">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 720" role="img" aria-labelledby="diagram-title diagram-description">
+      <title id="diagram-title">Catalog DDL to immutable artifacts and generated SDKs</title>
+      <desc id="diagram-description">Flight SQL DDL normalizes into CatalogSchemaVersion. The SQL Server and Hive saga reserves a version, updates Hive, persists three artifacts, and activates the head. Canonical manifest JSON, Arrow IPC schema, and binary proto2 FileDescriptorSet are sibling artifacts. Exported bundles are regenerated and compared byte for byte. Custom renderers consume the normalized schema to create Rust and TypeScript packages with builders and Flight helpers, plus hashed manifests and descriptors. No protoc compilation or automatic registry publishing occurs. Clients own transport authentication and delivery retry decisions.</desc>
+      <defs>
+        <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r=".7" fill="#23354c"/></pattern>
+        <marker id="blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#79d6fa"/></marker>
+        <marker id="purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#bca8f7"/></marker>
+        <marker id="green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#80e2b6"/></marker>
+        <symbol id="ddl" viewBox="0 0 64 64"><path d="M14 9h27l9 9v37H14ZM41 9v10h9M21 28h22M21 36h22M21 44h14"/></symbol>
+        <symbol id="table" viewBox="0 0 64 64"><rect x="8" y="12" width="48" height="42" rx="4"/><path d="M8 25h48M8 39h48M24 25v29M40 25v29"/></symbol>
+        <symbol id="bundle" viewBox="0 0 64 64"><path d="M32 7 55 19v27L32 58 9 46V19Z"/><path d="M9 19l23 13 23-13M32 32v26M21 15l23 13"/></symbol>
+        <symbol id="validate" viewBox="0 0 64 64"><path d="M32 7 53 15v16c0 14-9 23-21 28C20 54 11 45 11 31V15Z"/><path d="m21 32 7 7 15-17"/></symbol>
+        <symbol id="code" viewBox="0 0 64 64"><path d="m20 15-14 17 14 17M44 15l14 17-14 17M38 9 26 55"/></symbol>
+        <symbol id="client" viewBox="0 0 64 64"><rect x="8" y="9" width="48" height="34" rx="5"/><path d="M24 55h16M32 43v12M21 21l-6 5 6 5M43 21l6 5-6 5M35 19l-6 14"/></symbol>
+      </defs>
+      <rect width="1240" height="720" fill="url(#grid)"/>
+      <rect x="32" y="30" width="1176" height="176" rx="20" fill="#122137" stroke="#354b67"/>
+      <text x="58" y="56" fill="#8ca5c7" font-size="11" letter-spacing="2" style="text-anchor:start">AUTHORITATIVE CATALOG / IMMUTABLE SCHEMA VERSION</text>
+      <rect x="52" y="78" width="220" height="104" rx="14" fill="#1b2d45" stroke="#567393"/>
+      <use href="#ddl" x="68" y="96" width="54" height="54" class="icon" stroke="#79d6fa"/>
+      <text x="192" y="117" class="label" style="font-size:17px">Flight SQL DDL</text>
+      <text x="192" y="141" class="tiny">CREATE / nullable ADD</text>
+      <text x="162" y="169" class="tiny">Only the maintained DDL subset</text>
+      <path d="M272 130H322" stroke="#79d6fa" stroke-width="3" marker-end="url(#blue)"/>
+      <rect x="322" y="78" width="300" height="104" rx="14" fill="#17343e" stroke="#76dccb"/>
+      <use href="#table" x="338" y="96" width="54" height="54" class="icon" stroke="#76dccb"/>
+      <text x="498" y="117" class="label" style="font-size:17px">CatalogSchemaVersion</text>
+      <text x="498" y="141" class="tiny">IDs / positions / numbers / fingerprint</text>
+      <text x="472" y="169" class="tiny">Exact Arrow mapping + nullability</text>
+      <path d="M622 130H672" stroke="#bca8f7" stroke-width="3" marker-end="url(#purple)"/>
+      <rect x="672" y="78" width="514" height="104" rx="14" fill="#1b2d45" stroke="#567393"/>
+      <image href="../../loadtest/assets/microsoft-sql-server.svg" x="689" y="98" width="48" height="48"/>
+      <image href="../../loadtest/assets/apache-hive.svg" x="751" y="98" width="48" height="48"/>
+      <text x="987" y="117" class="label" style="font-size:18px">SQL + Hive durable saga</text>
+      <text x="987" y="143" class="small">Reserve -> Hive CAS -> artifacts -> activate</text>
+      <text x="929" y="169" class="tiny">Recoverable control-plane steps; no ingest deduplication</text>
+
+      <path d="M929 182V233H223V264" fill="none" stroke="#bca8f7" stroke-width="2.5" marker-end="url(#purple)"/>
+      <path d="M620 233V264" stroke="#bca8f7" stroke-width="2.5" marker-end="url(#purple)"/>
+      <path d="M929 233H1017V264" fill="none" stroke="#bca8f7" stroke-width="2.5" marker-end="url(#purple)"/>
+      <rect x="416" y="218" width="408" height="27" rx="6" fill="#101b2c"/>
+      <text x="620" y="237" class="flow" fill="#bca8f7">Three sibling artifacts from one normalized schema</text>
+      <rect x="52" y="264" width="342" height="102" rx="14" fill="#1b2d45" stroke="#567393"/>
+      <use href="#ddl" x="70" y="284" width="50" height="50" class="icon" stroke="#bca8f7"/>
+      <text x="255" y="300" class="label" style="font-size:18px">manifest.json</text>
+      <text x="255" y="327" class="small">Canonical catalog schema</text>
+      <text x="255" y="349" class="tiny">Preserves Arrow-specific details</text>
+      <rect x="449" y="264" width="342" height="102" rx="14" fill="#1b2d45" stroke="#567393"/>
+      <use href="#table" x="467" y="284" width="50" height="50" class="icon" stroke="#79d6fa"/>
+      <text x="652" y="300" class="label" style="font-size:18px">schema.arrow</text>
+      <text x="652" y="327" class="small">Exact Arrow IPC schema</text>
+      <text x="652" y="349" class="tiny">No row payload</text>
+      <rect x="846" y="264" width="342" height="102" rx="14" fill="#1b2d45" stroke="#567393"/>
+      <use href="#code" x="864" y="284" width="50" height="50" class="icon" stroke="#bca8f7"/>
+      <text x="1049" y="300" class="label" style="font-size:18px">descriptor.pb</text>
+      <text x="1049" y="327" class="small">Binary proto2 FileDescriptorSet</text>
+      <text x="1049" y="349" class="tiny">Not .proto source; no protoc</text>
+      <path d="M223 366V395H1017V366" fill="none" stroke="#bca8f7" stroke-width="2.5"/>
+      <path d="M620 366V395" stroke="#bca8f7" stroke-width="2.5"/>
+      <text x="928" y="418" class="tiny">Export one immutable version</text>
+
+      <rect x="52" y="428" width="342" height="172" rx="18" fill="#173a35" stroke="#80e2b6" stroke-width="2"/>
+      <use href="#validate" x="80" y="451" width="58" height="58" class="icon" stroke="#80e2b6"/>
+      <text x="261" y="480" class="label" style="font-size:18px">Validate bundle</text>
+      <text x="261" y="504" class="small">Regenerate + compare bytes</text>
+      <text x="223" y="549" class="small">Rebuild invariants and fingerprint</text>
+      <text x="223" y="574" class="tiny">Reject edited / inconsistent / lossy artifacts</text>
+      <path d="M223 395V428" fill="none" stroke="#bca8f7" stroke-width="2.5" marker-end="url(#purple)"/>
+      <path d="M394 514H449" stroke="#80e2b6" stroke-width="3" marker-end="url(#green)"/>
+      <rect x="449" y="428" width="342" height="172" rx="18" fill="#272944" stroke="#8f81c5" stroke-width="2"/>
+      <use href="#code" x="477" y="451" width="58" height="58" class="icon" stroke="#bca8f7"/>
+      <text x="658" y="480" class="label" style="font-size:18px">Custom renderers</text>
+      <text x="658" y="504" class="small">Read the normalized schema</text>
+      <text x="620" y="549" class="small">Typed builders + Arrow + Flight helpers</text>
+      <text x="620" y="574" class="tiny">Supported types only; fail closed on collisions</text>
+      <path d="M791 480H846" stroke="#bca8f7" stroke-width="3" marker-end="url(#purple)"/>
+      <path d="M791 553H846" stroke="#bca8f7" stroke-width="3" marker-end="url(#purple)"/>
+      <rect x="846" y="428" width="342" height="78" rx="14" fill="#1b2d45" stroke="#567393"/>
+      <use href="#bundle" x="864" y="441" width="50" height="50" class="icon" stroke="#bca8f7"/>
+      <text x="1049" y="459" class="label" style="font-size:18px">Rust SDK</text>
+      <text x="1049" y="484" class="small">Cargo package + generated tests</text>
+      <rect x="846" y="522" width="342" height="78" rx="14" fill="#1b2d45" stroke="#567393"/>
+      <use href="#bundle" x="864" y="535" width="50" height="50" class="icon" stroke="#79d6fa"/>
+      <text x="1049" y="553" class="label" style="font-size:18px">TypeScript SDK</text>
+      <text x="1049" y="578" class="small">npm package + generated tests</text>
+
+      <rect x="52" y="632" width="736" height="62" rx="12" fill="#14263b" stroke="#415d7d"/>
+      <text x="420" y="657" class="small">Stage output -> sdk-manifest + descriptors -> exact-byte check -> deterministic archive</text>
+      <text x="420" y="680" class="tiny">Gitignored .temp / target. Retain historical packages elsewhere. No automatic registry publishing.</text>
+      <path d="M1188 467H1200V619H1017" fill="none" stroke="#79d6fa" stroke-width="2.5"/>
+      <path d="M1017 600V620H1017V632" stroke="#79d6fa" stroke-width="2.5" marker-end="url(#blue)"/>
+      <rect x="846" y="632" width="342" height="62" rx="12" fill="#183249" stroke="#79d6fa"/>
+      <use href="#client" x="864" y="641" width="44" height="44" class="icon" stroke="#79d6fa"/>
+      <text x="1049" y="657" class="flow" fill="#79d6fa">Client -> Flight router</text>
+      <text x="1049" y="680" class="tiny">Client owns auth / retention / retries</text>
+    </svg>
+  </div>
+  <div class="note"><strong>Historical SDKs send their exact registered schema; nullable tail additions are null-filled.</strong><span class="warning">Protobuf is an artifact, not the SDK's code-generation source.</span></div>
+  <footer><span>Catalog and generator implementation, not a proposed pipeline</span><span><a href="../sdk-generation.md">Commands + layout</a> &middot; <a href="../catalog.md">Catalog contract</a> &middot; <a href="../README.md">Index</a> &middot; <a href="../../loadtest/assets/README.md">Icon sources</a></span></footer>
+</main>
+</body>
+</html>

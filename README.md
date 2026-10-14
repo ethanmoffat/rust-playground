@@ -83,7 +83,7 @@ source copy only after the receipt HTTP API reports `published` and
 `purge_allowed: true`, after the fenced Delta commit is durable. The DFE pool
 honestly reports only best-effort admission and has no receipt polling or
 at-least-once claim. See the
-[platform architecture](docs/architecture/arrowcol-platform.md) for the full
+[platform architecture](docs/architecture/arrowcol-platform/README.md) for the full
 catalog, router, receipt, fencing, buffering, and capability contracts.
 
 ### Finite qualification quick start

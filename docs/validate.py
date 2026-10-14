@@ -14,7 +14,13 @@ from urllib.parse import unquote
 ROOT = Path(__file__).resolve().parents[1]
 DOCUMENTS = [
     ROOT / "README.md",
-    ROOT / "docs/architecture/arrowcol-platform.md",
+    ROOT / "docs/architecture/arrowcol-platform/README.md",
+    ROOT / "docs/architecture/arrowcol-platform/routing.md",
+    ROOT / "docs/architecture/arrowcol-platform/catalog.md",
+    ROOT / "docs/architecture/arrowcol-platform/delivery-guarantees.md",
+    ROOT / "docs/architecture/arrowcol-platform/sdk-generation.md",
+    ROOT / "docs/architecture/arrowcol-platform/storage.md",
+    ROOT / "docs/architecture/arrowcol-platform/observability.md",
     ROOT / "docs/delivery-verification.md",
     ROOT / "docs/containers/publishing.md",
     ROOT / "projects/arrowcol-infra/README.md",
