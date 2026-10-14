@@ -276,17 +276,16 @@ async fn rejects_corrupt_and_non_delta_tables() -> Result<()> {
     std::fs::write(directory.path().join("raw.parquet"), b"not delta")?;
     let mut writer = DeltaTableWriter::open(directory.path())?;
     assert!(writer.write(&batch()?).await.is_err());
+    assert_eq!(std::fs::read(directory.path().join("raw.parquet"))?, b"not delta");
+    assert!(!directory.path().join("_delta_log").exists());
     drop(writer);
-    std::fs::remove_file(directory.path().join("raw.parquet"))?;
-    std::fs::create_dir(directory.path().join("_delta_log"))?;
-    std::fs::write(
-        directory.path().join("_delta_log/00000000000000000000.json"),
-        b"bad json",
-    )?;
-    let mut writer = DeltaTableWriter::open(directory.path())?;
+    let corrupt = tempfile::tempdir()?;
+    std::fs::create_dir(corrupt.path().join("_delta_log"))?;
+    std::fs::write(corrupt.path().join("_delta_log/00000000000000000000.json"), b"bad json")?;
+    let mut writer = DeltaTableWriter::open(corrupt.path())?;
     assert!(writer.write(&batch()?).await.is_err());
     assert_eq!(
-        std::fs::read(directory.path().join("_delta_log/00000000000000000000.json"))?,
+        std::fs::read(corrupt.path().join("_delta_log/00000000000000000000.json"))?,
         b"bad json"
     );
     Ok(())
