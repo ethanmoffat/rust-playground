@@ -8,9 +8,7 @@ use arrowcol_protocol::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel, IsolationLevel, Row};
-use tokio::net::TcpStream;
-use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use tiberius::{IsolationLevel, Row};
 use uuid::Uuid;
 
 use crate::{
@@ -19,7 +17,7 @@ use crate::{
     SubsystemState,
 };
 
-type SqlClient = Client<Compat<TcpStream>>;
+use arrowcol_sql_server::{ConnectionConfig, SqlClient, SqlConnection, SqlPool};
 
 const LEASE_COLUMNS: &str = "\
     implementation_pool, catalog_name, schema_name, table_name, lease_id, holder_instance_id, \
@@ -102,6 +100,18 @@ impl SqlServerRoutingConfig {
         self.command_timeout = command;
         self
     }
+
+    fn connection_config(&self) -> ConnectionConfig {
+        ConnectionConfig::new(
+            self.host.clone(),
+            self.port,
+            self.database.clone(),
+            self.username.clone(),
+            self.password.clone(),
+        )
+        .trust_server_certificate(self.trust_server_certificate)
+        .with_timeouts(self.connect_timeout, self.command_timeout)
+    }
 }
 
 /// SQL Server-backed multi-router coordination store.
@@ -118,8 +128,28 @@ impl SqlServerRoutingStore {
     #[must_use]
     pub const fn new(config: SqlServerRoutingConfig) -> Self {
         Self {
-            inner: RawSqlStore { config },
+            inner: RawSqlStore { config, pool: None },
         }
+    }
+
+    /// Uses a shared pool with the same credentials, TLS policy, and timeouts.
+    ///
+    /// Clones share this pool. Failed or cancelled operations discard their
+    /// connections. Cleanup failure after confirmed success is logged without
+    /// changing the operation's result.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a pool whose connection configuration differs from this store.
+    pub fn with_pool(mut self, pool: SqlPool) -> RoutingResult<Self> {
+        if !pool.matches_config(&self.inner.config.connection_config()) {
+            return Err(RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "SQL Server pool configuration does not match store configuration",
+            ));
+        }
+        self.inner.pool = Some(pool);
+        Ok(self)
     }
 }
 
@@ -194,39 +224,16 @@ impl RoutingStore for SqlServerRoutingStore {
 #[derive(Clone)]
 struct RawSqlStore {
     config: SqlServerRoutingConfig,
+    pool: Option<SqlPool>,
 }
 
 impl RawSqlStore {
-    async fn connect(&self) -> RoutingResult<SqlClient> {
-        let mut config = Config::new();
-        config.host(&self.config.host);
-        config.port(self.config.port);
-        config.database(&self.config.database);
-        config.authentication(AuthMethod::sql_server(
-            self.config.username.clone(),
-            self.config.password.clone(),
-        ));
-        config.encryption(EncryptionLevel::Required);
-        config.handshake_timeout(Some(self.config.connect_timeout));
-        config.command_timeout(Some(self.config.command_timeout));
-        if self.config.trust_server_certificate {
-            config.trust_cert();
+    async fn connect(&self) -> RoutingResult<SqlConnection> {
+        match &self.pool {
+            Some(pool) => pool.acquire().await,
+            None => SqlConnection::connect(&self.config.connection_config()).await,
         }
-        let address = config.get_addr();
-        let tcp = tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(&address))
-            .await
-            .map_err(|_| {
-                RoutingError::new(
-                    RoutingErrorKind::Database,
-                    format!("SQL Server TCP connection to {address} timed out"),
-                )
-            })?
-            .map_err(|cause| database_error("connect TCP", cause))?;
-        tcp.set_nodelay(true)
-            .map_err(|cause| database_error("configure TCP", cause))?;
-        Client::connect(config, tcp.compat_write())
-            .await
-            .map_err(|cause| database_error("login", cause))
+        .map_err(|error| database_error("acquire SQL Server connection", error))
     }
 }
 
@@ -240,9 +247,10 @@ impl RoutingStore for RawSqlStore {
         let heartbeat = datetime(registration.heartbeat_at_unix_ms)?;
         let expiry = datetime(registration.lease_expires_at_unix_ms)?;
         let mut client = self.connect().await?;
-        client
-            .execute(
-                "MERGE arrowcol.routing_collectors WITH (HOLDLOCK) AS target \
+        let result: RoutingResult<_> = async {
+            client
+                .execute(
+                    "MERGE arrowcol.routing_collectors WITH (HOLDLOCK) AS target \
                  USING (SELECT @P1 AS instance_id) AS source \
                  ON target.instance_id = source.instance_id \
                  WHEN MATCHED THEN UPDATE SET \
@@ -253,21 +261,32 @@ impl RoutingStore for RawSqlStore {
                     instance_id, instance_key, implementation_pool, flight_endpoint, catalog_capable, \
                     max_concurrent_streams, state, started_at_utc, heartbeat_at_utc, lease_expires_at_utc \
                  ) VALUES (@P1, @P2, @P3, @P4, @P5, @P6, 'ready', @P7, @P8, @P9);",
-                &[
-                    &instance_id,
-                    &registration.instance_key,
-                    &registration.implementation_pool.to_string(),
-                    &registration.flight_endpoint.to_string(),
-                    &registration.catalog_capable,
-                    &max_streams,
-                    &started,
-                    &heartbeat,
-                    &expiry,
-                ],
-            )
-            .await
-            .map_err(|cause| database_error("register routing collector", cause))?;
-        Ok(())
+                    &[
+                        &instance_id,
+                        &registration.instance_key,
+                        &registration.implementation_pool.to_string(),
+                        &registration.flight_endpoint.to_string(),
+                        &registration.catalog_capable,
+                        &max_streams,
+                        &started,
+                        &heartbeat,
+                        &expiry,
+                    ],
+                )
+                .await
+                .map_err(|cause| database_error("register routing collector", cause))?;
+            Ok(())
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "register_collector",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn heartbeat_collector(
@@ -286,27 +305,39 @@ impl RoutingStore for RawSqlStore {
         let heartbeat = datetime(heartbeat_at)?;
         let expiry = datetime(lease_expires_at)?;
         let mut client = self.connect().await?;
-        let row = client
-            .query(
-                "UPDATE arrowcol.routing_collectors \
+        let result: RoutingResult<_> = async {
+            let row = client
+                .query(
+                    "UPDATE arrowcol.routing_collectors \
                  SET heartbeat_at_utc = @P2, lease_expires_at_utc = @P3 \
                  OUTPUT INSERTED.instance_id \
                  WHERE instance_id = @P1 AND state IN ('ready', 'draining') \
                    AND heartbeat_at_utc <= @P2 AND @P3 > @P2;",
-                &[&id, &heartbeat, &expiry],
-            )
-            .await
-            .map_err(|cause| database_error("heartbeat routing collector", cause))?
-            .into_row()
-            .await
-            .map_err(|cause| database_error("read routing heartbeat result", cause))?;
-        if row.is_none() {
-            return Err(RoutingError::new(
-                RoutingErrorKind::Conflict,
-                "collector heartbeat was fenced or regressed",
-            ));
+                    &[&id, &heartbeat, &expiry],
+                )
+                .await
+                .map_err(|cause| database_error("heartbeat routing collector", cause))?
+                .into_row()
+                .await
+                .map_err(|cause| database_error("read routing heartbeat result", cause))?;
+            if row.is_none() {
+                return Err(RoutingError::new(
+                    RoutingErrorKind::Conflict,
+                    "collector heartbeat was fenced or regressed",
+                ));
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "heartbeat_collector",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn set_collector_state(
@@ -319,26 +350,38 @@ impl RoutingStore for RawSqlStore {
         let changed = datetime(changed_at)?;
         let state = collector_state_text(state);
         let mut client = self.connect().await?;
-        let row = client
-            .query(
-                "UPDATE arrowcol.routing_collectors \
+        let result: RoutingResult<_> = async {
+            let row = client
+                .query(
+                    "UPDATE arrowcol.routing_collectors \
                  SET state = @P2, heartbeat_at_utc = @P3 \
                  OUTPUT INSERTED.instance_id \
                  WHERE instance_id = @P1 AND heartbeat_at_utc <= @P3;",
-                &[&id, &state, &changed],
-            )
-            .await
-            .map_err(|cause| database_error("set routing collector state", cause))?
-            .into_row()
-            .await
-            .map_err(|cause| database_error("read routing collector state result", cause))?;
-        if row.is_none() {
-            return Err(RoutingError::new(
-                RoutingErrorKind::Conflict,
-                "collector state change was fenced or regressed",
-            ));
+                    &[&id, &state, &changed],
+                )
+                .await
+                .map_err(|cause| database_error("set routing collector state", cause))?
+                .into_row()
+                .await
+                .map_err(|cause| database_error("read routing collector state result", cause))?;
+            if row.is_none() {
+                return Err(RoutingError::new(
+                    RoutingErrorKind::Conflict,
+                    "collector state change was fenced or regressed",
+                ));
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "set_collector_state",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn publish_pressure(&self, snapshot: &RichPressureSnapshot) -> RoutingResult<()> {
@@ -359,6 +402,7 @@ impl RoutingStore for RawSqlStore {
         }
         let values = SnapshotSqlValues::try_from(snapshot)?;
         let mut client = self.connect().await?;
+        let result: RoutingResult<_> = async {
         client
             .begin_transaction_with_isolation(IsolationLevel::ReadCommitted)
             .await
@@ -440,13 +484,25 @@ impl RoutingStore for RawSqlStore {
         }
         .await;
         finish_transaction(&mut client, result, "publish routing pressure").await
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "publish_pressure",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn load_view(&self, loaded_at: UnixMillis) -> RoutingResult<RoutingView> {
         let mut client = self.connect().await?;
-        let rows = client
-            .query(
-                "SELECT c.instance_id, c.instance_key, c.implementation_pool, c.flight_endpoint, \
+        let result: RoutingResult<_> = async {
+            let rows = client
+                .query(
+                    "SELECT c.instance_id, c.instance_key, c.implementation_pool, c.flight_endpoint, \
                         c.catalog_capable, c.max_concurrent_streams, c.state, c.started_at_utc, \
                         c.heartbeat_at_utc, c.lease_expires_at_utc, \
                         p.observed_at_utc, p.cpu_utilization_bps, p.rss_bytes, p.rss_limit_bytes, \
@@ -460,58 +516,196 @@ impl RoutingStore for RawSqlStore {
                  FROM arrowcol.routing_collectors AS c \
                  LEFT JOIN arrowcol.routing_pressure_latest AS p \
                    ON p.collector_instance_id = c.instance_id;",
-                &[],
-            )
-            .await
-            .map_err(|cause| database_error("load routing collectors", cause))?
-            .into_first_result()
-            .await
-            .map_err(|cause| database_error("read routing collectors", cause))?;
-        let mut collectors = std::collections::BTreeMap::new();
-        for row in rows {
-            let record = collector_from_row(&row)?;
-            collectors.insert(record.registration.instance_id, record);
+                    &[],
+                )
+                .await
+                .map_err(|cause| database_error("load routing collectors", cause))?
+                .into_first_result()
+                .await
+                .map_err(|cause| database_error("read routing collectors", cause))?;
+            let mut collectors = std::collections::BTreeMap::new();
+            for row in rows {
+                let record = collector_from_row(&row)?;
+                collectors.insert(record.registration.instance_id, record);
+            }
+            let rows = client
+                .query(
+                    &format!("SELECT {LEASE_COLUMNS} FROM arrowcol.routing_table_leases;"),
+                    &[],
+                )
+                .await
+                .map_err(|cause| database_error("load routing leases", cause))?
+                .into_first_result()
+                .await
+                .map_err(|cause| database_error("read routing leases", cause))?;
+            let mut leases = std::collections::BTreeMap::new();
+            for row in rows {
+                let lease = lease_from_row(&row)?;
+                leases.insert(lease.key.clone(), lease);
+            }
+            Ok(RoutingView {
+                loaded_at_unix_ms: loaded_at,
+                collectors,
+                leases,
+            })
         }
-        let rows = client
-            .query(
-                &format!("SELECT {LEASE_COLUMNS} FROM arrowcol.routing_table_leases;"),
-                &[],
-            )
-            .await
-            .map_err(|cause| database_error("load routing leases", cause))?
-            .into_first_result()
-            .await
-            .map_err(|cause| database_error("read routing leases", cause))?;
-        let mut leases = std::collections::BTreeMap::new();
-        for row in rows {
-            let lease = lease_from_row(&row)?;
-            leases.insert(lease.key.clone(), lease);
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "load_view",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
         }
-        Ok(RoutingView {
-            loaded_at_unix_ms: loaded_at,
-            collectors,
-            leases,
-        })
+        Ok(value)
     }
 
     async fn claim_lease(&self, claim: &LeaseClaim) -> RoutingResult<RoutingLease> {
         validate_lease_window(claim.now_unix_ms, claim.expires_at_unix_ms)?;
         let mut client = self.connect().await?;
-        client
-            .begin_transaction_with_isolation(IsolationLevel::Serializable)
-            .await
-            .map_err(|cause| database_error("begin lease claim", cause))?;
-        let result = async {
-            if let Some(existing) = select_locked_lease(&mut client, &claim.key).await? {
-                if existing.is_valid_at(claim.now_unix_ms) {
-                    return Ok(existing);
+        let result: RoutingResult<_> = async {
+            client
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|cause| database_error("begin lease claim", cause))?;
+            let result = async {
+                if let Some(existing) = select_locked_lease(&mut client, &claim.key).await? {
+                    if existing.is_valid_at(claim.now_unix_ms) {
+                        return Ok(existing);
+                    }
+                    verify_candidate(
+                        &mut client,
+                        claim.candidate_instance_id,
+                        claim.key.implementation_pool,
+                        claim.minimum_snapshot_at_unix_ms,
+                        claim.now_unix_ms,
+                    )
+                    .await?;
+                    let epoch = existing.fencing_epoch.next().map_err(|cause| {
+                        RoutingError::new(
+                            RoutingErrorKind::CorruptState,
+                            format!("fencing epoch exhausted: {cause}"),
+                        )
+                    })?;
+                    let version = existing.lease_version.checked_add(1).ok_or_else(|| {
+                        RoutingError::new(RoutingErrorKind::CorruptState, "routing lease version exhausted")
+                    })?;
+                    update_lease_owner(
+                        &mut client,
+                        &claim.key,
+                        existing.lease_version,
+                        claim.candidate_instance_id,
+                        epoch,
+                        version,
+                        claim.now_unix_ms,
+                        claim.expires_at_unix_ms,
+                    )
+                    .await
+                } else {
+                    verify_candidate(
+                        &mut client,
+                        claim.candidate_instance_id,
+                        claim.key.implementation_pool,
+                        claim.minimum_snapshot_at_unix_ms,
+                        claim.now_unix_ms,
+                    )
+                    .await?;
+                    insert_lease(&mut client, claim).await
+                }
+            }
+            .await;
+            finish_transaction(&mut client, result, "claim routing lease").await
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "claim_lease",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
+    }
+
+    async fn begin_lease_drain(&self, request: &LeaseCas) -> RoutingResult<RoutingLease> {
+        let version = request
+            .expected_version
+            .checked_add(1)
+            .ok_or_else(|| RoutingError::new(RoutingErrorKind::CorruptState, "routing lease version exhausted"))?;
+        let now = datetime(request.now_unix_ms)?;
+        let mut client = self.connect().await?;
+        let result: RoutingResult<_> = async {
+            let rows = client
+                .query(
+                    &format!(
+                        "UPDATE arrowcol.routing_table_leases SET \
+                        state='draining', lease_version=@P5, renewed_at_utc=@P6, drain_started_at_utc=@P6 \
+                     OUTPUT INSERTED.{columns} \
+                     WHERE implementation_pool=@P1 AND catalog_name=@P2 AND schema_name=@P3 AND table_name=@P4 \
+                       AND lease_version=@P7 AND state='active';",
+                        columns = LEASE_COLUMNS.replace(", ", ", INSERTED.")
+                    ),
+                    &[
+                        &request.key.implementation_pool.to_string(),
+                        &request.key.table.catalog().as_str(),
+                        &request.key.table.schema().as_str(),
+                        &request.key.table.table().as_str(),
+                        &to_i64(version, "lease version")?,
+                        &now,
+                        &to_i64(request.expected_version, "expected lease version")?,
+                    ],
+                )
+                .await
+                .map_err(|cause| database_error("begin routing lease drain", cause))?
+                .into_first_result()
+                .await
+                .map_err(|cause| database_error("read routing lease drain result", cause))?;
+            let row = rows.into_iter().next().ok_or_else(|| {
+                RoutingError::new(
+                    RoutingErrorKind::Conflict,
+                    "routing lease changed before drain compare-and-set",
+                )
+            })?;
+            lease_from_row(&row)
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "begin_lease_drain",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
+    }
+
+    async fn transfer_drained_lease(&self, request: &LeaseTransfer) -> RoutingResult<RoutingLease> {
+        validate_lease_window(request.now_unix_ms, request.expires_at_unix_ms)?;
+        let mut client = self.connect().await?;
+        let result: RoutingResult<_> = async {
+            client
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|cause| database_error("begin routing lease transfer", cause))?;
+            let result = async {
+                let existing = select_locked_lease(&mut client, &request.key)
+                    .await?
+                    .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "routing lease was not found"))?;
+                if existing.state != LeaseState::Draining || existing.lease_version != request.expected_version {
+                    return Err(RoutingError::new(
+                        RoutingErrorKind::Conflict,
+                        "routing lease changed before transfer compare-and-set",
+                    ));
                 }
                 verify_candidate(
                     &mut client,
-                    claim.candidate_instance_id,
-                    claim.key.implementation_pool,
-                    claim.minimum_snapshot_at_unix_ms,
-                    claim.now_unix_ms,
+                    request.candidate_instance_id,
+                    request.key.implementation_pool,
+                    request.minimum_snapshot_at_unix_ms,
+                    request.now_unix_ms,
                 )
                 .await?;
                 let epoch = existing.fencing_epoch.next().map_err(|cause| {
@@ -525,121 +719,29 @@ impl RoutingStore for RawSqlStore {
                 })?;
                 update_lease_owner(
                     &mut client,
-                    &claim.key,
+                    &request.key,
                     existing.lease_version,
-                    claim.candidate_instance_id,
+                    request.candidate_instance_id,
                     epoch,
                     version,
-                    claim.now_unix_ms,
-                    claim.expires_at_unix_ms,
+                    request.now_unix_ms,
+                    request.expires_at_unix_ms,
                 )
                 .await
-            } else {
-                verify_candidate(
-                    &mut client,
-                    claim.candidate_instance_id,
-                    claim.key.implementation_pool,
-                    claim.minimum_snapshot_at_unix_ms,
-                    claim.now_unix_ms,
-                )
-                .await?;
-                insert_lease(&mut client, claim).await
             }
+            .await;
+            finish_transaction(&mut client, result, "transfer routing lease").await
         }
         .await;
-        finish_transaction(&mut client, result, "claim routing lease").await
-    }
-
-    async fn begin_lease_drain(&self, request: &LeaseCas) -> RoutingResult<RoutingLease> {
-        let version = request
-            .expected_version
-            .checked_add(1)
-            .ok_or_else(|| RoutingError::new(RoutingErrorKind::CorruptState, "routing lease version exhausted"))?;
-        let now = datetime(request.now_unix_ms)?;
-        let mut client = self.connect().await?;
-        let rows = client
-            .query(
-                &format!(
-                    "UPDATE arrowcol.routing_table_leases SET \
-                        state='draining', lease_version=@P5, renewed_at_utc=@P6, drain_started_at_utc=@P6 \
-                     OUTPUT INSERTED.{columns} \
-                     WHERE implementation_pool=@P1 AND catalog_name=@P2 AND schema_name=@P3 AND table_name=@P4 \
-                       AND lease_version=@P7 AND state='active';",
-                    columns = LEASE_COLUMNS.replace(", ", ", INSERTED.")
-                ),
-                &[
-                    &request.key.implementation_pool.to_string(),
-                    &request.key.table.catalog().as_str(),
-                    &request.key.table.schema().as_str(),
-                    &request.key.table.table().as_str(),
-                    &to_i64(version, "lease version")?,
-                    &now,
-                    &to_i64(request.expected_version, "expected lease version")?,
-                ],
-            )
-            .await
-            .map_err(|cause| database_error("begin routing lease drain", cause))?
-            .into_first_result()
-            .await
-            .map_err(|cause| database_error("read routing lease drain result", cause))?;
-        let row = rows.into_iter().next().ok_or_else(|| {
-            RoutingError::new(
-                RoutingErrorKind::Conflict,
-                "routing lease changed before drain compare-and-set",
-            )
-        })?;
-        lease_from_row(&row)
-    }
-
-    async fn transfer_drained_lease(&self, request: &LeaseTransfer) -> RoutingResult<RoutingLease> {
-        validate_lease_window(request.now_unix_ms, request.expires_at_unix_ms)?;
-        let mut client = self.connect().await?;
-        client
-            .begin_transaction_with_isolation(IsolationLevel::Serializable)
-            .await
-            .map_err(|cause| database_error("begin routing lease transfer", cause))?;
-        let result = async {
-            let existing = select_locked_lease(&mut client, &request.key)
-                .await?
-                .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "routing lease was not found"))?;
-            if existing.state != LeaseState::Draining || existing.lease_version != request.expected_version {
-                return Err(RoutingError::new(
-                    RoutingErrorKind::Conflict,
-                    "routing lease changed before transfer compare-and-set",
-                ));
-            }
-            verify_candidate(
-                &mut client,
-                request.candidate_instance_id,
-                request.key.implementation_pool,
-                request.minimum_snapshot_at_unix_ms,
-                request.now_unix_ms,
-            )
-            .await?;
-            let epoch = existing.fencing_epoch.next().map_err(|cause| {
-                RoutingError::new(
-                    RoutingErrorKind::CorruptState,
-                    format!("fencing epoch exhausted: {cause}"),
-                )
-            })?;
-            let version = existing
-                .lease_version
-                .checked_add(1)
-                .ok_or_else(|| RoutingError::new(RoutingErrorKind::CorruptState, "routing lease version exhausted"))?;
-            update_lease_owner(
-                &mut client,
-                &request.key,
-                existing.lease_version,
-                request.candidate_instance_id,
-                epoch,
-                version,
-                request.now_unix_ms,
-                request.expires_at_unix_ms,
-            )
-            .await
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "transfer_drained_lease",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
         }
-        .await;
-        finish_transaction(&mut client, result, "transfer routing lease").await
+        Ok(value)
     }
 }
 
@@ -982,7 +1084,13 @@ async fn finish_transaction<T>(
             Ok(value)
         }
         Err(error) => {
-            let _rollback = client.rollback_transaction().await;
+            if let Err(rollback_error) = client.rollback_transaction().await {
+                tracing::warn!(
+                    operation,
+                    error = %rollback_error,
+                    "SQL Server rollback failed; preserving primary operation error and discarding connection"
+                );
+            }
             Err(error)
         }
     }
@@ -1154,4 +1262,55 @@ fn database_error(operation: &str, cause: impl std::fmt::Display) -> RoutingErro
         RoutingErrorKind::Database,
         format!("SQL Server {operation} failed: {cause}"),
     )
+}
+
+#[cfg(test)]
+mod pooling_tests {
+    use super::*;
+    use arrowcol_sql_server::PoolConfig;
+
+    #[test]
+    fn pooling_requires_equivalent_connection_configuration() -> anyhow::Result<()> {
+        let config = SqlServerRoutingConfig::new("localhost", 1433, "catalog", "pool-user", "pool-secret")
+            .trust_server_certificate(true)
+            .with_timeouts(Duration::from_secs(3), Duration::from_secs(7));
+        let pool = SqlPool::new(
+            config.connection_config(),
+            PoolConfig {
+                max_size: 2,
+                acquire_timeout: Duration::from_secs(1),
+            },
+        )?;
+        let store = SqlServerRoutingStore::new(config.clone()).with_pool(pool.clone())?;
+        assert!(store.clone().inner.pool.is_some());
+        assert!(SqlServerRoutingStore::new(config.clone()).inner.pool.is_none());
+
+        for field in 0..8 {
+            let mut mismatch = config.clone();
+            match field {
+                0 => mismatch.host = "other-host".to_owned(),
+                1 => mismatch.port = 1434,
+                2 => mismatch.database = "other-database".to_owned(),
+                3 => mismatch.username = "other-user".to_owned(),
+                4 => mismatch.password = "other-secret".to_owned(),
+                5 => mismatch.trust_server_certificate = false,
+                6 => mismatch.connect_timeout = Duration::from_secs(4),
+                _ => mismatch.command_timeout = Duration::from_secs(8),
+            }
+            let Err(error) = SqlServerRoutingStore::new(mismatch).with_pool(pool.clone()) else {
+                anyhow::bail!("store accepted a mismatched pool");
+            };
+            assert_eq!(error.kind(), RoutingErrorKind::InvalidConfiguration);
+            assert!(!error.to_string().contains("pool-user"));
+            assert!(!error.to_string().contains("pool-secret"));
+            assert!(!error.to_string().contains("other-secret"));
+        }
+        assert_eq!(pool.stats().created, 0);
+        pool.close();
+        assert_eq!(
+            store.clone().inner.pool.as_ref().map(|pool| pool.stats().max_size),
+            Some(0)
+        );
+        Ok(())
+    }
 }

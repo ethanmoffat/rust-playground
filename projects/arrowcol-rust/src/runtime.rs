@@ -15,6 +15,7 @@ use arrowcol_flight::{
 use arrowcol_protocol::CollectorInstanceId;
 use arrowcol_receipts::{ReceiptStore, SqlServerReceiptConfig, SqlServerReceiptStore};
 use arrowcol_routing::{CollectorState, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
+use arrowcol_sql_server::{ConnectionConfig, PoolConfig, SqlPool};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -58,18 +59,45 @@ pub async fn run(config: CollectorConfig) -> Result<RunOutcome> {
         .context("SQL Server password secret is not UTF-8")?;
     let sql_connect = Duration::from_millis(config.sql_server.connect_timeout_ms);
     let sql_command = Duration::from_millis(config.sql_server.command_timeout_ms);
-
-    let catalog_store: Arc<dyn CatalogStore> = Arc::new(SqlServerCatalogStore::new(
-        CatalogSqlConfig::new(
-            &config.sql_server.host,
-            config.sql_server.port,
-            &config.sql_server.database,
-            &config.sql_server.username,
-            password.clone(),
+    let connection = ConnectionConfig::new(
+        &config.sql_server.host,
+        config.sql_server.port,
+        &config.sql_server.database,
+        &config.sql_server.username,
+        password.clone(),
+    )
+    .trust_server_certificate(config.sql_server.trust_server_certificate)
+    .with_timeouts(sql_connect, sql_command);
+    let create_pool = |max_size| {
+        SqlPool::new(
+            connection.clone(),
+            PoolConfig {
+                max_size,
+                acquire_timeout: Duration::from_millis(config.sql_server.pool.acquire_timeout_ms),
+            },
         )
-        .trust_server_certificate(config.sql_server.trust_server_certificate)
-        .with_timeouts(sql_connect, sql_command),
-    ));
+    };
+    let receipt_pool =
+        create_pool(config.sql_server.pool.receipts_max_size).context("create receipt SQL connection pool")?;
+    let routing_pool =
+        create_pool(config.sql_server.pool.routing_max_size).context("create routing SQL connection pool")?;
+    let catalog_pool =
+        create_pool(config.sql_server.pool.catalog_max_size).context("create catalog SQL connection pool")?;
+
+    let catalog_store: Arc<dyn CatalogStore> = Arc::new(
+        SqlServerCatalogStore::new(
+            CatalogSqlConfig::new(
+                &config.sql_server.host,
+                config.sql_server.port,
+                &config.sql_server.database,
+                &config.sql_server.username,
+                password.clone(),
+            )
+            .trust_server_certificate(config.sql_server.trust_server_certificate)
+            .with_timeouts(sql_connect, sql_command),
+        )
+        .with_pool(catalog_pool.clone())?,
+    );
     let metastore: Arc<dyn Metastore> = Arc::new(HiveMetastore::new(
         HiveMetastoreConfig::new(&config.hive.host, config.hive.port)
             .with_warehouse_root(&config.hive.warehouse_root)
@@ -98,32 +126,43 @@ pub async fn run(config: CollectorConfig) -> Result<RunOutcome> {
         .await
         .context("verify writable Delta root")?;
 
-    let receipt_store: Arc<dyn ReceiptStore> = Arc::new(SqlServerReceiptStore::new(
-        SqlServerReceiptConfig::new(
-            &config.sql_server.host,
-            config.sql_server.port,
-            &config.sql_server.database,
-            &config.sql_server.username,
-            password.clone(),
+    let receipt_store: Arc<dyn ReceiptStore> = Arc::new(
+        SqlServerReceiptStore::new(
+            SqlServerReceiptConfig::new(
+                &config.sql_server.host,
+                config.sql_server.port,
+                &config.sql_server.database,
+                &config.sql_server.username,
+                password.clone(),
+            )
+            .trust_server_certificate(config.sql_server.trust_server_certificate)
+            .with_timeouts(sql_connect, sql_command)
+            .with_batch_limits(config.receipts.mutation_batch_size, config.receipts.status_batch_size)?,
         )
-        .trust_server_certificate(config.sql_server.trust_server_certificate)
-        .with_timeouts(sql_connect, sql_command)
-        .with_batch_limits(config.receipts.mutation_batch_size, config.receipts.status_batch_size)?,
-    ));
-    let routing_store: Arc<dyn RoutingStore> = Arc::new(SqlServerRoutingStore::new(
-        SqlServerRoutingConfig::new(
-            &config.sql_server.host,
-            config.sql_server.port,
-            &config.sql_server.database,
-            &config.sql_server.username,
-            password,
+        .with_pool(receipt_pool.clone())?,
+    );
+    let routing_store: Arc<dyn RoutingStore> = Arc::new(
+        SqlServerRoutingStore::new(
+            SqlServerRoutingConfig::new(
+                &config.sql_server.host,
+                config.sql_server.port,
+                &config.sql_server.database,
+                &config.sql_server.username,
+                password,
+            )
+            .trust_server_certificate(config.sql_server.trust_server_certificate)
+            .with_timeouts(sql_connect, sql_command),
         )
-        .trust_server_certificate(config.sql_server.trust_server_certificate)
-        .with_timeouts(sql_connect, sql_command),
-    ));
+        .with_pool(routing_pool.clone())?,
+    );
 
     let drain = DrainController::new();
     let metrics = CollectorMetrics::new()?;
+    metrics.register_sql_pools(vec![
+        ("receipts", receipt_pool.clone()),
+        ("routing", routing_pool.clone()),
+        ("catalog", catalog_pool.clone()),
+    ])?;
     let activity = Arc::new(TableActivity::default());
     let leases = Arc::new(TableLeaseManager::new(
         Arc::clone(&receipt_store),
@@ -268,6 +307,9 @@ pub async fn run(config: CollectorConfig) -> Result<RunOutcome> {
     if !admin_task.is_finished() {
         let _ = admin_task.await;
     }
+    receipt_pool.close();
+    routing_pool.close();
+    catalog_pool.close();
 
     match (fatal, outcome) {
         (Some(fatal), Ok(outcome)) => Err(fatal.context(format!("collector stopped after {outcome:?}"))),

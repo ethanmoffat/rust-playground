@@ -14,6 +14,7 @@ use arrowcol_receipts::{
     FailureDisposition, OwnerRegistration, PublicationBatch, ReceiptErrorKind, ReceiptFailure, ReceiptStore,
     ReceiptVersion, SqlServerReceiptConfig, SqlServerReceiptStore, TableLeaseRequest, ValidatedDelivery,
 };
+use arrowcol_sql_server::{ConnectionConfig, PoolConfig, SqlPool};
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -21,14 +22,33 @@ use uuid::Uuid;
 
 type SqlClient = Client<Compat<TcpStream>>;
 
+static LIVE_RECEIPT_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the live arrowcol-infra SQL Server"]
 async fn live_receipts_prove_durability_races_and_hot_queries() -> anyhow::Result<()> {
+    live_receipts_case(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the live arrowcol-infra SQL Server"]
+async fn pooled_live_receipts_reuse_after_durability_races_and_errors() -> anyhow::Result<()> {
+    live_receipts_case(true).await
+}
+
+async fn live_receipts_case(pooled: bool) -> anyhow::Result<()> {
     if std::env::var("ARROWCOL_SQLSERVER_TEST").as_deref() != Ok("1") {
         return Ok(());
     }
+    // Reconciliation scans expired work across the database, not one fixture.
+    let _isolation = LIVE_RECEIPT_CASE.lock().await;
     let fixture = fixture().await?;
-    let store = Arc::new(SqlServerReceiptStore::new(sql_config()?));
+    let pool = pooled.then(sql_pool).transpose()?;
+    let mut store = SqlServerReceiptStore::new(sql_config()?);
+    if let Some(pool) = &pool {
+        store = store.with_pool(pool.clone())?;
+    }
+    let store = Arc::new(store.clone());
     seed_catalog(&fixture).await?;
     let owner = CollectorInstanceId::new();
     let start = now()?;
@@ -262,6 +282,15 @@ async fn live_receipts_prove_durability_races_and_hot_queries() -> anyhow::Resul
     assert_eq!(drain.active_receipts, 0);
     assert_eq!(drain.active_table_leases, 1);
     store.finish_owner_drain(owner, now()?).await?;
+    if let Some(pool) = pool {
+        let stats = pool.stats();
+        assert!(stats.reused > 0, "successful receipt operations must reuse sessions");
+        assert!(
+            stats.discarded > 0,
+            "failed receipt compare-and-set must discard sessions"
+        );
+        assert!(stats.size <= 2);
+    }
     Ok(())
 }
 
@@ -434,6 +463,30 @@ fn sql_config() -> anyhow::Result<SqlServerReceiptConfig> {
         secret_path(),
     )?
     .trust_server_certificate(true))
+}
+
+fn sql_pool() -> anyhow::Result<SqlPool> {
+    let host = std::env::var("ARROWCOL_SQLSERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let port = std::env::var("ARROWCOL_SQLSERVER_PORT")
+        .ok()
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(14_333);
+    let password = std::fs::read_to_string(secret_path())?;
+    Ok(SqlPool::new(
+        ConnectionConfig::new(
+            host,
+            port,
+            "arrowcol",
+            "arrowcol_app",
+            password.trim_end_matches(['\r', '\n']),
+        )
+        .trust_server_certificate(true),
+        PoolConfig {
+            max_size: 2,
+            acquire_timeout: Duration::from_secs(5),
+        },
+    )?)
 }
 
 async fn connect() -> anyhow::Result<SqlClient> {

@@ -3,6 +3,7 @@
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
   "projectType": "library",
   "sourceRoot": "crates/arrowcol-catalog/src",
+  "implicitDependencies": ["arrowcol-sql-server"],
   "namedInputs": {
     "default": [
       "{projectRoot}/**/*",

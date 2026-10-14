@@ -37,6 +37,11 @@ sql_server:
   trust_server_certificate: true
   connect_timeout_ms: 5000
   command_timeout_ms: 15000
+  pool:
+    receipts_max_size: 16
+    routing_max_size: 4
+    catalog_max_size: 4
+    acquire_timeout_ms: 5000
 
 hive:
   host: 127.0.0.1

@@ -51,4 +51,7 @@ test('collector policy provenance includes actual bounded flush/commit limits wi
   assert.equal(policies.direct.buffer.max_arrow_memory_per_flush, 536870912);
   assert.equal(policies.dataflow.commit.max_pending_files, 256);
   assert.equal(policies.direct.receipts.receipt_lease_duration_ms, 20000);
+  assert.deepEqual(policies.direct.sql_pool, {
+    receipts_max_size: 16, routing_max_size: 4, catalog_max_size: 4, acquire_timeout_ms: 5000,
+  });
 });

@@ -296,6 +296,9 @@ pub struct SqlServerConfig {
     pub connect_timeout_ms: u64,
     /// SQL command timeout.
     pub command_timeout_ms: u64,
+    /// Separate bounded connection pools for SQL operation roles.
+    #[serde(default)]
+    pub pool: SqlPoolSettings,
 }
 
 impl SqlServerConfig {
@@ -305,7 +308,58 @@ impl SqlServerConfig {
         nonempty(&self.username, "sql_server.username")?;
         nonempty_path(&self.password_file, "sql_server.password_file")?;
         positive(self.connect_timeout_ms, "sql_server.connect_timeout_ms")?;
-        positive(self.command_timeout_ms, "sql_server.command_timeout_ms")
+        positive(self.command_timeout_ms, "sql_server.command_timeout_ms")?;
+        self.pool.validate()
+    }
+}
+
+/// Per-role SQL connection budgets and checkout deadline.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SqlPoolSettings {
+    /// Maximum receipt connections, shared by admission and receipt control.
+    pub receipts_max_size: usize,
+    /// Maximum routing connections.
+    pub routing_max_size: usize,
+    /// Maximum catalog connections.
+    pub catalog_max_size: usize,
+    /// Maximum wait for a connection checkout.
+    pub acquire_timeout_ms: u64,
+}
+
+impl Default for SqlPoolSettings {
+    fn default() -> Self {
+        Self {
+            receipts_max_size: 16,
+            routing_max_size: 4,
+            catalog_max_size: 4,
+            acquire_timeout_ms: 5000,
+        }
+    }
+}
+
+impl SqlPoolSettings {
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (size, name) in [
+            (self.receipts_max_size, "sql_server.pool.receipts_max_size"),
+            (self.routing_max_size, "sql_server.pool.routing_max_size"),
+            (self.catalog_max_size, "sql_server.pool.catalog_max_size"),
+        ] {
+            positive(size, name)?;
+            if size > tokio::sync::Semaphore::MAX_PERMITS {
+                return Err(invalid(format!("{name} exceeds the supported connection limit")));
+            }
+        }
+        positive(self.acquire_timeout_ms, "sql_server.pool.acquire_timeout_ms")?;
+        if std::time::Instant::now()
+            .checked_add(Duration::from_millis(self.acquire_timeout_ms))
+            .is_none()
+        {
+            return Err(invalid(
+                "sql_server.pool.acquire_timeout_ms exceeds the supported deadline",
+            ));
+        }
+        Ok(())
     }
 }
 

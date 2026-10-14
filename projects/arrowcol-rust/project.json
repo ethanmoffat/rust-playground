@@ -10,6 +10,7 @@
     "arrowcol-protocol",
     "arrowcol-flight",
     "arrowcol-routing",
+    "arrowcol-sql-server",
     "arrow-deltalake",
     "arrowcol-infra"
   ],

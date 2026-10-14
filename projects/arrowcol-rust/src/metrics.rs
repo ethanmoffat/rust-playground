@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
 use arrowcol_flight::{PressureEvent, PressureHooks, StreamOutcome};
+use arrowcol_sql_server::SqlPool;
+use prometheus::core::{Collector, Desc};
+use prometheus::proto::{Counter, Gauge, LabelPair, Metric, MetricFamily, MetricType};
 use prometheus::{
     Encoder, IntCounter, IntCounterVec, IntGauge, Opts, Registry, TextEncoder, register_int_counter_vec_with_registry,
     register_int_counter_with_registry, register_int_gauge_with_registry,
@@ -109,6 +112,15 @@ impl CollectorMetrics {
         self.exported_rows.inc_by(rows);
     }
 
+    /// Registers fixed-role SQL pool snapshots without a sampling task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if pool metric registration fails.
+    pub fn register_sql_pools(&self, pools: Vec<(&'static str, SqlPool)>) -> Result<(), prometheus::Error> {
+        self.registry.register(Box::new(SqlPoolCollector::new(pools)?))
+    }
+
     /// Encodes Prometheus text exposition.
     ///
     /// # Errors
@@ -120,7 +132,120 @@ impl CollectorMetrics {
         TextEncoder::new().encode(&families, &mut output)?;
         Ok(output)
     }
+}
 
+struct SqlPoolCollector {
+    pools: Vec<(&'static str, SqlPool)>,
+    descriptors: Vec<Desc>,
+}
+
+const SQL_POOL_METRICS: [(&str, &str, MetricType); 9] = [
+    ("created_total", "SQL connections created", MetricType::COUNTER),
+    (
+        "acquired_total",
+        "Successful SQL connection checkouts",
+        MetricType::COUNTER,
+    ),
+    (
+        "reused_total",
+        "SQL checkouts reusing an existing connection",
+        MetricType::COUNTER,
+    ),
+    (
+        "discarded_total",
+        "SQL connections discarded rather than reused",
+        MetricType::COUNTER,
+    ),
+    (
+        "acquire_failures_total",
+        "Failed SQL connection checkouts",
+        MetricType::COUNTER,
+    ),
+    (
+        "acquire_wait_seconds_total",
+        "Cumulative SQL checkout wait in seconds",
+        MetricType::COUNTER,
+    ),
+    ("size", "Current SQL pool connection count", MetricType::GAUGE),
+    (
+        "available",
+        "SQL pool connections available for checkout",
+        MetricType::GAUGE,
+    ),
+    ("max_size", "Configured SQL pool connection limit", MetricType::GAUGE),
+];
+
+impl SqlPoolCollector {
+    fn new(pools: Vec<(&'static str, SqlPool)>) -> Result<Self, prometheus::Error> {
+        let descriptors = SQL_POOL_METRICS
+            .iter()
+            .map(|(name, help, _)| {
+                Desc::new(
+                    format!("arrowcol_direct_sql_pool_{name}"),
+                    (*help).to_owned(),
+                    vec!["role".to_owned()],
+                    Default::default(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { pools, descriptors })
+    }
+}
+
+impl Collector for SqlPoolCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        self.descriptors.iter().collect()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let snapshots = self
+            .pools
+            .iter()
+            .map(|(role, pool)| (*role, pool.stats()))
+            .collect::<Vec<_>>();
+        SQL_POOL_METRICS
+            .iter()
+            .enumerate()
+            .map(|(index, (name, help, kind))| {
+                let mut family = MetricFamily::default();
+                family.set_name(format!("arrowcol_direct_sql_pool_{name}"));
+                family.set_help((*help).to_owned());
+                family.set_field_type(*kind);
+                for (role, stats) in &snapshots {
+                    let value = match index {
+                        0 => stats.created as f64,
+                        1 => stats.acquired as f64,
+                        2 => stats.reused as f64,
+                        3 => stats.discarded as f64,
+                        4 => stats.acquire_failures as f64,
+                        5 => stats.acquire_wait_seconds,
+                        6 => stats.size as f64,
+                        7 => stats.available as f64,
+                        _ => stats.max_size as f64,
+                    };
+                    let mut label = LabelPair::default();
+                    label.set_name("role".to_owned());
+                    label.set_value((*role).to_owned());
+                    let mut metric = Metric::default();
+                    metric.set_label(vec![label]);
+                    if *kind == MetricType::COUNTER {
+                        let mut counter = Counter::default();
+                        counter.set_value(value);
+                        metric.set_counter(counter);
+                    } else {
+                        let mut gauge = Gauge::default();
+                        gauge.set_value(value);
+                        metric.set_gauge(gauge);
+                    }
+                    family.mut_metric().push(metric);
+                }
+                family
+            })
+            .collect()
+    }
+}
+
+impl CollectorMetrics {
     /// Returns cumulative admitted batch count.
     #[must_use]
     pub fn received_batches(&self) -> u64 {

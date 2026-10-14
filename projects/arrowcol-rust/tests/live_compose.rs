@@ -33,6 +33,7 @@ use arrowcol_rust::control::TableActivity;
 use arrowcol_rust::delta_sink::ProductionDeltaSink;
 use arrowcol_rust::ingest::DirectAdmission;
 use arrowcol_rust::lease::TableLeaseManager;
+use arrowcol_sql_server::{ConnectionConfig, PoolConfig, SqlPool};
 use futures::{StreamExt, TryStreamExt, stream};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tiberius::{AuthMethod as SqlAuthMethod, Client, Config as TiberiusConfig, EncryptionLevel};
@@ -48,17 +49,36 @@ type SqlClient = Client<Compat<TcpStream>>;
 async fn live_compose_end_to_end() -> Result<()> {
     let live = LiveConfig::load()?;
     let password = live.password()?;
-    let catalog: Arc<dyn CatalogStore> = Arc::new(SqlServerCatalogStore::new(
-        CatalogSqlConfig::new(
-            &live.sql_host,
-            live.sql_port,
-            &live.database,
-            &live.username,
-            password.clone(),
+    let connection = ConnectionConfig::new(
+        &live.sql_host,
+        live.sql_port,
+        &live.database,
+        &live.username,
+        password.clone(),
+    )
+    .trust_server_certificate(true)
+    .with_timeouts(Duration::from_secs(5), Duration::from_secs(15));
+    let pool_config = PoolConfig {
+        max_size: 4,
+        acquire_timeout: Duration::from_secs(5),
+    };
+    let catalog_pool = SqlPool::new(connection.clone(), pool_config)?;
+    let receipt_pool = SqlPool::new(connection.clone(), pool_config)?;
+    let routing_pool = SqlPool::new(connection, pool_config)?;
+    let catalog: Arc<dyn CatalogStore> = Arc::new(
+        SqlServerCatalogStore::new(
+            CatalogSqlConfig::new(
+                &live.sql_host,
+                live.sql_port,
+                &live.database,
+                &live.username,
+                password.clone(),
+            )
+            .trust_server_certificate(true)
+            .with_timeouts(Duration::from_secs(5), Duration::from_secs(15)),
         )
-        .trust_server_certificate(true)
-        .with_timeouts(Duration::from_secs(5), Duration::from_secs(15)),
-    ));
+        .with_pool(catalog_pool.clone())?,
+    );
     let metastore: Arc<dyn Metastore> = Arc::new(HiveMetastore::new(
         HiveMetastoreConfig::new(&live.hive_host, live.hive_port)
             .with_warehouse_root("file:///opt/hive/data/warehouse")
@@ -89,23 +109,29 @@ async fn live_compose_end_to_end() -> Result<()> {
         .context("live schema was not activated")?;
     let schema = Arc::new(current.arrow_schema()?);
 
-    let receipts: Arc<dyn ReceiptStore> = Arc::new(SqlServerReceiptStore::new(
-        SqlServerReceiptConfig::new(
-            &live.sql_host,
-            live.sql_port,
-            &live.database,
-            &live.username,
-            password.clone(),
-        )
-        .trust_server_certificate(true)
-        .with_timeouts(Duration::from_secs(5), Duration::from_secs(15))
-        .with_batch_limits(256, 256)?,
-    ));
-    let routing: Arc<dyn RoutingStore> = Arc::new(SqlServerRoutingStore::new(
-        SqlServerRoutingConfig::new(&live.sql_host, live.sql_port, &live.database, &live.username, password)
+    let receipts: Arc<dyn ReceiptStore> = Arc::new(
+        SqlServerReceiptStore::new(
+            SqlServerReceiptConfig::new(
+                &live.sql_host,
+                live.sql_port,
+                &live.database,
+                &live.username,
+                password.clone(),
+            )
             .trust_server_certificate(true)
-            .with_timeouts(Duration::from_secs(5), Duration::from_secs(15)),
-    ));
+            .with_timeouts(Duration::from_secs(5), Duration::from_secs(15))
+            .with_batch_limits(256, 256)?,
+        )
+        .with_pool(receipt_pool.clone())?,
+    );
+    let routing: Arc<dyn RoutingStore> = Arc::new(
+        SqlServerRoutingStore::new(
+            SqlServerRoutingConfig::new(&live.sql_host, live.sql_port, &live.database, &live.username, password)
+                .trust_server_certificate(true)
+                .with_timeouts(Duration::from_secs(5), Duration::from_secs(15)),
+        )
+        .with_pool(routing_pool.clone())?,
+    );
     let owner = CollectorInstanceId::new();
     register_live_owner(owner, &table_name, receipts.as_ref(), routing.as_ref()).await?;
     claim_live_route(owner, &identity, routing.as_ref()).await?;
@@ -274,6 +300,13 @@ async fn live_compose_end_to_end() -> Result<()> {
     routing
         .set_collector_state(owner, CollectorState::Stopped, now()?)
         .await?;
+    for pool in [&catalog_pool, &receipt_pool, &routing_pool] {
+        let stats = pool.stats();
+        assert!(stats.reused > 0, "live collector did not reuse SQL connections");
+        assert!(stats.created < stats.acquired, "every operation opened a connection");
+        assert!(stats.size <= 4);
+        pool.close();
+    }
     tokio::fs::remove_dir_all(root).await?;
     Ok(())
 }
@@ -286,6 +319,22 @@ async fn sql_outage_is_observed() -> Result<()> {
         "ARROWCOL_EXPECT_SQL_OUTAGE=1 is required"
     );
     let live = LiveConfig::load()?;
+    let connection = ConnectionConfig::new(
+        &live.sql_host,
+        live.sql_port,
+        &live.database,
+        &live.username,
+        live.password()?,
+    )
+    .trust_server_certificate(true)
+    .with_timeouts(Duration::from_millis(500), Duration::from_millis(500));
+    let pool = SqlPool::new(
+        connection,
+        PoolConfig {
+            max_size: 1,
+            acquire_timeout: Duration::from_millis(500),
+        },
+    )?;
     let store = SqlServerCatalogStore::new(
         CatalogSqlConfig::new(
             &live.sql_host,
@@ -296,8 +345,11 @@ async fn sql_outage_is_observed() -> Result<()> {
         )
         .trust_server_certificate(true)
         .with_timeouts(Duration::from_millis(500), Duration::from_millis(500)),
-    );
+    )
+    .with_pool(pool.clone())?;
     assert!(store.incomplete_sagas().await.is_err());
+    assert!(pool.stats().acquire_failures > 0);
+    pool.close();
     Ok(())
 }
 

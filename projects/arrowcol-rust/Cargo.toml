@@ -20,6 +20,7 @@ arrowcol-flight = { path = "../../crates/arrowcol-flight" }
 arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
 arrowcol-receipts = { path = "../../crates/arrowcol-receipts" }
 arrowcol-routing = { path = "../../crates/arrowcol-routing" }
+arrowcol-sql-server = { path = "../../crates/arrowcol-sql-server" }
 arrow-deltalake = { path = "../../crates/arrow-deltalake" }
 async-trait = "0.1"
 axum = "0.8"

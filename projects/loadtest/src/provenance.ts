@@ -37,6 +37,9 @@ export function safeCollectorPolicies(direct: Document, dataflow: Document): Doc
         'receipt_lease_duration_ms', 'admission_timeout_ms', 'mutation_batch_size', 'status_batch_size', 'reconciliation_batch_size',
       ]),
       shutdown: pick(direct.shutdown, ['stream_drain_timeout_ms', 'publication_drain_timeout_ms']),
+      sql_pool: pick(direct.sql_server.pool ?? {}, [
+        'receipts_max_size', 'routing_max_size', 'catalog_max_size', 'acquire_timeout_ms',
+      ]),
     },
     dataflow: {
       pipeline: pick(dataflow.groups.arrowcol.pipelines.ingest.policies, ['channel_capacity']),

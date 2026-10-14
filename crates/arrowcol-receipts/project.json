@@ -3,7 +3,7 @@
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
   "projectType": "library",
   "sourceRoot": "crates/arrowcol-receipts/src",
-  "implicitDependencies": ["arrowcol-catalog", "arrowcol-protocol", "arrow-deltalake", "arrowcol-infra"],
+  "implicitDependencies": ["arrowcol-catalog", "arrowcol-protocol", "arrowcol-sql-server", "arrow-deltalake", "arrowcol-infra"],
   "namedInputs": {
     "default": [
       "{projectRoot}/**/*",

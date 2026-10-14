@@ -75,6 +75,18 @@ The document covers:
 - graceful stream/publication drain ceilings; and
 - optional native Quiver settings.
 
+Direct reuses separate bounded SQL Server connection pools for receipts,
+routing, and catalog operations. `sql_server.pool` defaults to
+`receipts_max_size: 16`, `routing_max_size: 4`, `catalog_max_size: 4`, and
+`acquire_timeout_ms: 5000`; existing configurations may omit the section.
+Checkout, connection/login, and command deadlines remain distinct. Saturation
+surfaces a database error rather than opening connections beyond the limit.
+Cancelled or uncertain operations discard their connection, and completed
+transactions are checked and reset before reuse. Durable receipt and fencing
+semantics are unchanged; router and Dataflow stores do not opt into these pools.
+The `/metrics` endpoint exposes `arrowcol_direct_sql_pool_*` counters and pool
+occupancy with fixed `receipts`, `routing`, and `catalog` role labels.
+
 Native Quiver is rejected during config validation with the typed
 `native_quiver_generic_arrow` capability error. The checked-in Quiver boundary
 supports fixed OTAP slots, not arbitrary Arrow table/schema/receipt identities,

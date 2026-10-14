@@ -2,9 +2,7 @@ use std::{collections::BTreeMap, fmt::Display, path::Path, time::Duration};
 
 use arrowcol_protocol::{SchemaFingerprint, TableIdentity};
 use sha2::Digest;
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel, IsolationLevel, Row};
-use tokio::net::TcpStream;
-use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use tiberius::{IsolationLevel, Row};
 use uuid::Uuid;
 
 use crate::store::PersistedSagaRecord;
@@ -16,7 +14,7 @@ use crate::{
 
 const ARTIFACT_CHUNK_BYTES: usize = 8_000;
 
-type SqlClient = Client<Compat<TcpStream>>;
+use arrowcol_sql_server::{ConnectionConfig, SqlClient, SqlConnection, SqlPool};
 
 /// SQL Server application-database connection configuration.
 #[derive(Clone)]
@@ -109,51 +107,60 @@ impl SqlServerConfig {
         self.command_timeout = command;
         self
     }
+
+    fn connection_config(&self) -> ConnectionConfig {
+        ConnectionConfig::new(
+            self.host.clone(),
+            self.port,
+            self.database.clone(),
+            self.username.clone(),
+            self.password.clone(),
+        )
+        .trust_server_certificate(self.trust_server_certificate)
+        .with_timeouts(self.connect_timeout, self.command_timeout)
+    }
 }
 
 /// Production SQL Server-backed immutable catalog store.
 #[derive(Clone)]
 pub struct SqlServerCatalogStore {
     config: SqlServerConfig,
+    pool: Option<SqlPool>,
 }
 
 impl SqlServerCatalogStore {
     /// Creates a SQL Server catalog store.
     #[must_use]
     pub const fn new(config: SqlServerConfig) -> Self {
-        Self { config }
+        Self { config, pool: None }
     }
 
-    async fn connect(&self) -> CatalogResult<SqlClient> {
-        let mut config = Config::new();
-        config.host(&self.config.host);
-        config.port(self.config.port);
-        config.database(&self.config.database);
-        config.authentication(AuthMethod::sql_server(
-            self.config.username.clone(),
-            self.config.password.clone(),
-        ));
-        config.encryption(EncryptionLevel::Required);
-        config.handshake_timeout(Some(self.config.connect_timeout));
-        config.command_timeout(Some(self.config.command_timeout));
-        if self.config.trust_server_certificate {
-            config.trust_cert();
+    /// Uses a shared pool with the same credentials, TLS policy, and timeouts.
+    ///
+    /// Clones share this pool. Failed or cancelled operations discard their
+    /// connections. Cleanup failure after confirmed success is logged without
+    /// changing the operation's result.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a pool whose connection configuration differs from this store.
+    pub fn with_pool(mut self, pool: SqlPool) -> CatalogResult<Self> {
+        if !pool.matches_config(&self.config.connection_config()) {
+            return Err(CatalogError::new(
+                CatalogErrorCode::ApplicationDatabase,
+                "SQL Server pool configuration does not match store configuration",
+            ));
         }
-        let address = config.get_addr();
-        let tcp = tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(&address))
-            .await
-            .map_err(|_| {
-                CatalogError::new(
-                    CatalogErrorCode::ApplicationDatabase,
-                    format!("SQL Server TCP connection to {address} timed out"),
-                )
-            })?
-            .map_err(|error| db_error("connect TCP", error))?;
-        tcp.set_nodelay(true)
-            .map_err(|error| db_error("configure TCP", error))?;
-        Client::connect(config, tcp.compat_write())
-            .await
-            .map_err(|error| db_error("login", error))
+        self.pool = Some(pool);
+        Ok(self)
+    }
+
+    async fn connect(&self) -> CatalogResult<SqlConnection> {
+        match &self.pool {
+            Some(pool) => pool.acquire().await,
+            None => SqlConnection::connect(&self.config.connection_config()).await,
+        }
+        .map_err(|error| db_error("acquire SQL Server connection", error))
     }
 }
 
@@ -164,11 +171,31 @@ impl CatalogStore for SqlServerCatalogStore {
         identity: &TableIdentity,
         request_hash: RequestHash,
     ) -> CatalogResult<Option<SagaRecord>> {
-        operation_with_client(&mut self.connect().await?, identity, request_hash).await
+        let mut client = self.connect().await?;
+        let result: CatalogResult<_> = async { operation_with_client(&mut client, identity, request_hash).await }.await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "operation",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn current_schema(&self, identity: &TableIdentity) -> CatalogResult<Option<CatalogSchemaVersion>> {
-        current_schema_with_client(&mut self.connect().await?, identity, false).await
+        let mut client = self.connect().await?;
+        let result: CatalogResult<_> = async { current_schema_with_client(&mut client, identity, false).await }.await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "current_schema",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn schema_by_fingerprint(
@@ -177,148 +204,254 @@ impl CatalogStore for SqlServerCatalogStore {
         fingerprint: SchemaFingerprint,
     ) -> CatalogResult<Option<CatalogSchemaVersion>> {
         let mut client = self.connect().await?;
-        let catalog = identity.catalog().to_string();
-        let schema = identity.schema().to_string();
-        let table = identity.table().to_string();
-        let digest: &[u8] = fingerprint.as_bytes();
-        let row = client
-            .query(
-                "SELECT v.schema_version, v.schema_sha256, v.schema_json \
+        let result: CatalogResult<_> = async {
+            let catalog = identity.catalog().to_string();
+            let schema = identity.schema().to_string();
+            let table = identity.table().to_string();
+            let digest: &[u8] = fingerprint.as_bytes();
+            let row = client
+                .query(
+                    "SELECT v.schema_version, v.schema_sha256, v.schema_json \
                  FROM arrowcol.catalog_tables AS t \
                  INNER JOIN arrowcol.table_schema_versions AS v ON v.table_id = t.table_id \
                  WHERE t.catalog_name = @P1 AND t.schema_name = @P2 AND t.table_name = @P3 \
                    AND v.schema_sha256 = @P4 AND v.state IN ('active', 'superseded');",
-                &[&catalog, &schema, &table, &digest],
-            )
-            .await
-            .map_err(|error| db_error("query schema by fingerprint", error))?
-            .into_row()
-            .await
-            .map_err(|error| db_error("read schema by fingerprint", error))?;
-        row.map(|row| schema_from_row(&row, identity)).transpose()
+                    &[&catalog, &schema, &table, &digest],
+                )
+                .await
+                .map_err(|error| db_error("query schema by fingerprint", error))?
+                .into_row()
+                .await
+                .map_err(|error| db_error("read schema by fingerprint", error))?;
+            row.map(|row| schema_from_row(&row, identity)).transpose()
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "schema_by_fingerprint",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn schema_history(&self, identity: &TableIdentity) -> CatalogResult<Vec<CatalogSchemaVersion>> {
         let mut client = self.connect().await?;
-        let catalog = identity.catalog().to_string();
-        let schema = identity.schema().to_string();
-        let table = identity.table().to_string();
-        client
-            .query(
-                "SELECT v.schema_version, v.schema_sha256, v.schema_json \
+        let result: CatalogResult<_> = async {
+            let catalog = identity.catalog().to_string();
+            let schema = identity.schema().to_string();
+            let table = identity.table().to_string();
+            client
+                .query(
+                    "SELECT v.schema_version, v.schema_sha256, v.schema_json \
                  FROM arrowcol.catalog_tables AS t \
                  INNER JOIN arrowcol.table_schema_versions AS v ON v.table_id = t.table_id \
                  WHERE t.catalog_name = @P1 AND t.schema_name = @P2 AND t.table_name = @P3 \
                    AND v.state IN ('active', 'superseded') \
                  ORDER BY v.schema_version;",
-                &[&catalog, &schema, &table],
-            )
-            .await
-            .map_err(|error| db_error("query schema history", error))?
-            .into_first_result()
-            .await
-            .map_err(|error| db_error("read schema history", error))?
-            .iter()
-            .map(|row| schema_from_row(row, identity))
-            .collect()
+                    &[&catalog, &schema, &table],
+                )
+                .await
+                .map_err(|error| db_error("query schema history", error))?
+                .into_first_result()
+                .await
+                .map_err(|error| db_error("read schema history", error))?
+                .iter()
+                .map(|row| schema_from_row(row, identity))
+                .collect()
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "schema_history",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn reserve_change(&self, reservation: ChangeReservation) -> CatalogResult<ReserveOutcome> {
         let mut client = self.connect().await?;
-        let flat_fields = flatten_schema_fields(&reservation.target_schema)?;
-        let schema_json = serde_json::to_string(&reservation.target_schema).map_err(|error| {
-            CatalogError::new(
-                CatalogErrorCode::ApplicationDatabase,
-                format!("serialize pending catalog schema: {error}"),
-            )
-        })?;
-        client
-            .begin_transaction_with_isolation(IsolationLevel::Serializable)
-            .await
-            .map_err(|error| db_error("begin reserve transaction", error))?;
-        let result = reserve_in_transaction(&mut client, reservation, &flat_fields, &schema_json).await;
-        finish_transaction(&mut client, result, "reserve schema change").await
+        let result: CatalogResult<_> = async {
+            let flat_fields = flatten_schema_fields(&reservation.target_schema)?;
+            let schema_json = serde_json::to_string(&reservation.target_schema).map_err(|error| {
+                CatalogError::new(
+                    CatalogErrorCode::ApplicationDatabase,
+                    format!("serialize pending catalog schema: {error}"),
+                )
+            })?;
+            client
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|error| db_error("begin reserve transaction", error))?;
+            let result = reserve_in_transaction(&mut client, reservation, &flat_fields, &schema_json).await;
+            finish_transaction(&mut client, result, "reserve schema change").await
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "reserve_change",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn saga(&self, saga_id: SagaId) -> CatalogResult<Option<SagaRecord>> {
-        saga_with_client(&mut self.connect().await?, saga_id).await
+        let mut client = self.connect().await?;
+        let result: CatalogResult<_> = async { saga_with_client(&mut client, saga_id).await }.await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "saga",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn mark_hive_applied(&self, saga_id: SagaId) -> CatalogResult<SagaRecord> {
         let mut client = self.connect().await?;
-        let saga_uuid = saga_id.as_uuid();
-        client
-            .execute(
-                "UPDATE arrowcol.schema_change_sagas \
+        let result: CatalogResult<_> = async {
+            let saga_uuid = saga_id.as_uuid();
+            client
+                .execute(
+                    "UPDATE arrowcol.schema_change_sagas \
                  SET state = 'applying', current_step = 1, updated_at_utc = SYSUTCDATETIME(), \
                      last_error_code = NULL, last_error_message = NULL \
                  WHERE saga_id = @P1 AND completed_at_utc IS NULL AND current_step = 0;",
-                &[&saga_uuid],
-            )
-            .await
-            .map_err(|error| db_error("mark Hive schema applied", error))?;
-        required_saga(&mut client, saga_id).await
+                    &[&saga_uuid],
+                )
+                .await
+                .map_err(|error| db_error("mark Hive schema applied", error))?;
+            required_saga(&mut client, saga_id).await
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "mark_hive_applied",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn persist_artifacts(&self, saga_id: SagaId, artifacts: &DescriptorArtifacts) -> CatalogResult<SagaRecord> {
         let mut client = self.connect().await?;
-        client
-            .begin_transaction_with_isolation(IsolationLevel::Serializable)
-            .await
-            .map_err(|error| db_error("begin artifact transaction", error))?;
-        let result = persist_artifacts_in_transaction(&mut client, saga_id, artifacts).await;
-        finish_transaction(&mut client, result, "persist schema artifacts").await
+        let result: CatalogResult<_> = async {
+            client
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|error| db_error("begin artifact transaction", error))?;
+            let result = persist_artifacts_in_transaction(&mut client, saga_id, artifacts).await;
+            finish_transaction(&mut client, result, "persist schema artifacts").await
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "persist_artifacts",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn finalize(&self, saga_id: SagaId) -> CatalogResult<SagaRecord> {
         let mut client = self.connect().await?;
-        client
-            .begin_transaction_with_isolation(IsolationLevel::Serializable)
-            .await
-            .map_err(|error| db_error("begin finalize transaction", error))?;
-        let result = finalize_in_transaction(&mut client, saga_id).await;
-        finish_transaction(&mut client, result, "finalize schema change").await
+        let result: CatalogResult<_> = async {
+            client
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|error| db_error("begin finalize transaction", error))?;
+            let result = finalize_in_transaction(&mut client, saga_id).await;
+            finish_transaction(&mut client, result, "finalize schema change").await
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "finalize",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn record_failure(&self, saga_id: SagaId, step: SagaStep, error: &CatalogError) -> CatalogResult<SagaRecord> {
         let mut client = self.connect().await?;
-        let saga_uuid = saga_id.as_uuid();
-        let step_number = step.number();
-        let code = error.code().as_str();
-        let message = truncate_chars(error.message(), 2_048);
-        client
-            .execute(
-                "UPDATE arrowcol.schema_change_sagas \
+        let result: CatalogResult<_> = async {
+            let saga_uuid = saga_id.as_uuid();
+            let step_number = step.number();
+            let code = error.code().as_str();
+            let message = truncate_chars(error.message(), 2_048);
+            client
+                .execute(
+                    "UPDATE arrowcol.schema_change_sagas \
                  SET state = 'failed', current_step = @P2, attempt_count = attempt_count + 1, \
                      updated_at_utc = SYSUTCDATETIME(), last_error_code = @P3, last_error_message = @P4 \
                  WHERE saga_id = @P1 AND completed_at_utc IS NULL AND current_step <= @P2;",
-                &[&saga_uuid, &step_number, &code, &message],
-            )
-            .await
-            .map_err(|db| db_error("record schema saga failure", db))?;
-        required_saga(&mut client, saga_id).await
+                    &[&saga_uuid, &step_number, &code, &message],
+                )
+                .await
+                .map_err(|db| db_error("record schema saga failure", db))?;
+            required_saga(&mut client, saga_id).await
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "record_failure",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn incomplete_sagas(&self) -> CatalogResult<Vec<SagaRecord>> {
         let mut client = self.connect().await?;
-        let rows = client
-            .query(
-                "SELECT saga_id FROM arrowcol.schema_change_sagas \
+        let result: CatalogResult<_> = async {
+            let rows = client
+                .query(
+                    "SELECT saga_id FROM arrowcol.schema_change_sagas \
                  WHERE completed_at_utc IS NULL \
                  ORDER BY started_at_utc, saga_id;",
-                &[],
-            )
-            .await
-            .map_err(|error| db_error("query incomplete schema sagas", error))?
-            .into_first_result()
-            .await
-            .map_err(|error| db_error("read incomplete schema sagas", error))?;
-        let mut sagas = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id = required_uuid(&row, "saga_id")?;
-            sagas.push(required_saga(&mut client, SagaId::from_uuid(id)).await?);
+                    &[],
+                )
+                .await
+                .map_err(|error| db_error("query incomplete schema sagas", error))?
+                .into_first_result()
+                .await
+                .map_err(|error| db_error("read incomplete schema sagas", error))?;
+            let mut sagas = Vec::with_capacity(rows.len());
+            for row in rows {
+                let id = required_uuid(&row, "saga_id")?;
+                sagas.push(required_saga(&mut client, SagaId::from_uuid(id)).await?);
+            }
+            Ok(sagas)
         }
-        Ok(sagas)
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "incomplete_sagas",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn artifacts(
@@ -327,30 +460,42 @@ impl CatalogStore for SqlServerCatalogStore {
         version: SchemaVersion,
     ) -> CatalogResult<Option<DescriptorArtifacts>> {
         let mut client = self.connect().await?;
-        let catalog = identity.catalog().to_string();
-        let schema = identity.schema().to_string();
-        let table = identity.table().to_string();
-        let version = version_to_i64(version)?;
-        let rows = client
-            .query(
-                "SELECT a.artifact_kind, a.chunk_ordinal, a.artifact_sha256, \
+        let result: CatalogResult<_> = async {
+            let catalog = identity.catalog().to_string();
+            let schema = identity.schema().to_string();
+            let table = identity.table().to_string();
+            let version = version_to_i64(version)?;
+            let rows = client
+                .query(
+                    "SELECT a.artifact_kind, a.chunk_ordinal, a.artifact_sha256, \
                         a.artifact_size_bytes, a.chunk_data \
                  FROM arrowcol.catalog_tables AS t \
                  INNER JOIN arrowcol.schema_artifact_chunks AS a ON a.table_id = t.table_id \
                  WHERE t.catalog_name = @P1 AND t.schema_name = @P2 AND t.table_name = @P3 \
                    AND a.schema_version = @P4 \
                  ORDER BY a.artifact_kind, a.chunk_ordinal;",
-                &[&catalog, &schema, &table, &version],
-            )
-            .await
-            .map_err(|error| db_error("query schema artifacts", error))?
-            .into_first_result()
-            .await
-            .map_err(|error| db_error("read schema artifacts", error))?;
-        if rows.is_empty() {
-            return Ok(None);
+                    &[&catalog, &schema, &table, &version],
+                )
+                .await
+                .map_err(|error| db_error("query schema artifacts", error))?
+                .into_first_result()
+                .await
+                .map_err(|error| db_error("read schema artifacts", error))?;
+            if rows.is_empty() {
+                return Ok(None);
+            }
+            artifact_rows(rows).map(Some)
         }
-        artifact_rows(rows).map(Some)
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "artifacts",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 }
 
@@ -1051,7 +1196,13 @@ async fn finish_transaction<T>(client: &mut SqlClient, result: CatalogResult<T>,
             Ok(value)
         }
         Err(error) => {
-            let _rollback = client.rollback_transaction().await;
+            if let Err(rollback_error) = client.rollback_transaction().await {
+                tracing::warn!(
+                    operation = context,
+                    error = %rollback_error,
+                    "SQL Server rollback failed; preserving primary operation error and discarding connection"
+                );
+            }
             Err(error)
         }
     }
@@ -1321,4 +1472,52 @@ fn db_error(context: &str, error: impl Display) -> CatalogError {
         CatalogErrorCode::ApplicationDatabase,
         format!("SQL Server {context} failed: {error}"),
     )
+}
+
+#[cfg(test)]
+mod pooling_tests {
+    use super::*;
+    use arrowcol_sql_server::PoolConfig;
+
+    #[test]
+    fn pooling_requires_equivalent_connection_configuration() -> anyhow::Result<()> {
+        let config = SqlServerConfig::new("localhost", 1433, "catalog", "pool-user", "pool-secret")
+            .trust_server_certificate(true)
+            .with_timeouts(Duration::from_secs(3), Duration::from_secs(7));
+        let pool = SqlPool::new(
+            config.connection_config(),
+            PoolConfig {
+                max_size: 2,
+                acquire_timeout: Duration::from_secs(1),
+            },
+        )?;
+        let store = SqlServerCatalogStore::new(config.clone()).with_pool(pool.clone())?;
+        assert!(store.clone().pool.is_some());
+        assert!(SqlServerCatalogStore::new(config.clone()).pool.is_none());
+
+        for field in 0..8 {
+            let mut mismatch = config.clone();
+            match field {
+                0 => mismatch.host = "other-host".to_owned(),
+                1 => mismatch.port = 1434,
+                2 => mismatch.database = "other-database".to_owned(),
+                3 => mismatch.username = "other-user".to_owned(),
+                4 => mismatch.password = "other-secret".to_owned(),
+                5 => mismatch.trust_server_certificate = false,
+                6 => mismatch.connect_timeout = Duration::from_secs(4),
+                _ => mismatch.command_timeout = Duration::from_secs(8),
+            }
+            let Err(error) = SqlServerCatalogStore::new(mismatch).with_pool(pool.clone()) else {
+                anyhow::bail!("store accepted a mismatched pool");
+            };
+            assert_eq!(error.code(), CatalogErrorCode::ApplicationDatabase);
+            assert!(!error.to_string().contains("pool-user"));
+            assert!(!error.to_string().contains("pool-secret"));
+            assert!(!error.to_string().contains("other-secret"));
+        }
+        assert_eq!(pool.stats().created, 0);
+        pool.close();
+        assert_eq!(store.clone().pool.as_ref().map(|pool| pool.stats().max_size), Some(0));
+        Ok(())
+    }
 }

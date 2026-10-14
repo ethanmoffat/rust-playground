@@ -8,9 +8,7 @@ use arrowcol_protocol::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel, IsolationLevel, Row, ToSql};
-use tokio::net::TcpStream;
-use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use tiberius::{IsolationLevel, Row, ToSql};
 use uuid::Uuid;
 
 use crate::{
@@ -38,7 +36,7 @@ const RECEIPT_FROM: &str = "\
      AND l.lease_id = r.lease_id \
      AND l.holder_instance_id = r.owner_instance_id";
 
-type SqlClient = Client<Compat<TcpStream>>;
+use arrowcol_sql_server::{ConnectionConfig, SqlClient, SqlConnection, SqlPool};
 
 /// SQL Server application-database connection and API bounds.
 #[derive(Clone)]
@@ -139,51 +137,60 @@ impl SqlServerReceiptConfig {
         self.max_status_batch_size = statuses;
         Ok(self)
     }
+
+    fn connection_config(&self) -> ConnectionConfig {
+        ConnectionConfig::new(
+            self.host.clone(),
+            self.port,
+            self.database.clone(),
+            self.username.clone(),
+            self.password.clone(),
+        )
+        .trust_server_certificate(self.trust_server_certificate)
+        .with_timeouts(self.connect_timeout, self.command_timeout)
+    }
 }
 
 /// SQL Server-backed receipt store over the Arrowcol application database.
 #[derive(Clone)]
 pub struct SqlServerReceiptStore {
     config: SqlServerReceiptConfig,
+    pool: Option<SqlPool>,
 }
 
 impl SqlServerReceiptStore {
     /// Creates a receipt store.
     #[must_use]
     pub const fn new(config: SqlServerReceiptConfig) -> Self {
-        Self { config }
+        Self { config, pool: None }
     }
 
-    async fn connect(&self) -> ReceiptResult<SqlClient> {
-        let mut config = Config::new();
-        config.host(&self.config.host);
-        config.port(self.config.port);
-        config.database(&self.config.database);
-        config.authentication(AuthMethod::sql_server(
-            self.config.username.clone(),
-            self.config.password.clone(),
-        ));
-        config.encryption(EncryptionLevel::Required);
-        config.handshake_timeout(Some(self.config.connect_timeout));
-        config.command_timeout(Some(self.config.command_timeout));
-        if self.config.trust_server_certificate {
-            config.trust_cert();
+    /// Uses a shared pool with the same credentials, TLS policy, and timeouts.
+    ///
+    /// Clones share this pool. Failed or cancelled operations discard their
+    /// connections. Cleanup failure after confirmed success is logged without
+    /// changing the operation's result.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a pool whose connection configuration differs from this store.
+    pub fn with_pool(mut self, pool: SqlPool) -> ReceiptResult<Self> {
+        if !pool.matches_config(&self.config.connection_config()) {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::InvalidConfiguration,
+                "SQL Server pool configuration does not match store configuration",
+            ));
         }
-        let address = config.get_addr();
-        let tcp = tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(&address))
-            .await
-            .map_err(|_| {
-                ReceiptError::new(
-                    ReceiptErrorKind::Database,
-                    format!("SQL Server TCP connection to {address} timed out"),
-                )
-            })?
-            .map_err(|cause| database_error("connect TCP", cause))?;
-        tcp.set_nodelay(true)
-            .map_err(|cause| database_error("configure TCP", cause))?;
-        Client::connect(config, tcp.compat_write())
-            .await
-            .map_err(|cause| database_error("login", cause))
+        self.pool = Some(pool);
+        Ok(self)
+    }
+
+    async fn connect(&self) -> ReceiptResult<SqlConnection> {
+        match &self.pool {
+            Some(pool) => pool.acquire().await,
+            None => SqlConnection::connect(&self.config.connection_config()).await,
+        }
+        .map_err(|error| database_error("acquire SQL Server connection", error))
     }
 
     fn mutation_bound(&self, count: usize) -> ReceiptResult<()> {
@@ -226,202 +233,250 @@ impl ReceiptStore for SqlServerReceiptStore {
         }
         let instance = registration.instance_id.as_uuid();
         let mut client = self.connect().await?;
-        client
-            .begin_transaction_with_isolation(IsolationLevel::Serializable)
-            .await
-            .map_err(|cause| database_error("begin receipt owner registration", cause))?;
-        let result = async {
-            let max_generation = client
-                .query(
-                    "SELECT MAX(generation) AS max_generation \
+        let result: ReceiptResult<_> = async {
+            client
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|cause| database_error("begin receipt owner registration", cause))?;
+            let result = async {
+                let max_generation = client
+                    .query(
+                        "SELECT MAX(generation) AS max_generation \
                      FROM arrowcol.collector_instances WITH (UPDLOCK, HOLDLOCK) \
                      WHERE instance_key = @P1;",
-                    &[&registration.instance_key],
-                )
-                .await
-                .map_err(|cause| database_error("lock receipt owner generation", cause))?
-                .into_row()
-                .await
-                .map_err(|cause| database_error("read receipt owner generation", cause))?
-                .and_then(|row| row.get::<i64, _>("max_generation"));
-            if max_generation.is_some_and(|current| generation <= current) {
-                return Err(ReceiptError::new(
-                    ReceiptErrorKind::Conflict,
-                    "owner generation must advance beyond every prior registration for the instance key",
-                ));
-            }
-
-            let active = client
-                .query(
-                    "SELECT TOP (1) instance_id, lease_expires_at_utc \
-                     FROM arrowcol.collector_instances WITH (UPDLOCK, HOLDLOCK) \
-                     WHERE instance_key = @P1 AND stopped_at_utc IS NULL;",
-                    &[&registration.instance_key],
-                )
-                .await
-                .map_err(|cause| database_error("lock active receipt owner", cause))?
-                .into_row()
-                .await
-                .map_err(|cause| database_error("read active receipt owner", cause))?;
-            if let Some(active) = active {
-                let prior = required_uuid(&active, "instance_id")?;
-                let prior_expiry = required_datetime(&active, "lease_expires_at_utc")?;
-                if prior_expiry > started {
+                        &[&registration.instance_key],
+                    )
+                    .await
+                    .map_err(|cause| database_error("lock receipt owner generation", cause))?
+                    .into_row()
+                    .await
+                    .map_err(|cause| database_error("read receipt owner generation", cause))?
+                    .and_then(|row| row.get::<i64, _>("max_generation"));
+                if max_generation.is_some_and(|current| generation <= current) {
                     return Err(ReceiptError::new(
                         ReceiptErrorKind::Conflict,
-                        "a live owner already holds the configured instance key",
+                        "owner generation must advance beyond every prior registration for the instance key",
                     ));
                 }
-                client
-                    .execute(
-                        "UPDATE arrowcol.table_leases \
+
+                let active = client
+                    .query(
+                        "SELECT TOP (1) instance_id, lease_expires_at_utc \
+                     FROM arrowcol.collector_instances WITH (UPDLOCK, HOLDLOCK) \
+                     WHERE instance_key = @P1 AND stopped_at_utc IS NULL;",
+                        &[&registration.instance_key],
+                    )
+                    .await
+                    .map_err(|cause| database_error("lock active receipt owner", cause))?
+                    .into_row()
+                    .await
+                    .map_err(|cause| database_error("read active receipt owner", cause))?;
+                if let Some(active) = active {
+                    let prior = required_uuid(&active, "instance_id")?;
+                    let prior_expiry = required_datetime(&active, "lease_expires_at_utc")?;
+                    if prior_expiry > started {
+                        return Err(ReceiptError::new(
+                            ReceiptErrorKind::Conflict,
+                            "a live owner already holds the configured instance key",
+                        ));
+                    }
+                    client
+                        .execute(
+                            "UPDATE arrowcol.table_leases \
                          SET released_at_utc = @P2, release_reason = 'expired' \
                          WHERE holder_instance_id = @P1 AND released_at_utc IS NULL; \
                          UPDATE arrowcol.collector_instances \
                          SET state = 'failed', stopped_at_utc = @P2 \
                          WHERE instance_id = @P1 AND stopped_at_utc IS NULL;",
-                        &[&prior, &started],
-                    )
-                    .await
-                    .map_err(|cause| database_error("fence expired receipt owner", cause))?;
-            }
+                            &[&prior, &started],
+                        )
+                        .await
+                        .map_err(|cause| database_error("fence expired receipt owner", cause))?;
+                }
 
-            client
-                .execute(
-                    "INSERT INTO arrowcol.collector_instances ( \
+                client
+                    .execute(
+                        "INSERT INTO arrowcol.collector_instances ( \
                         instance_id, instance_key, generation, state, host_name, build_version, \
                         started_at_utc, heartbeat_at_utc, lease_expires_at_utc \
                      ) VALUES (@P1, @P2, @P3, 'active', @P4, @P5, @P6, @P6, @P7);",
-                    &[
-                        &instance,
-                        &registration.instance_key,
-                        &generation,
-                        &registration.host_name,
-                        &registration.build_version,
-                        &started,
-                        &deadline,
-                    ],
-                )
-                .await
-                .map_err(|cause| database_error("register receipt owner", cause))?;
-            Ok(())
+                        &[
+                            &instance,
+                            &registration.instance_key,
+                            &generation,
+                            &registration.host_name,
+                            &registration.build_version,
+                            &started,
+                            &deadline,
+                        ],
+                    )
+                    .await
+                    .map_err(|cause| database_error("register receipt owner", cause))?;
+                Ok(())
+            }
+            .await;
+            finish_transaction(&mut client, result, "receipt owner registration").await
         }
         .await;
-        finish_transaction(&mut client, result, "receipt owner registration").await
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "register_owner",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn heartbeat_owner(&self, owner: CollectorInstanceId, lease_deadline: UnixMillis) -> ReceiptResult<()> {
         let owner = owner.as_uuid();
         let deadline = datetime(lease_deadline)?;
         let mut client = self.connect().await?;
-        let row = client
-            .query(
-                "UPDATE arrowcol.collector_instances \
+        let result: ReceiptResult<_> = async {
+            let row = client
+                .query(
+                    "UPDATE arrowcol.collector_instances \
                  SET heartbeat_at_utc = SYSUTCDATETIME(), lease_expires_at_utc = @P2 \
                  OUTPUT INSERTED.instance_id \
                  WHERE instance_id = @P1 AND state = 'active' \
                    AND stopped_at_utc IS NULL AND @P2 > SYSUTCDATETIME();",
-                &[&owner, &deadline],
-            )
-            .await
-            .map_err(|cause| database_error("heartbeat receipt owner", cause))?
-            .into_row()
-            .await
-            .map_err(|cause| database_error("read owner heartbeat result", cause))?;
-        if row.is_none() {
-            return Err(ReceiptError::new(
-                ReceiptErrorKind::Fenced,
-                "owner is not active or the requested deadline has expired",
-            ));
+                    &[&owner, &deadline],
+                )
+                .await
+                .map_err(|cause| database_error("heartbeat receipt owner", cause))?
+                .into_row()
+                .await
+                .map_err(|cause| database_error("read owner heartbeat result", cause))?;
+            if row.is_none() {
+                return Err(ReceiptError::new(
+                    ReceiptErrorKind::Fenced,
+                    "owner is not active or the requested deadline has expired",
+                ));
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "heartbeat_owner",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn start_owner_drain(&self, owner: CollectorInstanceId) -> ReceiptResult<OwnerDrain> {
         let owner_uuid = owner.as_uuid();
         let mut client = self.connect().await?;
-        client
-            .begin_transaction_with_isolation(IsolationLevel::Serializable)
-            .await
-            .map_err(|cause| database_error("begin owner drain", cause))?;
-        let result = async {
-            let row = client
-                .query(
-                    "UPDATE arrowcol.collector_instances \
+        let result: ReceiptResult<_> = async {
+            client
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|cause| database_error("begin owner drain", cause))?;
+            let result = async {
+                let row = client
+                    .query(
+                        "UPDATE arrowcol.collector_instances \
                      SET state = 'draining', heartbeat_at_utc = SYSUTCDATETIME() \
                      OUTPUT INSERTED.instance_id \
                      WHERE instance_id = @P1 AND stopped_at_utc IS NULL \
                        AND state IN ('active', 'draining');",
-                    &[&owner_uuid],
-                )
-                .await
-                .map_err(|cause| database_error("start owner drain", cause))?
-                .into_row()
-                .await
-                .map_err(|cause| database_error("read owner drain result", cause))?;
-            if row.is_none() {
-                return Err(ReceiptError::new(
-                    ReceiptErrorKind::NotFound,
-                    "active receipt owner was not found",
-                ));
+                        &[&owner_uuid],
+                    )
+                    .await
+                    .map_err(|cause| database_error("start owner drain", cause))?
+                    .into_row()
+                    .await
+                    .map_err(|cause| database_error("read owner drain result", cause))?;
+                if row.is_none() {
+                    return Err(ReceiptError::new(
+                        ReceiptErrorKind::NotFound,
+                        "active receipt owner was not found",
+                    ));
+                }
+                owner_drain_counts(&mut client, owner).await
             }
-            owner_drain_counts(&mut client, owner).await
+            .await;
+            finish_transaction(&mut client, result, "start owner drain").await
         }
         .await;
-        finish_transaction(&mut client, result, "start owner drain").await
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "start_owner_drain",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn finish_owner_drain(&self, owner: CollectorInstanceId, stopped_at: UnixMillis) -> ReceiptResult<()> {
         let owner_uuid = owner.as_uuid();
         let stopped = datetime(stopped_at)?;
         let mut client = self.connect().await?;
-        client
-            .begin_transaction_with_isolation(IsolationLevel::Serializable)
-            .await
-            .map_err(|cause| database_error("begin owner drain completion", cause))?;
-        let result = async {
-            let outstanding = owner_drain_counts(&mut client, owner).await?;
-            if outstanding.active_receipts != 0 {
-                return Err(ReceiptError::new(
-                    ReceiptErrorKind::Conflict,
-                    format!(
-                        "owner still has {} accepted, buffered, or flushing receipts",
-                        outstanding.active_receipts
-                    ),
-                ));
-            }
+        let result: ReceiptResult<_> = async {
             client
-                .execute(
-                    "UPDATE arrowcol.table_leases \
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|cause| database_error("begin owner drain completion", cause))?;
+            let result = async {
+                let outstanding = owner_drain_counts(&mut client, owner).await?;
+                if outstanding.active_receipts != 0 {
+                    return Err(ReceiptError::new(
+                        ReceiptErrorKind::Conflict,
+                        format!(
+                            "owner still has {} accepted, buffered, or flushing receipts",
+                            outstanding.active_receipts
+                        ),
+                    ));
+                }
+                client
+                    .execute(
+                        "UPDATE arrowcol.table_leases \
                      SET released_at_utc = @P2, release_reason = 'instance_stopped' \
                      WHERE holder_instance_id = @P1 AND released_at_utc IS NULL;",
-                    &[&owner_uuid, &stopped],
-                )
-                .await
-                .map_err(|cause| database_error("release drained owner table leases", cause))?;
-            let row = client
-                .query(
-                    "UPDATE arrowcol.collector_instances \
+                        &[&owner_uuid, &stopped],
+                    )
+                    .await
+                    .map_err(|cause| database_error("release drained owner table leases", cause))?;
+                let row = client
+                    .query(
+                        "UPDATE arrowcol.collector_instances \
                      SET state = 'stopped', stopped_at_utc = @P2, heartbeat_at_utc = @P2, lease_expires_at_utc = @P2 \
                      OUTPUT INSERTED.instance_id \
                      WHERE instance_id = @P1 AND state = 'draining' AND stopped_at_utc IS NULL;",
-                    &[&owner_uuid, &stopped],
-                )
-                .await
-                .map_err(|cause| database_error("finish owner drain", cause))?
-                .into_row()
-                .await
-                .map_err(|cause| database_error("read owner drain completion", cause))?;
-            if row.is_none() {
-                return Err(ReceiptError::new(
-                    ReceiptErrorKind::Conflict,
-                    "owner was not in the draining state",
-                ));
+                        &[&owner_uuid, &stopped],
+                    )
+                    .await
+                    .map_err(|cause| database_error("finish owner drain", cause))?
+                    .into_row()
+                    .await
+                    .map_err(|cause| database_error("read owner drain completion", cause))?;
+                if row.is_none() {
+                    return Err(ReceiptError::new(
+                        ReceiptErrorKind::Conflict,
+                        "owner was not in the draining state",
+                    ));
+                }
+                Ok(())
             }
-            Ok(())
+            .await;
+            finish_transaction(&mut client, result, "finish owner drain").await
         }
         .await;
-        finish_transaction(&mut client, result, "finish owner drain").await
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "finish_owner_drain",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn acquire_table_lease(&self, request: TableLeaseRequest) -> ReceiptResult<TableLease> {
@@ -437,65 +492,78 @@ impl ReceiptStore for SqlServerReceiptStore {
         let lease_id = LeaseId::new();
         let lease_uuid = lease_id.as_uuid();
         let mut client = self.connect().await?;
-        client
-            .begin_transaction_with_isolation(IsolationLevel::Serializable)
-            .await
-            .map_err(|cause| database_error("begin table lease acquisition", cause))?;
-        let result = async {
-            validate_catalog_table(&mut client, request.table_id, &request.table).await?;
-            validate_active_owner(&mut client, request.owner_instance_id, request.issued_at_unix_ms).await?;
+        let result: ReceiptResult<_> = async {
             client
-                .execute(
-                    "UPDATE arrowcol.table_leases \
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|cause| database_error("begin table lease acquisition", cause))?;
+            let result = async {
+                validate_catalog_table(&mut client, request.table_id, &request.table).await?;
+                validate_active_owner(&mut client, request.owner_instance_id, request.issued_at_unix_ms).await?;
+                client
+                    .execute(
+                        "UPDATE arrowcol.table_leases \
                      SET released_at_utc = @P2, release_reason = 'expired' \
                      WHERE table_id = @P1 AND released_at_utc IS NULL AND expires_at_utc <= @P2;",
-                    &[&request.table_id, &issued],
-                )
-                .await
-                .map_err(|cause| database_error("expire predecessor table lease", cause))?;
-            let active = client
-                .query(
-                    "SELECT lease_id FROM arrowcol.table_leases WITH (UPDLOCK, HOLDLOCK) \
+                        &[&request.table_id, &issued],
+                    )
+                    .await
+                    .map_err(|cause| database_error("expire predecessor table lease", cause))?;
+                let active = client
+                    .query(
+                        "SELECT lease_id FROM arrowcol.table_leases WITH (UPDLOCK, HOLDLOCK) \
                      WHERE table_id = @P1 AND released_at_utc IS NULL;",
-                    &[&request.table_id],
-                )
-                .await
-                .map_err(|cause| database_error("check active table lease", cause))?
-                .into_row()
-                .await
-                .map_err(|cause| database_error("read active table lease", cause))?;
-            if active.is_some() {
-                return Err(ReceiptError::new(
-                    ReceiptErrorKind::Fenced,
-                    "another active table lease owns the table",
-                ));
-            }
-            let epoch = next_fencing_epoch(&mut client, request.table_id).await?;
-            let epoch_i64 = i64::try_from(epoch.get())
-                .map_err(|_| ReceiptError::new(ReceiptErrorKind::CorruptState, "fencing epoch exceeds SQL bigint"))?;
-            client
-                .execute(
-                    "INSERT INTO arrowcol.table_leases ( \
+                        &[&request.table_id],
+                    )
+                    .await
+                    .map_err(|cause| database_error("check active table lease", cause))?
+                    .into_row()
+                    .await
+                    .map_err(|cause| database_error("read active table lease", cause))?;
+                if active.is_some() {
+                    return Err(ReceiptError::new(
+                        ReceiptErrorKind::Fenced,
+                        "another active table lease owns the table",
+                    ));
+                }
+                let epoch = next_fencing_epoch(&mut client, request.table_id).await?;
+                let epoch_i64 = i64::try_from(epoch.get()).map_err(|_| {
+                    ReceiptError::new(ReceiptErrorKind::CorruptState, "fencing epoch exceeds SQL bigint")
+                })?;
+                client
+                    .execute(
+                        "INSERT INTO arrowcol.table_leases ( \
                         table_id, fencing_epoch, lease_id, holder_instance_id, \
                         acquired_at_utc, renewed_at_utc, expires_at_utc \
                      ) VALUES (@P1, @P2, @P3, @P4, @P5, @P5, @P6);",
-                    &[&request.table_id, &epoch_i64, &lease_uuid, &owner, &issued, &expires],
+                        &[&request.table_id, &epoch_i64, &lease_uuid, &owner, &issued, &expires],
+                    )
+                    .await
+                    .map_err(|cause| database_error("insert table lease", cause))?;
+                TableLease::new(
+                    lease_id,
+                    request.table,
+                    request.owner_instance_id,
+                    request.implementation_pool,
+                    epoch,
+                    request.issued_at_unix_ms,
+                    request.expires_at_unix_ms,
                 )
-                .await
-                .map_err(|cause| database_error("insert table lease", cause))?;
-            TableLease::new(
-                lease_id,
-                request.table,
-                request.owner_instance_id,
-                request.implementation_pool,
-                epoch,
-                request.issued_at_unix_ms,
-                request.expires_at_unix_ms,
-            )
-            .map_err(|cause| ReceiptError::new(ReceiptErrorKind::CorruptState, cause.to_string()))
+                .map_err(|cause| ReceiptError::new(ReceiptErrorKind::CorruptState, cause.to_string()))
+            }
+            .await;
+            finish_transaction(&mut client, result, "acquire table lease").await
         }
         .await;
-        finish_transaction(&mut client, result, "acquire table lease").await
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "acquire_table_lease",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn renew_table_lease(&self, lease: &TableLease, expires_at: UnixMillis) -> ReceiptResult<TableLease> {
@@ -515,9 +583,10 @@ impl ReceiptStore for SqlServerReceiptStore {
         })?;
         let expires = datetime(expires_at)?;
         let mut client = self.connect().await?;
-        let row = client
-            .query(
-                "UPDATE l \
+        let result: ReceiptResult<_> = async {
+            let row = client
+                .query(
+                    "UPDATE l \
                  SET renewed_at_utc = SYSUTCDATETIME(), expires_at_utc = @P4 \
                  OUTPUT INSERTED.renewed_at_utc \
                  FROM arrowcol.table_leases AS l \
@@ -526,27 +595,38 @@ impl ReceiptStore for SqlServerReceiptStore {
                    AND l.released_at_utc IS NULL AND l.expires_at_utc > SYSUTCDATETIME() \
                    AND i.state IN ('active', 'draining') AND i.lease_expires_at_utc > SYSUTCDATETIME() \
                    AND @P4 > l.expires_at_utc;",
-                &[&lease_uuid, &owner, &epoch, &expires],
+                    &[&lease_uuid, &owner, &epoch, &expires],
+                )
+                .await
+                .map_err(|cause| database_error("renew table lease", cause))?
+                .into_row()
+                .await
+                .map_err(|cause| database_error("read table lease renewal", cause))?;
+            let row = row.ok_or_else(|| {
+                ReceiptError::new(ReceiptErrorKind::Fenced, "table lease or owner expired before renewal")
+            })?;
+            let issued = unix_millis(required_datetime(&row, "renewed_at_utc")?)?;
+            TableLease::new(
+                lease.lease_id(),
+                lease.table().clone(),
+                lease.holder_instance_id(),
+                lease.implementation_pool(),
+                lease.fencing_token(),
+                issued,
+                expires_at,
             )
-            .await
-            .map_err(|cause| database_error("renew table lease", cause))?
-            .into_row()
-            .await
-            .map_err(|cause| database_error("read table lease renewal", cause))?;
-        let row = row.ok_or_else(|| {
-            ReceiptError::new(ReceiptErrorKind::Fenced, "table lease or owner expired before renewal")
-        })?;
-        let issued = unix_millis(required_datetime(&row, "renewed_at_utc")?)?;
-        TableLease::new(
-            lease.lease_id(),
-            lease.table().clone(),
-            lease.holder_instance_id(),
-            lease.implementation_pool(),
-            lease.fencing_token(),
-            issued,
-            expires_at,
-        )
-        .map_err(|cause| ReceiptError::new(ReceiptErrorKind::CorruptState, cause.to_string()))
+            .map_err(|cause| ReceiptError::new(ReceiptErrorKind::CorruptState, cause.to_string()))
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "renew_table_lease",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn release_table_lease(&self, lease: &TableLease, released_at: UnixMillis) -> ReceiptResult<()> {
@@ -554,26 +634,38 @@ impl ReceiptStore for SqlServerReceiptStore {
         let owner = lease.holder_instance_id().as_uuid();
         let released = datetime(released_at)?;
         let mut client = self.connect().await?;
-        let row = client
-            .query(
-                "UPDATE arrowcol.table_leases \
+        let result: ReceiptResult<_> = async {
+            let row = client
+                .query(
+                    "UPDATE arrowcol.table_leases \
                  SET released_at_utc = @P3, release_reason = 'released' \
                  OUTPUT INSERTED.lease_id \
                  WHERE lease_id = @P1 AND holder_instance_id = @P2 AND released_at_utc IS NULL;",
-                &[&lease_uuid, &owner, &released],
-            )
-            .await
-            .map_err(|cause| database_error("release table lease", cause))?
-            .into_row()
-            .await
-            .map_err(|cause| database_error("read table lease release", cause))?;
-        if row.is_none() {
-            return Err(ReceiptError::new(
-                ReceiptErrorKind::Fenced,
-                "table lease was already released or ownership changed",
-            ));
+                    &[&lease_uuid, &owner, &released],
+                )
+                .await
+                .map_err(|cause| database_error("release table lease", cause))?
+                .into_row()
+                .await
+                .map_err(|cause| database_error("read table lease release", cause))?;
+            if row.is_none() {
+                return Err(ReceiptError::new(
+                    ReceiptErrorKind::Fenced,
+                    "table lease was already released or ownership changed",
+                ));
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "release_table_lease",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn create_flight_batch(
@@ -610,6 +702,7 @@ impl ReceiptStore for SqlServerReceiptStore {
         })?;
         let pool = lease.implementation_pool().to_string();
         let mut client = self.connect().await?;
+        let result: ReceiptResult<_> = async {
         client
             .begin_transaction_with_isolation(IsolationLevel::Serializable)
             .await
@@ -690,6 +783,17 @@ impl ReceiptStore for SqlServerReceiptStore {
         }
         .await;
         finish_transaction(&mut client, result, "create receipt batch").await
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "create_flight_batch",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn mark_buffered(
@@ -699,15 +803,28 @@ impl ReceiptStore for SqlServerReceiptStore {
         lease_deadline: UnixMillis,
     ) -> ReceiptResult<Vec<ReceiptRecord>> {
         self.mutation_bound(receipts.len())?;
-        transition_batch(
-            &mut self.connect().await?,
-            owner,
-            receipts,
-            "accepted",
-            "buffered",
-            Some(lease_deadline),
-        )
-        .await
+        let mut client = self.connect().await?;
+        let result: ReceiptResult<_> = async {
+            transition_batch(
+                &mut client,
+                owner,
+                receipts,
+                "accepted",
+                "buffered",
+                Some(lease_deadline),
+            )
+            .await
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "mark_buffered",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn mark_flushing(
@@ -717,15 +834,28 @@ impl ReceiptStore for SqlServerReceiptStore {
         lease_deadline: UnixMillis,
     ) -> ReceiptResult<Vec<ReceiptRecord>> {
         self.mutation_bound(receipts.len())?;
-        transition_batch(
-            &mut self.connect().await?,
-            owner,
-            receipts,
-            "buffered",
-            "flushing",
-            Some(lease_deadline),
-        )
-        .await
+        let mut client = self.connect().await?;
+        let result: ReceiptResult<_> = async {
+            transition_batch(
+                &mut client,
+                owner,
+                receipts,
+                "buffered",
+                "flushing",
+                Some(lease_deadline),
+            )
+            .await
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "mark_flushing",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn heartbeat_receipts(
@@ -741,17 +871,18 @@ impl ReceiptStore for SqlServerReceiptStore {
         let owner_uuid = owner.as_uuid();
         let deadline = datetime(lease_deadline)?;
         let mut client = self.connect().await?;
-        client
-            .begin_transaction_with_isolation(IsolationLevel::Serializable)
-            .await
-            .map_err(|cause| database_error("begin receipt heartbeat", cause))?;
-        let result = async {
-            for receipt in receipts {
-                let id = receipt.receipt_id.as_uuid();
-                let revision = revision_i64(receipt.revision)?;
-                let row = client
-                    .query(
-                        "UPDATE r \
+        let result: ReceiptResult<_> = async {
+            client
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|cause| database_error("begin receipt heartbeat", cause))?;
+            let result = async {
+                for receipt in receipts {
+                    let id = receipt.receipt_id.as_uuid();
+                    let revision = revision_i64(receipt.revision)?;
+                    let row = client
+                        .query(
+                            "UPDATE r \
                          SET heartbeat_at_utc = SYSUTCDATETIME(), receipt_lease_deadline_utc = @P4 \
                          OUTPUT INSERTED.receipt_id \
                          FROM arrowcol.delivery_receipts AS r \
@@ -765,21 +896,32 @@ impl ReceiptStore for SqlServerReceiptStore {
                            AND @P4 <= l.expires_at_utc \
                            AND i.state IN ('active', 'draining') AND i.lease_expires_at_utc > SYSUTCDATETIME() \
                            AND @P4 <= i.lease_expires_at_utc;",
-                        &[&id, &owner_uuid, &revision, &deadline],
-                    )
-                    .await
-                    .map_err(|cause| database_error("heartbeat receipt lease", cause))?
-                    .into_row()
-                    .await
-                    .map_err(|cause| database_error("read receipt heartbeat result", cause))?;
-                if row.is_none() {
-                    return Err(transition_conflict(receipt.receipt_id));
+                            &[&id, &owner_uuid, &revision, &deadline],
+                        )
+                        .await
+                        .map_err(|cause| database_error("heartbeat receipt lease", cause))?
+                        .into_row()
+                        .await
+                        .map_err(|cause| database_error("read receipt heartbeat result", cause))?;
+                    if row.is_none() {
+                        return Err(transition_conflict(receipt.receipt_id));
+                    }
                 }
+                Ok(())
             }
-            Ok(())
+            .await;
+            finish_transaction(&mut client, result, "heartbeat receipts").await
         }
         .await;
-        finish_transaction(&mut client, result, "heartbeat receipts").await
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "heartbeat_receipts",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn publish_commit(
@@ -819,17 +961,18 @@ impl ReceiptStore for SqlServerReceiptStore {
         let schema = table.schema().to_string();
         let table_name = table.table().to_string();
         let mut client = self.connect().await?;
-        client
-            .begin_transaction_with_isolation(IsolationLevel::Serializable)
-            .await
-            .map_err(|cause| database_error("begin receipt publication", cause))?;
-        let result = async {
-            for receipt in &batch.receipts {
-                let id = receipt.receipt_id.as_uuid();
-                let revision = revision_i64(receipt.revision)?;
-                let row = client
-                    .query(
-                        "UPDATE r \
+        let result: ReceiptResult<_> = async {
+            client
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|cause| database_error("begin receipt publication", cause))?;
+            let result = async {
+                for receipt in &batch.receipts {
+                    let id = receipt.receipt_id.as_uuid();
+                    let revision = revision_i64(receipt.revision)?;
+                    let row = client
+                        .query(
+                            "UPDATE r \
                          SET state = 'published', revision = revision + 1, updated_at_utc = @P8, \
                              heartbeat_at_utc = @P8, delta_version = @P9, data_files_added = @P10, \
                              rows_published = @P11, bytes_published = @P12, published_at_utc = @P8 \
@@ -843,47 +986,58 @@ impl ReceiptStore for SqlServerReceiptStore {
                            AND r.state = 'flushing' AND r.lease_id = @P4 AND r.fencing_epoch = @P5 \
                            AND t.catalog_name = @P6 AND t.schema_name = @P7 AND t.table_name = @P13 \
                            AND l.released_at_utc IS NULL AND l.expires_at_utc > @P8;",
-                        &[
-                            &id,
-                            &owner_uuid,
-                            &revision,
-                            &lease_uuid,
-                            &epoch,
-                            &catalog,
-                            &schema,
-                            &published,
-                            &delta_version,
-                            &data_files,
-                            &rows,
-                            &bytes,
-                            &table_name,
-                        ],
+                            &[
+                                &id,
+                                &owner_uuid,
+                                &revision,
+                                &lease_uuid,
+                                &epoch,
+                                &catalog,
+                                &schema,
+                                &published,
+                                &delta_version,
+                                &data_files,
+                                &rows,
+                                &bytes,
+                                &table_name,
+                            ],
+                        )
+                        .await
+                        .map_err(|cause| database_error("publish delivery receipt", cause))?
+                        .into_row()
+                        .await
+                        .map_err(|cause| database_error("read published receipt", cause))?;
+                    if row.is_none() {
+                        return Err(transition_conflict(receipt.receipt_id));
+                    }
+                    insert_event(
+                        &mut client,
+                        id,
+                        revision + 1,
+                        Some("flushing"),
+                        "published",
+                        owner_uuid,
+                        None,
+                        Some("durable Delta commit observed"),
                     )
-                    .await
-                    .map_err(|cause| database_error("publish delivery receipt", cause))?
-                    .into_row()
-                    .await
-                    .map_err(|cause| database_error("read published receipt", cause))?;
-                if row.is_none() {
-                    return Err(transition_conflict(receipt.receipt_id));
+                    .await?;
                 }
-                insert_event(
-                    &mut client,
-                    id,
-                    revision + 1,
-                    Some("flushing"),
-                    "published",
-                    owner_uuid,
-                    None,
-                    Some("durable Delta commit observed"),
-                )
-                .await?;
+                let ids: Vec<_> = batch.receipts.iter().map(|receipt| receipt.receipt_id).collect();
+                receipts_with_client(&mut client, &ids).await
             }
-            let ids: Vec<_> = batch.receipts.iter().map(|receipt| receipt.receipt_id).collect();
-            receipts_with_client(&mut client, &ids).await
+            .await;
+            finish_transaction(&mut client, result, "publish receipt batch").await
         }
         .await;
-        finish_transaction(&mut client, result, "publish receipt batch").await
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "publish_commit",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn fail_batch(
@@ -924,60 +1078,72 @@ impl ReceiptStore for SqlServerReceiptStore {
         let failed = datetime(failed_at)?;
         let owner_uuid = owner.as_uuid();
         let mut client = self.connect().await?;
-        client
-            .begin_transaction_with_isolation(IsolationLevel::Serializable)
-            .await
-            .map_err(|cause| database_error("begin receipt failure", cause))?;
-        let result = async {
-            for receipt in receipts {
-                let id = receipt.receipt_id.as_uuid();
-                let revision = revision_i64(receipt.revision)?;
-                let row = client
-                    .query(
-                        "UPDATE arrowcol.delivery_receipts \
+        let result: ReceiptResult<_> = async {
+            client
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|cause| database_error("begin receipt failure", cause))?;
+            let result = async {
+                for receipt in receipts {
+                    let id = receipt.receipt_id.as_uuid();
+                    let revision = revision_i64(receipt.revision)?;
+                    let row = client
+                        .query(
+                            "UPDATE arrowcol.delivery_receipts \
                          SET state = @P4, revision = revision + 1, updated_at_utc = @P5, heartbeat_at_utc = @P5, \
                              failure_disposition = @P6, error_code = @P7, error_message = @P8, retry_after_ms = @P9 \
                          OUTPUT INSERTED.receipt_id \
                          WHERE receipt_id = @P1 AND owner_instance_id = @P2 AND revision = @P3 \
                            AND state IN ('accepted', 'buffered', 'flushing');",
-                        &[
-                            &id,
-                            &owner_uuid,
-                            &revision,
-                            &target,
-                            &failed,
-                            &disposition,
-                            &error_code,
-                            &error_message,
-                            &retry_after,
-                        ],
+                            &[
+                                &id,
+                                &owner_uuid,
+                                &revision,
+                                &target,
+                                &failed,
+                                &disposition,
+                                &error_code,
+                                &error_message,
+                                &retry_after,
+                            ],
+                        )
+                        .await
+                        .map_err(|cause| database_error("fail delivery receipt", cause))?
+                        .into_row()
+                        .await
+                        .map_err(|cause| database_error("read failed receipt", cause))?;
+                    if row.is_none() {
+                        return Err(transition_conflict(receipt.receipt_id));
+                    }
+                    let from = receipt_state_for_revision(receipt.revision)?;
+                    insert_event(
+                        &mut client,
+                        id,
+                        revision + 1,
+                        Some(from),
+                        target,
+                        owner_uuid,
+                        Some(disposition),
+                        Some(error_message),
                     )
-                    .await
-                    .map_err(|cause| database_error("fail delivery receipt", cause))?
-                    .into_row()
-                    .await
-                    .map_err(|cause| database_error("read failed receipt", cause))?;
-                if row.is_none() {
-                    return Err(transition_conflict(receipt.receipt_id));
+                    .await?;
                 }
-                let from = receipt_state_for_revision(receipt.revision)?;
-                insert_event(
-                    &mut client,
-                    id,
-                    revision + 1,
-                    Some(from),
-                    target,
-                    owner_uuid,
-                    Some(disposition),
-                    Some(error_message),
-                )
-                .await?;
+                let ids: Vec<_> = receipts.iter().map(|receipt| receipt.receipt_id).collect();
+                receipts_with_client(&mut client, &ids).await
             }
-            let ids: Vec<_> = receipts.iter().map(|receipt| receipt.receipt_id).collect();
-            receipts_with_client(&mut client, &ids).await
+            .await;
+            finish_transaction(&mut client, result, "fail receipt batch").await
         }
         .await;
-        finish_transaction(&mut client, result, "fail receipt batch").await
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "fail_batch",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn receipt(&self, receipt_id: ReceiptId) -> ReceiptResult<Option<ReceiptRecord>> {
@@ -1001,7 +1167,17 @@ impl ReceiptStore for SqlServerReceiptStore {
                 ),
             ));
         }
-        receipts_optional_with_client(&mut self.connect().await?, receipt_ids).await
+        let mut client = self.connect().await?;
+        let result: ReceiptResult<_> = async { receipts_optional_with_client(&mut client, receipt_ids).await }.await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "receipts",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 
     async fn reconcile_expired(&self, now: UnixMillis, limit: usize) -> ReceiptResult<ReconciliationReport> {
@@ -1019,53 +1195,54 @@ impl ReceiptStore for SqlServerReceiptStore {
             )
         })?;
         let mut client = self.connect().await?;
-        client
-            .begin_transaction_with_isolation(IsolationLevel::ReadCommitted)
-            .await
-            .map_err(|cause| database_error("begin receipt reconciliation", cause))?;
-        let result = async {
-            let rows = client
-                .query(
-                    "SELECT TOP (@P1) receipt_id, owner_instance_id, revision, state \
+        let result: ReceiptResult<_> = async {
+            client
+                .begin_transaction_with_isolation(IsolationLevel::ReadCommitted)
+                .await
+                .map_err(|cause| database_error("begin receipt reconciliation", cause))?;
+            let result = async {
+                let rows = client
+                    .query(
+                        "SELECT TOP (@P1) receipt_id, owner_instance_id, revision, state \
                      FROM arrowcol.delivery_receipts WITH ( \
                          INDEX(IX_delivery_receipts_expiry_active), UPDLOCK, READPAST, ROWLOCK \
                      ) \
                      WHERE receipt_lease_deadline_utc <= @P2 \
                        AND state IN ('accepted', 'buffered', 'flushing') \
                      ORDER BY receipt_lease_deadline_utc, receipt_id;",
-                    &[&limit_i32, &now],
-                )
-                .await
-                .map_err(|cause| database_error("select expired receipts", cause))?
-                .into_first_result()
-                .await
-                .map_err(|cause| database_error("read expired receipts", cause))?;
-            let mut ids = Vec::with_capacity(rows.len());
-            for row in rows {
-                let id = required_uuid(&row, "receipt_id")?;
-                let owner = required_uuid(&row, "owner_instance_id")?;
-                let revision = required_i64(&row, "revision")?;
-                let state = required_str(&row, "state")?.to_owned();
-                let (target, disposition, error_code, error_message, event_message) = if state == "flushing" {
-                    (
-                        "permanent_failure",
-                        "permanent",
-                        "publication_outcome_unknown",
-                        "receipt ownership expired while Delta publication outcome was uncertain",
-                        "expired flushing work requires explicit Delta reconciliation",
+                        &[&limit_i32, &now],
                     )
-                } else {
-                    (
-                        "retryable_failure",
-                        "retryable",
-                        "publication_failed",
-                        "receipt ownership expired before recoverable publication completed",
-                        "expired recoverable in-process work",
-                    )
-                };
-                let updated = client
-                    .query(
-                        "UPDATE arrowcol.delivery_receipts \
+                    .await
+                    .map_err(|cause| database_error("select expired receipts", cause))?
+                    .into_first_result()
+                    .await
+                    .map_err(|cause| database_error("read expired receipts", cause))?;
+                let mut ids = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let id = required_uuid(&row, "receipt_id")?;
+                    let owner = required_uuid(&row, "owner_instance_id")?;
+                    let revision = required_i64(&row, "revision")?;
+                    let state = required_str(&row, "state")?.to_owned();
+                    let (target, disposition, error_code, error_message, event_message) = if state == "flushing" {
+                        (
+                            "permanent_failure",
+                            "permanent",
+                            "publication_outcome_unknown",
+                            "receipt ownership expired while Delta publication outcome was uncertain",
+                            "expired flushing work requires explicit Delta reconciliation",
+                        )
+                    } else {
+                        (
+                            "retryable_failure",
+                            "retryable",
+                            "publication_failed",
+                            "receipt ownership expired before recoverable publication completed",
+                            "expired recoverable in-process work",
+                        )
+                    };
+                    let updated = client
+                        .query(
+                            "UPDATE arrowcol.delivery_receipts \
                          SET state = @P6, revision = revision + 1, updated_at_utc = @P4, \
                              heartbeat_at_utc = @P4, failure_disposition = @P7, \
                              error_code = @P8, error_message = @P9, \
@@ -1073,46 +1250,57 @@ impl ReceiptStore for SqlServerReceiptStore {
                          OUTPUT INSERTED.receipt_id \
                          WHERE receipt_id = @P1 AND owner_instance_id = @P2 AND revision = @P3 \
                            AND state = @P5 AND receipt_lease_deadline_utc <= @P4;",
-                        &[
-                            &id,
-                            &owner,
-                            &revision,
-                            &now,
-                            &state,
-                            &target,
-                            &disposition,
-                            &error_code,
-                            &error_message,
-                        ],
-                    )
-                    .await
-                    .map_err(|cause| database_error("reconcile expired receipt", cause))?
-                    .into_row()
-                    .await
-                    .map_err(|cause| database_error("read reconciled receipt", cause))?;
-                if updated.is_some() {
-                    insert_event(
-                        &mut client,
-                        id,
-                        revision + 1,
-                        Some(&state),
-                        target,
-                        owner,
-                        Some(disposition),
-                        Some(event_message),
-                    )
-                    .await?;
-                    ids.push(receipt_id(id)?);
+                            &[
+                                &id,
+                                &owner,
+                                &revision,
+                                &now,
+                                &state,
+                                &target,
+                                &disposition,
+                                &error_code,
+                                &error_message,
+                            ],
+                        )
+                        .await
+                        .map_err(|cause| database_error("reconcile expired receipt", cause))?
+                        .into_row()
+                        .await
+                        .map_err(|cause| database_error("read reconciled receipt", cause))?;
+                    if updated.is_some() {
+                        insert_event(
+                            &mut client,
+                            id,
+                            revision + 1,
+                            Some(&state),
+                            target,
+                            owner,
+                            Some(disposition),
+                            Some(event_message),
+                        )
+                        .await?;
+                        ids.push(receipt_id(id)?);
+                    }
                 }
+                let reconciled = receipts_with_client(&mut client, &ids).await?;
+                Ok(ReconciliationReport {
+                    limit_reached: reconciled.len() == limit,
+                    reconciled,
+                })
             }
-            let reconciled = receipts_with_client(&mut client, &ids).await?;
-            Ok(ReconciliationReport {
-                limit_reached: reconciled.len() == limit,
-                reconciled,
-            })
+            .await;
+            finish_transaction(&mut client, result, "reconcile expired receipts").await
         }
         .await;
-        finish_transaction(&mut client, result, "reconcile expired receipts").await
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "reconcile_expired",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
     }
 }
 
@@ -1500,7 +1688,13 @@ async fn finish_transaction<T>(client: &mut SqlClient, result: ReceiptResult<T>,
             Ok(value)
         }
         Err(error) => {
-            let _rollback = client.rollback_transaction().await;
+            if let Err(rollback_error) = client.rollback_transaction().await {
+                tracing::warn!(
+                    operation = context,
+                    error = %rollback_error,
+                    "SQL Server rollback failed; preserving primary operation error and discarding connection"
+                );
+            }
             Err(error)
         }
     }
@@ -1679,4 +1873,53 @@ fn missing_column(column: &str) -> ReceiptError {
 
 fn database_error(context: &str, cause: impl std::fmt::Display) -> ReceiptError {
     ReceiptError::new(ReceiptErrorKind::Database, format!("{context}: {cause}"))
+}
+
+#[cfg(test)]
+mod pooling_tests {
+    use super::*;
+    use arrowcol_sql_server::PoolConfig;
+
+    #[test]
+    fn pooling_requires_equivalent_connection_configuration() -> anyhow::Result<()> {
+        let config = SqlServerReceiptConfig::new("localhost", 1433, "catalog", "pool-user", "pool-secret")
+            .trust_server_certificate(true)
+            .with_timeouts(Duration::from_secs(3), Duration::from_secs(7));
+        let pool = SqlPool::new(
+            config.connection_config(),
+            PoolConfig {
+                max_size: 2,
+                acquire_timeout: Duration::from_secs(1),
+            },
+        )?;
+        let bounded = config.clone().with_batch_limits(1, 2)?;
+        let store = SqlServerReceiptStore::new(bounded).with_pool(pool.clone())?;
+        assert!(store.clone().pool.is_some());
+        assert!(SqlServerReceiptStore::new(config.clone()).pool.is_none());
+
+        for field in 0..8 {
+            let mut mismatch = config.clone();
+            match field {
+                0 => mismatch.host = "other-host".to_owned(),
+                1 => mismatch.port = 1434,
+                2 => mismatch.database = "other-database".to_owned(),
+                3 => mismatch.username = "other-user".to_owned(),
+                4 => mismatch.password = "other-secret".to_owned(),
+                5 => mismatch.trust_server_certificate = false,
+                6 => mismatch.connect_timeout = Duration::from_secs(4),
+                _ => mismatch.command_timeout = Duration::from_secs(8),
+            }
+            let Err(error) = SqlServerReceiptStore::new(mismatch).with_pool(pool.clone()) else {
+                anyhow::bail!("store accepted a mismatched pool");
+            };
+            assert_eq!(error.kind(), ReceiptErrorKind::InvalidConfiguration);
+            assert!(!error.to_string().contains("pool-user"));
+            assert!(!error.to_string().contains("pool-secret"));
+            assert!(!error.to_string().contains("other-secret"));
+        }
+        assert_eq!(pool.stats().created, 0);
+        pool.close();
+        assert_eq!(store.clone().pool.as_ref().map(|pool| pool.stats().max_size), Some(0));
+        Ok(())
+    }
 }

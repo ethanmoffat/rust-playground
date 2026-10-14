@@ -79,6 +79,9 @@ test('actual runtime builder applies matching process-wide 128 MiB budgets witho
   assert.deepEqual(builtDirect.delta, direct.delta);
   assert.deepEqual(builtNodes.delta.config.commit, nodes.delta.config.commit);
   assert.deepEqual(builtDirect.receipts, direct.receipts);
+  assert.deepEqual(builtDirect.sql_server.pool, {
+    receipts_max_size: 16, routing_max_size: 4, catalog_max_size: 4, acquire_timeout_ms: 5000,
+  });
   assert.deepEqual(builtDirect.auth, direct.auth);
   assert.equal(builtDirect.identity.generation, 2);
   assert.equal(builtDirect.flight.max_concurrent_streams, 256);
