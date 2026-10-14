@@ -20,7 +20,6 @@ pub const RUN_METADATA_FILE: &str = "run-metadata.json";
 pub const SCHEMA_CONTRACT_FILE: &str = "schema-contracts.json";
 pub const ROUTING_EVIDENCE_FILE: &str = "routing.json";
 pub const CAPABILITY_EVIDENCE_FILE: &str = "capabilities.json";
-pub const PROBE_EVIDENCE_FILE: &str = "probes.json";
 pub const VALIDATION_FILE: &str = "validation.json";
 
 /// Pool-specific acknowledgement outcome.

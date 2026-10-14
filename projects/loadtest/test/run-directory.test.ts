@@ -1,15 +1,70 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { deltaTableLocations, prepareBenchmarkDirectory } from '../src/main.js';
+import { BENCHMARK_PROJECT } from '../src/cli.js';
+import { deltaTableLocations } from '../src/main.js';
+import { acquireBenchmarkController, benchmarkDirectories, checkedBenchmarkPath, resetBenchmark } from '../src/lifecycle.js';
 
-test('Delta table locations show aligned absolute workspace paths for the selected run', () => {
-  const directory = path.resolve('onelake/benchmark/custom-run');
-  assert.equal(deltaTableLocations('onelake/benchmark/custom-run'), [
+function fixture(t: { after: (callback: () => void) => void }): string {
+  const workspace = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-reset-'));
+  t.after(() => rmSync(workspace, { recursive: true, force: true }));
+  return workspace;
+}
+
+interface Resource {
+  id: string;
+  name: string;
+  labels: Record<string, string>;
+  containers?: Record<string, { Name: string }>;
+}
+
+function mockDocker(workspace: string): { commands: string[][]; docker: (args: string[]) => string } {
+  const commands: string[][] = [];
+  const labelled = (project: string): Record<string, string> => ({
+    'com.docker.compose.project': project,
+    'com.docker.compose.project.config_files': path.join(workspace, 'projects/loadtest/compose.yaml'),
+  });
+  const containers: Resource[] = [
+    { id: 'collector', name: 'collector', labels: labelled(BENCHMARK_PROJECT) },
+    { id: 'unrelated', name: 'unrelated', labels: labelled('another-project') },
+  ];
+  const volumes: Resource[] = [
+    { id: `${BENCHMARK_PROJECT}_sqlserver-data`, name: `${BENCHMARK_PROJECT}_sqlserver-data`,
+      labels: { ...labelled(BENCHMARK_PROJECT), 'com.docker.compose.volume': 'sqlserver-data' } },
+    { id: 'other-volume', name: 'other-volume', labels: labelled('another-project') },
+  ];
+  const networks: Resource[] = [
+    { id: 'network', name: `${BENCHMARK_PROJECT}_default`, labels: labelled(BENCHMARK_PROJECT),
+      containers: { collector: { Name: 'collector' } } },
+    { id: 'other-network', name: 'another-project_default', labels: labelled('another-project') },
+  ];
+  const docker = (args: string[]): string => {
+    commands.push(args);
+    if (args[0] === 'ps') return containers.map(resource => resource.id).join('\n');
+    if (args[1] === 'ls') return (args[0] === 'volume' ? volumes : networks).map(resource => resource.id).join('\n');
+    if (args.includes('inspect')) {
+      const resource = [...containers, ...volumes, ...networks].find(resource => resource.id === args.at(-1));
+      assert(resource);
+      return JSON.stringify(resource);
+    }
+    if (args[0] === 'stop') return '';
+    if (args.includes('rm')) {
+      const list = args[0] === 'volume' ? volumes : args[0] === 'network' ? networks : containers;
+      for (let index = list.length - 1; index >= 0; index--) if (args.includes(list[index].id)) list.splice(index, 1);
+      return '';
+    }
+    throw new Error(`Unexpected Docker command ${args.join(' ')}`);
+  };
+  return { commands, docker };
+}
+
+test('Delta output has one fixed location', () => {
+  const directory = path.resolve('onelake/benchmark/latest');
+  assert.equal(deltaTableLocations(directory), [
     'Delta tables on disk (workspace paths)',
     '-------------------------------------',
     `  Direct:   ${path.join(directory, 'direct')}`,
@@ -17,60 +72,145 @@ test('Delta table locations show aligned absolute workspace paths for the select
   ].join('\n'));
 });
 
-function staleRun(root: string): { root: string; directory: string } {
-  const directory = path.join(root, 'latest');
-  mkdirSync(directory);
-  writeFileSync(path.join(directory, 'result.json'), '{"old":true}');
-  return { root, directory };
-}
-
-function fixture(t: { after: (callback: () => void) => void }): string {
-  const root = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-run-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  return root;
-}
-
-test('new runs reserve separate directories; even empty reserved runs are never replaced', (t) => {
-  const root = fixture(t);
-  assert.equal(prepareBenchmarkDirectory(root, 'latest', () => false).directory, path.join(root, 'latest'));
-  assert.throws(() => prepareBenchmarkDirectory(root, 'latest', () => false), /unused --run-id/u);
-  assert.equal(prepareBenchmarkDirectory(root, 'soak-2', () => false).directory, path.join(root, 'soak-2'));
+test('starting again removes old output and owned SQL resources without an identity flag', async t => {
+  const workspace = fixture(t);
+  const latest = path.join(workspace, 'onelake/benchmark/latest');
+  mkdirSync(latest, { recursive: true });
+  writeFileSync(path.join(latest, 'old.json'), '{}');
+  const { docker, commands } = mockDocker(workspace);
+  assert.equal(await resetBenchmark(workspace, docker), latest);
+  assert(!existsSync(path.join(latest, 'old.json')));
+  assert(commands.some(args => args.join(' ') === `volume rm ${BENCHMARK_PROJECT}_sqlserver-data`));
+  assert(commands.some(args => args.join(' ') === 'rm collector'));
+  assert(commands.every(args => !args.includes('unrelated') || args.includes('inspect')));
+  assert(commands.every(args => !args.includes('other-volume') || args.includes('inspect')));
+  writeFileSync(path.join(latest, 'second.json'), '{}');
+  assert.equal(await resetBenchmark(workspace, docker), latest);
+  assert(!existsSync(path.join(latest, 'second.json')));
 });
 
-test('historical output is neither renamed nor replaced without a stack', (t) => {
-  const { root, directory } = staleRun(fixture(t));
-  assert.throws(() => prepareBenchmarkDirectory(root, 'latest', () => false), /unused --run-id/u);
-  assert.equal(readFileSync(path.join(directory, 'result.json'), 'utf8'), '{"old":true}');
+test('legacy benchmark data is reset but unrelated directories survive', async t => {
+  const workspace = fixture(t);
+  const legacy = path.join(workspace, 'onelake/benchmark/previous');
+  mkdirSync(path.join(legacy, 'router-state'), { recursive: true });
+  writeFileSync(path.join(legacy, 'router-state/network.json'), '{}');
+  const unrelated = path.join(workspace, 'onelake/benchmark/not-a-benchmark');
+  mkdirSync(unrelated);
+  writeFileSync(path.join(unrelated, 'keep.txt'), 'keep');
+  assert.deepEqual(benchmarkDirectories(workspace), [legacy]);
+  const { docker } = mockDocker(workspace);
+  await resetBenchmark(workspace, docker);
+  assert(!existsSync(legacy));
+  assert.equal(readFileSync(path.join(unrelated, 'keep.txt'), 'utf8'), 'keep');
 });
 
-test('retained resources block a run even without a directory', (t) => {
-  const root = fixture(t);
-  assert.throws(() => prepareBenchmarkDirectory(root, 'latest', () => true), /retained SQL volume\/history/u);
+test('symlinks and workspace escapes are rejected before Docker mutations', async t => {
+  const workspace = fixture(t);
+  const outside = path.join(workspace, 'outside');
+  mkdirSync(outside);
+  writeFileSync(path.join(outside, 'keep.txt'), 'keep');
+  const root = path.join(workspace, 'onelake/benchmark');
+  mkdirSync(root, { recursive: true });
+  symlinkSync(outside, path.join(root, 'latest'));
+  const { docker, commands } = mockDocker(workspace);
+  await assert.rejects(resetBenchmark(workspace, docker), /symlink/u);
+  assert.equal(commands.length, 0);
+  assert.throws(() => checkedBenchmarkPath(workspace, path.dirname(workspace)), /outside/u);
+  assert.equal(readFileSync(path.join(outside, 'keep.txt'), 'utf8'), 'keep');
 });
 
-test('path traversal and dangling directory symlinks cannot bypass reservation', (t) => {
-  const root = fixture(t);
-  assert.throws(() => prepareBenchmarkDirectory(root, '../escape', () => false), /run-id/u);
-  symlinkSync(path.join(root, 'missing'), path.join(root, 'latest'));
-  assert.throws(() => prepareBenchmarkDirectory(root, 'latest', () => false), /unused --run-id/u);
+test('another workspace ownership and cleanup failures cannot silently start a new benchmark', async t => {
+  const workspace = fixture(t);
+  const latest = path.join(workspace, 'onelake/benchmark/latest');
+  mkdirSync(latest, { recursive: true });
+  writeFileSync(path.join(latest, 'keep.txt'), 'keep');
+  const { docker, commands } = mockDocker('/another-workspace');
+  await assert.rejects(resetBenchmark(workspace, docker), /another workspace/u);
+  assert(commands.every(args => !args.includes('rm') && args[0] !== 'stop'));
+  const valid = mockDocker(workspace);
+  await assert.rejects(resetBenchmark(workspace, args => {
+    if (args[0] === 'stop') throw new Error('Docker stop failed');
+    return valid.docker(args);
+  }), /Docker stop failed/u);
+  assert.equal(readFileSync(path.join(latest, 'keep.txt'), 'utf8'), 'keep');
 });
 
-test('CLI rejects a retained SQL volume before bootstrap and never issues destructive Docker commands', (t) => {
-  const root = fixture(t);
-  const calls = path.join(root, 'docker-calls.jsonl');
-  writeFileSync(path.join(root, 'docker'), `#!${process.execPath}
-import { appendFileSync } from 'node:fs';
-appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2))+'\\n');
-if (process.argv[2] === 'volume') console.log('retained-sql-volume');
-`, { mode: 0o755 });
-  const result = spawnSync(process.execPath, [
-    ...process.execArgv, fileURLToPath(new URL('../src/main.ts', import.meta.url)),
-    '--run-id', 'fixture-existing-sql-volume',
-  ], { encoding: 'utf8', env: { ...process.env, PATH: `${root}:${process.env.PATH}` }, timeout: 10_000 });
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /unused --run-id/u);
-  const commands = readFileSync(calls, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as string[]);
-  assert(commands.some((args) => args[0] === 'volume' && args[1] === 'ls'));
-  assert(commands.every((args) => !args.some((arg) => ['rm', 'down', 'kill', '--volumes'].includes(arg))));
-  assert(!commands.some((args) => args[0] === 'compose'));
+test('scratch symlinks are rejected before Docker mutations, even without previous output', async t => {
+  const workspace = fixture(t);
+  const outside = path.join(workspace, 'outside');
+  mkdirSync(outside);
+  writeFileSync(path.join(outside, 'keep.txt'), 'keep');
+  const temporary = path.join(workspace, 'projects/loadtest/.temp');
+  mkdirSync(temporary, { recursive: true });
+  symlinkSync(outside, path.join(temporary, 'bin'));
+  const { docker, commands } = mockDocker(workspace);
+  await assert.rejects(resetBenchmark(workspace, docker), /symlink/u);
+  assert.equal(commands.length, 0);
+  assert.equal(readFileSync(path.join(outside, 'keep.txt'), 'utf8'), 'keep');
+});
+
+test('a stale controller PID is not signalled and concurrent same-process startup is rejected', async t => {
+  const workspace = fixture(t);
+  const temporary = path.join(workspace, 'projects/loadtest/.temp');
+  mkdirSync(temporary, { recursive: true });
+  writeFileSync(path.join(temporary, 'controller.json'), JSON.stringify({ pid: process.pid, started: '0' }));
+  const controller = await acquireBenchmarkController(workspace);
+  try {
+    controller.checkRunning();
+    await assert.rejects(acquireBenchmarkController(workspace), /unrelated process/u);
+    assert.equal(JSON.parse(readFileSync(path.join(temporary, 'controller.json'), 'utf8')).pid, process.pid);
+  } finally {
+    controller.close();
+  }
+  assert(!existsSync(path.join(temporary, 'controller.json')));
+});
+
+test('a new start waits for the positively identified previous controller to finish', { timeout: 15_000 }, async t => {
+  const workspace = fixture(t);
+  const source = path.join(workspace, 'projects/loadtest/src/main.ts');
+  mkdirSync(path.dirname(source), { recursive: true });
+  const lifecycle = fileURLToPath(new URL('../src/lifecycle.ts', import.meta.url));
+  writeFileSync(source, [
+    `import { acquireBenchmarkController } from ${JSON.stringify(lifecycle)};`,
+    `const controller = await acquireBenchmarkController(${JSON.stringify(workspace)});`,
+    'const timer = setInterval(() => {',
+    '  try { controller.checkRunning(); }',
+    '  catch { clearInterval(timer); controller.close(); }',
+    '}, 10);',
+    'console.log("ready");',
+  ].join('\n'));
+  const child = spawn(process.execPath, [...process.execArgv, source], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const exited = new Promise<number | null>(resolve => child.once('exit', resolve));
+  t.after(async () => {
+    if (child.exitCode === null) child.kill('SIGTERM');
+    await exited;
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.once('error', reject);
+    child.stdout.on('data', data => { if (String(data).includes('ready')) resolve(); });
+    child.once('exit', code => reject(new Error(`Fixture controller exited ${code} before becoming ready`)));
+  });
+  const controller = await acquireBenchmarkController(workspace);
+  try {
+    assert.equal(await exited, 0);
+    controller.checkRunning();
+    assert.equal(JSON.parse(readFileSync(path.join(workspace, 'projects/loadtest/.temp/controller.json'), 'utf8')).pid, process.pid);
+  } finally {
+    controller.close();
+  }
+});
+
+test('foreign network endpoints are rejected before stopping containers', async t => {
+  const workspace = fixture(t);
+  const { docker, commands } = mockDocker(workspace);
+  await assert.rejects(resetBenchmark(workspace, args => {
+    const text = docker(args);
+    if (args[0] === 'network' && args[1] === 'inspect' && args.at(-1) === 'network') {
+      const resource = JSON.parse(text);
+      resource.containers.foreign = { Name: 'do-not-stop' };
+      return JSON.stringify(resource);
+    }
+    return text;
+  }), /Another container/u);
+  assert(commands.every(args => args[0] !== 'stop' && !args.includes('rm')));
 });

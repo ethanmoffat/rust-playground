@@ -75,7 +75,7 @@ pub struct CapabilityEvidence {
 #[derive(Clone)]
 pub struct FlightTransport {
     channel: Channel,
-    catalog_channel: Option<Channel>,
+    catalog_channel: Channel,
     http: HttpClient,
     receipt_base: Url,
     direct_admin_bases: Vec<Url>,
@@ -84,14 +84,14 @@ pub struct FlightTransport {
 }
 
 impl FlightTransport {
-    /// Connects to the router and loads the trusted-edge key.
+    /// Connects to the router and catalog and loads the authentication keys.
     ///
     /// # Errors
     ///
     /// Returns invalid endpoint, key, or connection failures.
     pub async fn connect(
         flight_endpoint: &str,
-        catalog_endpoint: Option<&str>,
+        catalog_endpoint: &str,
         receipt_endpoint: &str,
         edge_secret_file: &Path,
         internal_secret_file: &Path,
@@ -104,17 +104,11 @@ impl FlightTransport {
             .http2_keep_alive_interval(Duration::from_secs(10))
             .keep_alive_while_idle(true);
         let channel = endpoint.connect().await?;
-        let catalog_channel = if let Some(catalog_endpoint) = catalog_endpoint {
-            Some(
-                Endpoint::from_shared(catalog_endpoint.to_owned())?
-                    .connect_timeout(timeout)
-                    .timeout(timeout)
-                    .connect()
-                    .await?,
-            )
-        } else {
-            None
-        };
+        let catalog_channel = Endpoint::from_shared(catalog_endpoint.to_owned())?
+            .connect_timeout(timeout)
+            .timeout(timeout)
+            .connect()
+            .await?;
         let http = HttpClient::builder()
             .connect_timeout(timeout)
             .timeout(timeout)
@@ -165,11 +159,7 @@ impl FlightTransport {
         let mut request = Request::new(outbound);
         self.internal_signer.decorate_catalog_request(&mut request)?;
         request.set_timeout(timeout);
-        let mut client = FlightServiceClient::new(
-            self.catalog_channel
-                .clone()
-                .context("catalog channel was not configured")?,
-        );
+        let mut client = FlightServiceClient::new(self.catalog_channel.clone());
         let response = tokio::time::timeout(timeout, client.do_put(request))
             .await
             .context("Flight SQL registration timed out")??;

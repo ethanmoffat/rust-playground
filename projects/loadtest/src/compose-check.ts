@@ -31,7 +31,6 @@ const result = spawnSync('docker', args, {
     ...process.env,
     LOADTEST_UID: String(process.getuid?.() ?? 10001),
     LOADTEST_GID: String(process.getgid?.() ?? 10001),
-    LOADTEST_RUN_ID: 'config-check',
     ONELAKE_HOST_PATH: state,
     LOADTEST_SCRATCH_HOST_PATH: path.join(workspace, 'projects/loadtest/.temp'),
     LOADTEST_BIN_HOST_PATH: path.join(workspace, 'target/debug'),

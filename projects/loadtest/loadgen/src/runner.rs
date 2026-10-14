@@ -1,30 +1,23 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
-use arrow::{array::RecordBatch, datatypes::Schema};
 use arrowcol_protocol::{ImplementationPool, ReceiptId, UnixMillis};
 use arrowcol_routing::{RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
 use serde::Serialize;
-use tokio::{
-    sync::{Semaphore, mpsc},
-    task::JoinSet,
-};
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
     cli::{RunArgs, Scenario},
-    generator::{LogicalBatch, Scheduler, build_logical_batch, encode_record_batch},
+    generator::{LogicalBatch, Scheduler, build_logical_batch},
     manifest::{
-        AckOutcome, CAPABILITY_EVIDENCE_FILE, ManifestWriter, PROBE_EVIDENCE_FILE, RECEIPT_MANIFEST_FILE,
-        ROUTING_EVIDENCE_FILE, RUN_METADATA_FILE, ReceiptManifestEntry, SendManifestEntry, run_metadata,
+        AckOutcome, CAPABILITY_EVIDENCE_FILE, ManifestWriter, RECEIPT_MANIFEST_FILE, ROUTING_EVIDENCE_FILE,
+        RUN_METADATA_FILE, ReceiptManifestEntry, SendManifestEntry, run_metadata,
     },
     schema::{TABLE_COUNT, schema_contract_sha256},
     sdk::prepare_tables,
@@ -40,10 +33,7 @@ use crate::{
 /// Returns invalid configuration, dependency, delivery, receipt, or evidence failures.
 pub async fn run(arguments: RunArgs) -> Result<()> {
     validate_arguments(&arguments)?;
-    let run_id = arguments
-        .run_id
-        .clone()
-        .unwrap_or_else(|| format!("run-{}-{}", now_unix_millis(), Uuid::new_v4().simple()));
+    let run_id = format!("run-{}-{}", now_unix_millis(), Uuid::new_v4().simple());
     let manifests = ManifestWriter::create(&arguments.results).await?;
     let schema_digest = schema_contract_sha256()?;
     manifests
@@ -52,7 +42,7 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
 
     let transport = FlightTransport::connect(
         &arguments.router_endpoint,
-        (!arguments.reuse_generated).then_some(arguments.catalog_endpoint.as_str()),
+        &arguments.catalog_endpoint,
         &arguments.receipt_endpoint,
         &arguments.edge_secret_file,
         &arguments.internal_secret_file,
@@ -60,11 +50,7 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         arguments.request_timeout.get(),
     )
     .await?;
-    let tables = if arguments.reuse_generated {
-        crate::sdk::load_prepared_tables(&arguments, &run_id, &manifests).await?
-    } else {
-        prepare_tables(&arguments, &run_id, &transport, &manifests).await?
-    };
+    let tables = prepare_tables(&arguments, &run_id, &transport, &manifests).await?;
     if tables.len() != TABLE_COUNT {
         bail!("prepared {} schemas instead of {TABLE_COUNT}", tables.len());
     }
@@ -77,13 +63,11 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         bail!("requested load table filter contains an unknown table");
     }
 
-    if !arguments.skip_capabilities {
-        let capabilities = serde_json::json!({
-            "direct": transport.capability_evidence(&arguments.direct_admin_endpoints).await?,
-            "dataflow": transport.capability_evidence(&arguments.dataflow_admin_endpoints).await?,
-        });
-        manifests.write_json(CAPABILITY_EVIDENCE_FILE, &capabilities).await?;
-    }
+    let capabilities = serde_json::json!({
+        "direct": transport.capability_evidence(&arguments.direct_admin_endpoints).await?,
+        "dataflow": transport.capability_evidence(&arguments.dataflow_admin_endpoints).await?,
+    });
+    manifests.write_json(CAPABILITY_EVIDENCE_FILE, &capabilities).await?;
 
     if !arguments.capture_settle.get().is_zero() {
         tokio::time::sleep(arguments.capture_settle.get()).await;
@@ -93,21 +77,6 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
     for table in &load_tables {
         let batch = build_logical_batch(Arc::clone(table), arguments.batch_rows, arguments.seed).await?;
         batches.insert(table.identity.to_string(), Arc::new(batch));
-    }
-    if !arguments.skip_probes {
-        let probe = run_probes(
-            &transport,
-            batches
-                .values()
-                .next()
-                .cloned()
-                .context("generated probe batch is missing")?,
-            arguments.lanes,
-            arguments.request_timeout.get(),
-            arguments.drain_timeout.get(),
-        )
-        .await?;
-        manifests.write_json(PROBE_EVIDENCE_FILE, &probe).await?;
     }
     let scheduled_table_count = load_tables.len();
     let scheduler = Arc::new(Scheduler::new(load_tables, arguments.seed)?);
@@ -204,166 +173,6 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_probes(
-    transport: &FlightTransport,
-    batch: Arc<LogicalBatch>,
-    lanes: usize,
-    request_timeout: Duration,
-    drain_timeout: Duration,
-) -> Result<ProbeEvidence> {
-    let mut fields = batch
-        .record_batch
-        .schema()
-        .fields()
-        .iter()
-        .map(|field| field.as_ref().clone())
-        .collect::<Vec<_>>();
-    let first = fields.first_mut().context("probe schema has no fields")?;
-    *first = first.clone().with_nullable(true);
-    let malformed = RecordBatch::try_new(Arc::new(Schema::new(fields)), batch.record_batch.columns().to_vec())?;
-    let (malformed, _) = encode_record_batch(&batch.table, &malformed).await?;
-    let malformed = Arc::new(malformed);
-    let mut rejection = None;
-    for attempt in 1..=16_u32 {
-        match transport
-            .send_batch(
-                &batch.table,
-                ImplementationPool::Direct,
-                Arc::clone(&malformed),
-                request_timeout,
-            )
-            .await
-        {
-            Ok(_) => bail!("breaking schema probe unexpectedly created an acknowledgement"),
-            Err(error)
-                if error.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<tonic::Status>()
-                        .is_some_and(|status| status.code() == tonic::Code::InvalidArgument)
-                }) =>
-            {
-                let (code, message) = status_fields(&error);
-                rejection = Some(format!("{code}: {message}"));
-                break;
-            }
-            Err(error) if attempt == 16 => {
-                return Err(error).context("breaking schema probe never reached schema validation");
-            }
-            Err(_) => tokio::time::sleep(probe_retry_delay(attempt)).await,
-        }
-    }
-    let rejection = rejection.context("breaking schema probe produced no result")?;
-
-    let first = send_probe_with_retry(transport, &batch, ImplementationPool::Direct, request_timeout).await?;
-    let second = send_probe_with_retry(transport, &batch, ImplementationPool::Direct, request_timeout).await?;
-    let (FlightAcknowledgement::DurableReceipt(first), FlightAcknowledgement::DurableReceipt(second)) = (first, second)
-    else {
-        bail!("duplicate direct probe did not return durable receipts");
-    };
-    if first == second {
-        bail!("byte-identical direct deliveries reused a receipt identifier");
-    }
-    wait_for_probe_receipts(transport, &[first, second], drain_timeout).await?;
-
-    let limit = lanes.clamp(1, 8);
-    let semaphore = Arc::new(Semaphore::new(limit));
-    let active = Arc::new(AtomicUsize::new(0));
-    let peak = Arc::new(AtomicUsize::new(0));
-    let mut sends = JoinSet::new();
-    for _ in 0..limit.saturating_mul(2) {
-        let transport = transport.clone();
-        let batch = Arc::clone(&batch);
-        let semaphore = Arc::clone(&semaphore);
-        let active = Arc::clone(&active);
-        let peak = Arc::clone(&peak);
-        sends.spawn(async move {
-            let permit = semaphore.acquire_owned().await.context("probe semaphore closed")?;
-            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-            peak.fetch_max(current, Ordering::SeqCst);
-            let result = send_probe_with_retry(&transport, &batch, ImplementationPool::Dataflow, request_timeout).await;
-            active.fetch_sub(1, Ordering::SeqCst);
-            drop(permit);
-            match result? {
-                FlightAcknowledgement::BestEffortAdmission => Ok::<(), anyhow::Error>(()),
-                FlightAcknowledgement::DurableReceipt(_) => {
-                    bail!("dataflow backpressure probe returned a durable receipt")
-                }
-            }
-        });
-    }
-    while let Some(result) = sends.join_next().await {
-        result.context("bounded backpressure probe task failed")??;
-    }
-    let observed = peak.load(Ordering::SeqCst);
-    if observed > limit {
-        bail!("bounded backpressure probe exceeded its in-flight limit");
-    }
-    Ok(ProbeEvidence {
-        breaking_schema_rejected_before_receipt: true,
-        breaking_schema_error: rejection,
-        duplicate_receipts: [first.to_string(), second.to_string()],
-        duplicate_receipts_published: true,
-        bounded_inflight_limit: limit,
-        bounded_inflight_observed: observed,
-        dataflow_probe_admissions: limit.saturating_mul(2),
-    })
-}
-
-async fn send_probe_with_retry(
-    transport: &FlightTransport,
-    batch: &LogicalBatch,
-    pool: ImplementationPool,
-    timeout: Duration,
-) -> Result<FlightAcknowledgement> {
-    let mut last_error = None;
-    for attempt in 1..=16_u32 {
-        match transport
-            .send_batch(&batch.table, pool, Arc::clone(&batch.encoded), timeout)
-            .await
-        {
-            Ok(acknowledgement) => return Ok(acknowledgement),
-            Err(error) => {
-                last_error = Some(error);
-                if attempt < 16 {
-                    tokio::time::sleep(probe_retry_delay(attempt)).await;
-                }
-            }
-        }
-    }
-    Err(last_error.context("probe delivery retries were exhausted")?)
-}
-
-fn probe_retry_delay(attempt: u32) -> Duration {
-    let exponent = attempt.saturating_sub(1).min(4);
-    Duration::from_millis(100_u64.saturating_mul(1_u64 << exponent).min(1_000))
-}
-
-async fn wait_for_probe_receipts(transport: &FlightTransport, receipts: &[ReceiptId], timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let responses = receipt_poll_map(receipts, transport.poll_receipts(receipts).await?)?;
-        let mut published = 0_usize;
-        for receipt in receipts {
-            let response = responses.get(receipt).context("probe receipt response is missing")?;
-            if let Some(status) = &response.status {
-                let facts = ReceiptFacts::from_status(status);
-                if facts.state == "published" && response.purge_allowed {
-                    published += 1;
-                } else if facts.terminal {
-                    bail!("duplicate probe receipt {receipt} ended as {}", facts.state);
-                }
-            }
-        }
-        if published == receipts.len() {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("duplicate receipt probe exceeded its bounded publication timeout");
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
 fn validate_arguments(arguments: &RunArgs) -> Result<()> {
     if arguments.lanes == 0 || arguments.batch_rows == 0 || arguments.max_attempts == 0 {
         bail!("lanes, batch rows, and max attempts must be positive");
@@ -385,17 +194,6 @@ fn validate_arguments(arguments: &RunArgs) -> Result<()> {
         bail!("benchmark scenarios must not contain duplicates");
     }
     Ok(())
-}
-
-#[derive(Serialize)]
-struct ProbeEvidence {
-    breaking_schema_rejected_before_receipt: bool,
-    breaking_schema_error: String,
-    duplicate_receipts: [String; 2],
-    duplicate_receipts_published: bool,
-    bounded_inflight_limit: usize,
-    bounded_inflight_observed: usize,
-    dataflow_probe_admissions: usize,
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -626,3 +626,62 @@ struct ValidationReport {
     dataflow: Option<SnapshotSummary>,
     routing: RoutingEvidence,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ordinary_capabilities() -> Value {
+        serde_json::json!({
+            "direct": [{
+                "response": {
+                    "implementation_pool": "direct",
+                    "capabilities": ["receipt_status"]
+                }
+            }],
+            "dataflow": [{
+                "response": {
+                    "delivery_guarantee": "best_effort",
+                    "completion_mode": "best_effort_admission",
+                    "capabilities": []
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn ordinary_collector_delivery_capabilities_are_valid() {
+        let mut failures = Vec::new();
+        validate_capabilities(&ordinary_capabilities(), &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn capability_evidence_is_required_for_both_pools() {
+        let mut failures = Vec::new();
+        validate_capabilities(&serde_json::json!({}), &mut failures);
+        assert_eq!(
+            failures,
+            [
+                "direct capability evidence is missing",
+                "dataflow capability evidence is missing",
+            ]
+        );
+    }
+
+    #[test]
+    fn capability_validation_preserves_delivery_contracts() {
+        let mut capabilities = ordinary_capabilities();
+        capabilities["direct"][0]["response"]["capabilities"] = serde_json::json!([]);
+        capabilities["dataflow"][0]["response"]["capabilities"] = serde_json::json!(["receipt_status"]);
+        let mut failures = Vec::new();
+        validate_capabilities(&capabilities, &mut failures);
+        assert_eq!(
+            failures,
+            [
+                "direct collector did not advertise durable receipt status",
+                "dataflow collector capability gap was not reported honestly",
+            ]
+        );
+    }
+}

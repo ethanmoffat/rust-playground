@@ -1,5 +1,4 @@
 export interface BenchmarkOptions {
-  runId: string;
   warmupSeconds: number;
   measureSeconds?: number;
   captureSettleSeconds: number;
@@ -12,17 +11,7 @@ export interface BenchmarkOptions {
 }
 
 const MAX_DURATION_SECONDS = 2_147_483_647;
-
-export function validateRunId(value: string): string {
-  if (!/^[a-z0-9][a-z0-9_-]{0,37}$/u.test(value)) {
-    throw new Error('--run-id must be 1–38 lowercase ASCII letters, digits, underscores or hyphens, starting with a letter or digit');
-  }
-  return value;
-}
-
-export function benchmarkProject(runId: string): string {
-  return `rust-playground-loadtest-${validateRunId(runId)}`;
-}
+export const BENCHMARK_PROJECT = 'rust-playground-loadtest-latest';
 
 export function parseDuration(value: string, name: string): number {
   const match = /^([0-9]+)([smh]?)$/iu.exec(value);
@@ -46,7 +35,6 @@ export function parseBenchmarkOptions(args: string[]): BenchmarkOptions {
   let concurrency = '4';
   let batchRows = '8192';
   let measure: string | undefined;
-  let runId = 'latest';
   let validate = false;
   for (let index = 0; index < args.length; index++) {
     if (args[index] === '--validate') {
@@ -61,11 +49,9 @@ export function parseBenchmarkOptions(args: string[]): BenchmarkOptions {
     else if (option === '--concurrency') concurrency = value;
     else if (option === '--measure') measure = value;
     else if (option === '--batch-rows') batchRows = value;
-    else if (option === '--run-id') runId = validateRunId(value);
     else throw new Error(`Unknown option '${option}'. Options: ${benchmarkUsage}`);
   }
   return {
-    runId,
     warmupSeconds: parseDuration(warmup, '--warmup'),
     measureSeconds: measure === undefined ? undefined : parseDuration(measure, '--measure'),
     captureSettleSeconds: 30,
@@ -78,4 +64,4 @@ export function parseBenchmarkOptions(args: string[]): BenchmarkOptions {
   };
 }
 
-export const benchmarkUsage = '[--run-id latest (must be unused)] [--warmup 30s] [--measure 1m (omit to run until Ctrl+C)] [--concurrency 4] [--batch-rows 8192] [--validate]';
+export const benchmarkUsage = '[--warmup 30s] [--measure 1m (omit to run until Ctrl+C)] [--concurrency 4] [--batch-rows 8192] [--validate]';

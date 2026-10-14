@@ -19,7 +19,7 @@ pub struct Cli {
 pub enum Command {
     /// Register schemas, generate SDK artifacts, and run bounded load.
     Run(Box<RunArgs>),
-    /// Validate retained manifests and independent Delta snapshots.
+    /// Validate benchmark manifests and independent Delta snapshots.
     Validate(ValidateArgs),
     /// Print the exact public Flight SQL schema fixture.
     PrintSchemas,
@@ -100,10 +100,6 @@ impl std::error::Error for DurationParseError {}
 /// Runtime and connection settings.
 #[derive(Clone, Debug, Args)]
 pub struct RunArgs {
-    /// Stable run identifier. Defaults to a UTC timestamp and random suffix.
-    #[arg(long, env = "LOADTEST_RUN_ID")]
-    pub run_id: Option<String>,
-
     /// Warmup duration.
     #[arg(long, env = "LOADTEST_WARMUP", default_value = "2m")]
     pub warmup: DurationArg,
@@ -161,18 +157,6 @@ pub struct RunArgs {
     #[arg(long, env = "LOADTEST_MAX_ATTEMPTS", default_value_t = 16)]
     pub max_attempts: u32,
 
-    /// Skip one-time schema/duplicate/backpressure probes for follow-up chaos sends.
-    #[arg(long, env = "LOADTEST_SKIP_PROBES", default_value_t = false, hide = true)]
-    pub skip_probes: bool,
-
-    /// Reuse previously generated SDK artifacts for a follow-up run.
-    #[arg(long, env = "LOADTEST_REUSE_GENERATED", default_value_t = false, hide = true)]
-    pub reuse_generated: bool,
-
-    /// Skip capability snapshots for a degraded follow-up chaos send.
-    #[arg(long, env = "LOADTEST_SKIP_CAPABILITIES", default_value_t = false, hide = true)]
-    pub skip_capabilities: bool,
-
     /// Router Arrow Flight endpoint.
     #[arg(long, env = "LOADTEST_ROUTER_ENDPOINT", default_value = "http://router:50050")]
     pub router_endpoint: String,
@@ -229,7 +213,7 @@ pub struct RunArgs {
     )]
     pub scratch_root: PathBuf,
 
-    /// Retained benchmark result directory.
+    /// Benchmark result directory.
     #[arg(long, env = "LOADTEST_RESULTS", default_value = "/results")]
     pub results: PathBuf,
 
@@ -276,10 +260,10 @@ impl RunArgs {
     }
 }
 
-/// Inputs for independent retained-state validation.
+/// Inputs for independent benchmark output validation.
 #[derive(Clone, Debug, Args)]
 pub struct ValidateArgs {
-    /// Retained benchmark result directory.
+    /// Benchmark result directory.
     #[arg(long, env = "LOADTEST_RESULTS", default_value = "/results")]
     pub results: PathBuf,
 
@@ -302,6 +286,8 @@ pub struct ValidateArgs {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::{Context, Result, bail};
+
     use super::*;
 
     #[test]
@@ -323,9 +309,61 @@ mod tests {
     }
 
     #[test]
+    fn execution_naming_and_follow_up_options_are_not_supported() -> Result<()> {
+        for option in ["--run-id", "--skip-probes", "--reuse-generated", "--skip-capabilities"] {
+            let error = Cli::try_parse_from(["arrowcol-loadgen", "run", option])
+                .err()
+                .with_context(|| format!("removed option {option} was accepted"))?;
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+
+        let command = <Cli as clap::CommandFactory>::command();
+        let run = command.find_subcommand("run").context("run command is missing")?;
+        for argument in run.get_arguments() {
+            assert!(
+                ![
+                    "LOADTEST_RUN_ID",
+                    "LOADTEST_SKIP_PROBES",
+                    "LOADTEST_REUSE_GENERATED",
+                    "LOADTEST_SKIP_CAPABILITIES",
+                ]
+                .iter()
+                .any(|removed| argument.get_env().is_some_and(|env| env == *removed))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_load_settings_remain_supported() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "arrowcol-loadgen",
+            "run",
+            "--warmup",
+            "2m",
+            "--measure",
+            "30s",
+            "--lanes",
+            "8",
+            "--batch-rows",
+            "1024",
+            "--scenario",
+            "paired",
+        ])?;
+        let Command::Run(arguments) = cli.command else {
+            bail!("expected run command");
+        };
+        assert_eq!(arguments.warmup.get(), Duration::from_secs(120));
+        assert_eq!(arguments.measure.get(), Duration::from_secs(30));
+        assert_eq!(arguments.lanes, 8);
+        assert_eq!(arguments.batch_rows, 1024);
+        assert_eq!(arguments.effective_scenarios(), vec![Scenario::Paired]);
+        Ok(())
+    }
+
+    #[test]
     fn continuous_mode_forces_paired_scheduling() {
         let arguments = RunArgs {
-            run_id: Some("test".to_owned()),
             warmup: DurationArg(Duration::ZERO),
             measure: DurationArg(Duration::from_secs(1)),
             capture_settle: DurationArg(Duration::ZERO),
@@ -339,9 +377,6 @@ mod tests {
             batch_rows: 1,
             seed: 1,
             max_attempts: 1,
-            skip_probes: false,
-            reuse_generated: false,
-            skip_capabilities: false,
             router_endpoint: "http://localhost".to_owned(),
             catalog_endpoint: "http://localhost".to_owned(),
             receipt_endpoint: "http://localhost".to_owned(),

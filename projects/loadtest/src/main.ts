@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import {
-  chmodSync, closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync,
+  chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync,
 } from 'node:fs';
 import { hostname } from 'node:os';
 import path from 'node:path';
@@ -10,14 +10,14 @@ import { fileURLToPath } from 'node:url';
 
 import {
   benchmarkUsage,
-  benchmarkProject,
+  BENCHMARK_PROJECT,
   parseBenchmarkOptions,
-  validateRunId,
   type BenchmarkOptions,
 } from './cli.js';
 import { startResourceSampler } from './resource-sampler.js';
 import { writeProvenance } from './provenance.js';
 import { benchmarkComposeFiles, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs } from './runtime-config.js';
+import { acquireBenchmarkController, resetBenchmark, type BenchmarkController } from './lifecycle.js';
 
 const workspace = realpathSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..'));
 const composeFile = path.join(workspace, 'projects/loadtest/compose.yaml');
@@ -114,60 +114,35 @@ function composeInteractive(project: string, env: NodeJS.ProcessEnv, args: strin
   }
 }
 
-function runInteractive(
+async function runInteractive(
   command: string,
   args: string[],
   env: NodeJS.ProcessEnv,
+  controller: BenchmarkController,
   timeout?: number,
-): void {
-  const result = spawnSync(command, args, {
+): Promise<void> {
+  const child = spawn(command, args, {
     cwd: workspace,
     env,
     stdio: 'inherit',
     timeout,
   });
-  if (result.error || result.status !== 0) {
-    throw new Error(`${command} ${args.join(' ')} failed: ${result.error?.message ?? result.status}`);
-  }
-}
-
-function benchmarkProjectHasResources(project: string): boolean {
-  const filter = `label=com.docker.compose.project=${project}`;
-  return run('docker', ['ps', '--all', '--quiet', '--filter', filter]).trim().length > 0
-    || run('docker', ['network', 'ls', '--quiet', '--filter', filter]).trim().length > 0
-    || run('docker', ['volume', 'ls', '--quiet', '--filter', filter]).trim().length > 0
-    || run('docker', ['volume', 'ls', '--quiet', '--filter', `name=^${project}_`]).trim().length > 0;
-}
-
-export function prepareBenchmarkDirectory(
-  benchmarkRoot: string,
-  runId: string,
-  projectHasResources: () => boolean,
-): { directory: string } {
-  validateRunId(runId);
-  const directory = path.join(benchmarkRoot, runId);
-  const conflict = (): Error => new Error(
-    `Benchmark run '${runId}' already has a directory, stack or retained SQL volume/history; use an unused --run-id. Nothing was stopped or removed.`,
-  );
-  if (projectHasResources()) throw conflict();
+  controller.setChild(child);
   try {
-    lstatSync(directory);
-    throw conflict();
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    await new Promise<void>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', (code, signal) => {
+        if (code === 0 && signal === null) resolve();
+        else reject(new Error(`${command} ${args.join(' ')} failed: ${signal ?? code}`));
+      });
+    });
+  } finally {
+    controller.setChild(undefined);
   }
-  mkdirSync(benchmarkRoot, { recursive: true });
-  try {
-    mkdirSync(directory);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw conflict();
-    throw error;
-  }
-  return { directory };
 }
 
-function writeBenchmarkSecrets(runId: string): { edge: string; internal: string } {
-  const root = path.join(workspace, 'projects/loadtest/.temp/secrets', runId);
+function writeBenchmarkSecrets(): { edge: string; internal: string } {
+  const root = path.join(workspace, 'projects/loadtest/.temp/secrets/latest');
   mkdirSync(root, { recursive: true });
   const edge = path.join(root, 'edge-hmac.txt');
   const internal = path.join(root, 'internal-hmac.txt');
@@ -183,9 +158,9 @@ function cargoTargetDirectory(): string {
   return target;
 }
 
-function stageHelperBinaries(runId: string): string {
+function stageHelperBinaries(): string {
   const source = path.join(cargoTargetDirectory(), 'debug');
-  const destination = path.join(workspace, 'projects/loadtest/.temp/bin', runId);
+  const destination = path.join(workspace, 'projects/loadtest/.temp/bin/latest');
   mkdirSync(destination, { recursive: true });
   for (const binary of ['arrowcol-loadgen', 'arrowcol-sdk-gen']) {
     const input = path.join(source, binary);
@@ -242,11 +217,10 @@ function benchmarkEnvironment(
   network: BenchmarkNetwork,
   binaryDirectory: string,
 ): NodeJS.ProcessEnv {
-  const secrets = writeBenchmarkSecrets(options.runId);
+  const secrets = writeBenchmarkSecrets();
   const infra = path.join(workspace, 'projects/arrowcol-infra/secrets');
   return {
     ...environment(directory),
-    LOADTEST_RUN_ID: options.runId,
     LOADTEST_COMPOSE_OVERRIDE_FILE: path.join(directory, 'router-state/compose-runtime.json'),
     LOADTEST_WARMUP: `${options.warmupSeconds}s`,
     ...(options.measureSeconds === undefined ? {} : { LOADTEST_MEASURE: `${options.measureSeconds}s` }),
@@ -309,7 +283,7 @@ function cidrRange(value: string): [number, number] | undefined {
   return [start, start + size - 1];
 }
 
-function selectBenchmarkNetwork(_runId: string): BenchmarkNetwork {
+function selectBenchmarkNetwork(): BenchmarkNetwork {
   const ids = run('docker', ['network', 'ls', '--quiet']).trim().split('\n').filter(Boolean);
   const used = ids.length === 0
     ? []
@@ -328,7 +302,7 @@ function selectBenchmarkNetwork(_runId: string): BenchmarkNetwork {
       direct: `${base}.21`, dataflow: `${base}.31`,
     };
   }
-  throw new Error('No unused benchmark subnet in 10.89.0.0/16; retained stacks were left untouched');
+  throw new Error('No available benchmark subnet in 10.89.0.0/16');
 }
 
 function connectWorkspaceContainer(
@@ -362,9 +336,8 @@ function connectWorkspaceContainer(
 function localLoadgenEnvironment(
   context: Pick<BenchmarkContext, 'directory' | 'env' | 'network' | 'options'>,
   results: string,
-  overrides: Record<string, string> = {},
 ): NodeJS.ProcessEnv {
-  const secrets = path.join(workspace, 'projects/loadtest/.temp/secrets', context.options.runId);
+  const secrets = path.join(workspace, 'projects/loadtest/.temp/secrets/latest');
   const infra = path.join(workspace, 'projects/arrowcol-infra/secrets');
   return {
     ...context.env,
@@ -376,36 +349,28 @@ function localLoadgenEnvironment(
     LOADTEST_RECEIPT_ENDPOINT: `http://${context.network.router}:50050`,
     LOADTEST_EDGE_SECRET_FILE: path.join(secrets, 'edge-hmac.txt'),
     LOADTEST_INTERNAL_SECRET_FILE: path.join(secrets, 'internal-hmac.txt'),
-    LOADTEST_SCRATCH_ROOT: `projects/loadtest/.temp/loadgen/${context.options.runId}`,
+    LOADTEST_SCRATCH_ROOT: 'projects/loadtest/.temp/loadgen/latest',
     LOADTEST_DIRECT_ADMIN_ENDPOINTS: `http://${context.network.direct}:8081`,
     LOADTEST_DATAFLOW_ADMIN_ENDPOINTS: `http://${context.network.dataflow}:32011`,
     ARROWCOL_SQL_HOST: context.network.sql,
     ARROWCOL_SQL_PASSWORD_FILE: path.join(infra, 'arrowcol-app-password.txt'),
     ARROWCOL_SDK_GEN: path.join(cargoTargetDirectory(), 'debug/arrowcol-sdk-gen'),
-    ...overrides,
   };
 }
 
-function runLocalLoadgen(
+async function runLocalLoadgen(
   context: Pick<BenchmarkContext, 'directory' | 'env' | 'network' | 'options'>,
   command: 'run' | 'validate',
   results: string,
-  overrides: Record<string, string> = {},
-  expectFailure = false,
-): void {
-  let failed = false;
-  try {
-    runInteractive(
-      path.join(cargoTargetDirectory(), 'debug/arrowcol-loadgen'),
-      [command],
-      localLoadgenEnvironment(context, results, overrides),
-      command === 'validate' ? 3_600_000 : context.options.measureSeconds === undefined ? undefined : (context.options.warmupSeconds + context.options.measureSeconds + 600) * 1000,
-    );
-  } catch (error) {
-    failed = true;
-    if (!expectFailure) throw error;
-  }
-  if (expectFailure) assert(failed, `${command} unexpectedly succeeded`);
+  controller: BenchmarkController,
+): Promise<void> {
+  await runInteractive(
+    path.join(cargoTargetDirectory(), 'debug/arrowcol-loadgen'),
+    [command],
+    localLoadgenEnvironment(context, results),
+    controller,
+    command === 'validate' ? 3_600_000 : context.options.measureSeconds === undefined ? undefined : (context.options.warmupSeconds + context.options.measureSeconds + 600) * 1000,
+  );
 }
 
 export function portainerAccess(port: string, passwordFile: string): string {
@@ -430,16 +395,13 @@ export function deltaTableLocations(directory: string): string {
   ].join('\n');
 }
 
-async function benchmark(options: BenchmarkOptions): Promise<BenchmarkContext> {
+async function benchmark(options: BenchmarkOptions, controller: BenchmarkController): Promise<BenchmarkContext> {
   step(`Load test: warmup ${options.warmupSeconds}s, concurrency ${options.concurrency}, batch rows ${options.batchRows}`);
-  step('Bootstrapping secrets and preparing run directory');
-  const project = benchmarkProject(options.runId);
-  const prepared = prepareBenchmarkDirectory(
-    path.join(workspace, 'onelake/benchmark'),
-    options.runId,
-    () => benchmarkProjectHasResources(project),
-  );
-  const directory = prepared.directory;
+  step('Starting fresh: removing previous loadtest containers, volumes, and generated data');
+  const project = BENCHMARK_PROJECT;
+  const directory = await resetBenchmark(workspace, args => run('docker', args));
+  controller.checkRunning();
+  step('Bootstrapping secrets and preparing benchmark');
   for (const child of [
     'direct', 'dataflow', 'otel', 'results', 'router-state',
     'direct-state-1',
@@ -451,10 +413,10 @@ async function benchmark(options: BenchmarkOptions): Promise<BenchmarkContext> {
   try {
     run(path.join(workspace, 'projects/arrowcol-infra/scripts/bootstrap-secrets.sh'), []);
     mkdirSync(path.join(workspace, 'projects/loadtest/.temp'), { recursive: true });
-    network = selectBenchmarkNetwork(options.runId);
+    network = selectBenchmarkNetwork();
     writeRuntimeConfigs(directory, network);
     writeFileSync(path.join(directory, 'router-state/network.json'), `${JSON.stringify(network, null, 2)}\n`);
-    env = benchmarkEnvironment(directory, options, network, stageHelperBinaries(options.runId));
+    env = benchmarkEnvironment(directory, options, network, stageHelperBinaries());
   } catch (error) {
     writeFileSync(path.join(directory, 'results/runner-failure.json'), `${JSON.stringify({
       timestamp: new Date().toISOString(), phase: 'preparation', kind: error instanceof Error ? error.name : 'Error',
@@ -479,11 +441,13 @@ async function benchmark(options: BenchmarkOptions): Promise<BenchmarkContext> {
     composeInteractive(project, env, [
       '--profile', 'benchmark', 'build', 'sqlserver', 'hive-metastore',
     ], 3_600_000);
+    controller.checkRunning();
     phase = 'stack-start';
     step(`Starting ${services.length} services and waiting for health (up to 10 minutes)`);
     composeInteractive(project, env, [
       '--profile', 'benchmark', 'up', '--detach', '--no-build', '--wait', '--wait-timeout', '600', ...services,
     ], 3_600_000);
+    controller.checkRunning();
     workspaceConnection = connectWorkspaceContainer(project, env);
     phase = 'startup-provenance';
     writeProvenance(workspace, directory, project, options, env, true);
@@ -495,7 +459,7 @@ async function benchmark(options: BenchmarkOptions): Promise<BenchmarkContext> {
     });
     step(
       `Grafana: http://localhost:${process.env.GRAFANA_PORT ?? 3000} (admin/admin); ` +
-      `logs: docker compose --project-name ${project} logs -f`,
+      `logs: docker logs -f ${project}-dataflow-1-1`,
     );
     step(portainerAccess(
       process.env.PORTAINER_PORT ?? '9444',
@@ -509,11 +473,12 @@ async function benchmark(options: BenchmarkOptions): Promise<BenchmarkContext> {
     const context = { directory, env, network, options };
     phase = 'load-generation';
     step('Running load generator (Ctrl+C to stop; stack is kept)');
-    runLocalLoadgen(context, 'run', path.join(directory, 'results'));
+    await runLocalLoadgen(context, 'run', path.join(directory, 'results'), controller);
     if (options.validate) {
       phase = 'delta-validation';
       step('Validating Delta output');
-      runLocalLoadgen(context, 'validate', path.join(directory, 'results'));
+      controller.checkRunning();
+      await runLocalLoadgen(context, 'validate', path.join(directory, 'results'), controller);
     }
   } catch (error) {
     failure = error;
@@ -541,7 +506,7 @@ async function benchmark(options: BenchmarkOptions): Promise<BenchmarkContext> {
     step(`FAILED. Diagnostics: ${resultsDirectory}/compose.log`);
     throw failure;
   }
-  step(`Done. Results: ${resultsDirectory}. Stack kept; use an unused --run-id for another run.`);
+  step(`Done. Results: ${resultsDirectory}. Stack kept for inspection; the next start resets it.`);
   return {
     directory,
     env,
@@ -560,7 +525,12 @@ async function main(): Promise<void> {
     return;
   }
   const options = parseBenchmarkOptions(userArguments);
-  await benchmark(options);
+  const controller = await acquireBenchmarkController(workspace);
+  try {
+    await benchmark(options, controller);
+  } finally {
+    controller.close();
+  }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

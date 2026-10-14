@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { benchmarkProject, validateRunId } from './cli.js';
+import { BENCHMARK_PROJECT } from './cli.js';
 
 const execute = promisify(execFile);
 export const SAMPLE_INTERVAL_MS = 10_000;
@@ -256,7 +256,7 @@ function parseSamplerOptions(args: string[]): SamplerOptions {
     values.set(args[index], args[index + 1]);
   }
   const project = values.get('--project') ?? '';
-  if (benchmarkProject(validateRunId(project.replace(/^rust-playground-loadtest-/u, ''))) !== project) {
+  if (project !== BENCHMARK_PROJECT) {
     throw new Error('Invalid sampler project');
   }
   const endpoint = (name: string): string => {

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 
 import { parseCounters, parseMetrics, parseResources, parseStatus, runResourceSampler, startResourceSampler } from '../src/resource-sampler.js';
+import { BENCHMARK_PROJECT } from '../src/cli.js';
 
 const status = 'Pid:\t1\nVmRSS:\t2048 kB\nRssAnon:\t1024 kB\nThreads:\t7\n';
 const resources = `\n__status__\n${status}\n__current__\n4096\n\n__stat__\nanon 2048\ninactive_file 1024\n\n__cpu__\nusage_usec 9000\nuser_usec 7000\nsystem_usec 2000\n`;
@@ -57,7 +58,7 @@ else if (command === 'exec') console.log(${JSON.stringify(resources)});
 else process.exit(1);
 `, { mode: 0o755 });
   const stop = await startResourceSampler({
-    project: 'rust-playground-loadtest-fixture', results,
+    project: BENCHMARK_PROJECT, results,
     directAdmin: 'http://127.0.0.1:1', dataflowAdmin: 'http://127.0.0.1:1',
   }, { ...process.env, PATH: `${results}:${process.env.PATH}` });
   try {

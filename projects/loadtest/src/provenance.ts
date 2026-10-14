@@ -126,9 +126,6 @@ export function writeProvenance(
     workload: {
       ...options, scenario: 'paired', tables: env.LOADTEST_TABLES?.split(',') ?? 'all schema fixtures (13 tables)',
       maxAttempts: env.LOADTEST_MAX_ATTEMPTS ?? '16',
-      skipProbes: env.LOADTEST_SKIP_PROBES ?? 'false',
-      skipCapabilities: env.LOADTEST_SKIP_CAPABILITIES ?? 'false',
-      reuseGenerated: env.LOADTEST_REUSE_GENERATED ?? 'false',
       continuous: options.measureSeconds === undefined, keepStack: true,
     },
     sampler: { intervalMs: 10_000, file: 'resource-samples.jsonl', workingSet: 'max(0, memory.current - memory.stat.inactive_file)' },

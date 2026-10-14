@@ -155,36 +155,6 @@ pub async fn prepare_tables(
     Ok(tables)
 }
 
-/// Reloads generated SDK manifests and Arrow descriptors from an earlier run
-/// without contacting the catalog control plane.
-///
-/// # Errors
-///
-/// Returns unsafe path, missing artifact, manifest, schema, or filesystem failures.
-pub async fn load_prepared_tables(
-    arguments: &RunArgs,
-    run_id: &str,
-    manifests: &ManifestWriter,
-) -> Result<Vec<Arc<GeneratedTable>>> {
-    validate_scratch_root(&arguments.scratch_root)?;
-    let generated_root = arguments.scratch_root.join(safe_component(run_id)?).join("generated");
-    let mut tables = Vec::new();
-    for statement in schema_statements()? {
-        let root = generated_root.join(statement.identity.table().as_str());
-        let table = load_generated_table(&root, &statement.identity, SchemaVersion::FIRST)?;
-        if table.schema.fields().len() != statement.field_count {
-            bail!("reused generated schema field count differs for {}", statement.identity);
-        }
-        tables.push(Arc::new(table));
-    }
-    tables.sort_by(|left, right| left.identity.cmp(&right.identity));
-    let contracts = tables.iter().map(|table| table.contract()).collect::<Vec<_>>();
-    manifests
-        .write_json(crate::manifest::SCHEMA_CONTRACT_FILE, &contracts)
-        .await?;
-    Ok(tables)
-}
-
 fn validate_scratch_root(path: &Path) -> Result<()> {
     if path.is_absolute()
         || path
@@ -209,7 +179,7 @@ fn safe_component(value: &str) -> Result<&str> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
-        bail!("run ID must be 1..=128 ASCII letters, digits, '.', '_' or '-'");
+        bail!("internal correlation ID must be 1..=128 ASCII letters, digits, '.', '_' or '-'");
     }
     Ok(value)
 }
