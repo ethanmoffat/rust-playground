@@ -20,17 +20,19 @@ interface ProcessIdentity {
   cwd: string;
 }
 
-function processIdentity(pid: number): ProcessIdentity | undefined {
+function processIdentity(pid: number, relevant?: (args: string[]) => boolean): ProcessIdentity | undefined {
   try {
     const directory = `/proc/${pid}`;
     if (statSync(directory).uid !== process.getuid?.()) return undefined;
     const stat = readFileSync(`${directory}/stat`, 'utf8');
     const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
     if (fields[0] === 'Z') return undefined;
+    const args = readFileSync(`${directory}/cmdline`, 'utf8').split('\0').filter(Boolean);
+    if (relevant && !relevant(args)) return undefined;
     return {
       pid, parent: Number(fields[1]), started: fields[19],
       executable: readlinkSync(`${directory}/exe`).replace(/ \(deleted\)$/u, ''),
-      arguments: readFileSync(`${directory}/cmdline`, 'utf8').split('\0').filter(Boolean),
+      arguments: args,
       cwd: readlinkSync(`${directory}/cwd`),
     };
   } catch (error) {
@@ -172,7 +174,9 @@ async function stopBenchmarkProcesses(workspace: string, directories: string[]):
   const sampler = path.join(workspace, 'projects/loadtest/src/resource-sampler.ts');
   for (const entry of readdirSync('/proc')) {
     if (!/^[1-9]\d*$/u.test(entry)) continue;
-    const identity = processIdentity(Number(entry));
+    const identity = processIdentity(Number(entry), args =>
+      (path.basename(args[0] ?? '') === 'arrowcol-loadgen' && ['run', 'validate'].includes(args[1]))
+      || args.some(arg => path.basename(arg) === 'resource-sampler.ts'));
     if (!identity || identity.pid === process.pid) continue;
     if (path.basename(identity.executable) === 'arrowcol-loadgen'
         && contained(identity.executable, workspace)

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -213,4 +215,47 @@ test('foreign network endpoints are rejected before stopping containers', async 
     return text;
   }), /Another container/u);
   assert(commands.every(args => args[0] !== 'stop' && !args.includes('rm')));
+});
+
+for (const candidate of [false, true]) test(candidate
+  ? 'unverifiable benchmark candidates prevent cleanup'
+  : 'unrelated protected processes do not prevent a fresh start', async t => {
+  const workspace = fixture(t);
+  const source = 'console.log("ready"); setInterval(() => {}, 1000)';
+  if (candidate) writeFileSync(path.join(workspace, 'run'), source);
+  const child = spawn(process.execPath, candidate ? ['run'] : ['-e', source], {
+    cwd: workspace,
+    argv0: candidate ? path.join(workspace, 'target/debug/arrowcol-loadgen') : process.execPath,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const exited = new Promise<number | null>(resolve => child.once('exit', resolve));
+  t.after(async () => {
+    if (child.exitCode === null) child.kill('SIGTERM');
+    await exited;
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.once('error', reject);
+    child.stdout.once('data', () => resolve());
+    child.once('exit', code => reject(new Error(`Fixture process exited ${code} before becoming ready`)));
+  });
+  const original = fs.readlinkSync;
+  const denied = `/proc/${child.pid}/exe`;
+  const mocked = t.mock.method(fs, 'readlinkSync', (...args: Parameters<typeof fs.readlinkSync>) => {
+    if (args[0] === denied) throw Object.assign(new Error('Protected executable'), { code: 'EACCES' });
+    return original(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const { docker, commands } = mockDocker(workspace);
+    if (candidate) {
+      await assert.rejects(resetBenchmark(workspace, docker), /Protected executable/u);
+      assert(commands.every(args => args[0] !== 'stop' && !args.includes('rm')));
+    } else {
+      await resetBenchmark(workspace, docker);
+    }
+    assert.equal(child.exitCode, null);
+  } finally {
+    mocked.mock.restore();
+    syncBuiltinESMExports();
+  }
 });
