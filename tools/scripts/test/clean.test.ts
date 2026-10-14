@@ -169,6 +169,7 @@ test('every project exposes clean and the root includes every child', () => {
     'crates/arrowcol-receipts/project.json',
     'crates/arrowcol-routing/project.json',
     'crates/arrowcol-sdk-gen/project.json',
+    'crates/arrowcol-sql-server/project.json',
     'crates/arrow-deltalake/project.json',
     'crates/greeting/project.json',
     'crates/otel-deltalake-exporter/project.json',
