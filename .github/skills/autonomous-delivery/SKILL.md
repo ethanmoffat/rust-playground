@@ -67,7 +67,7 @@ A local orchestrator or a focused expert consultation can handle that depth;
 the outer coordinator need not absorb every implementation detail.
 
 | Work | Model-selection bias |
-|---|---|
+| --- | --- |
 | Overall decomposition, priorities, acceptance and integration | Strong reasoning, reliable synthesis and sufficient context |
 | Bounded implementation with a clear contract and tests | Fast, capable coding model |
 | Straightforward evidence gathering or routine validation | Efficient model with the necessary tools and fidelity |

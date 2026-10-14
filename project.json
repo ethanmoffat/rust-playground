@@ -140,6 +140,12 @@
       "dependsOn": [
         {
           "projects": [
+            "tools-scripts"
+          ],
+          "target": "markdown-lint"
+        },
+        {
+          "projects": [
             "arrowcol-buffer",
             "arrowcol-receipts",
             "arrowcol-catalog",
@@ -165,7 +171,25 @@
         "commands": []
       },
       "metadata": {
-        "description": "Run strict Clippy checks for every Rust package."
+        "description": "Lint first-party Markdown and run strict Clippy checks for every Rust package."
+      }
+    },
+    "fail-on-untracked-files": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        {
+          "projects": [
+            "tools-scripts"
+          ],
+          "target": "clean-worktree"
+        }
+      ],
+      "options": {
+        "commands": []
+      },
+      "metadata": {
+        "description": "Reject tracked changes and unexpected untracked files after verification."
       }
     },
     "build": {

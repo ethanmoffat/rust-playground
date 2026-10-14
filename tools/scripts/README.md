@@ -11,6 +11,30 @@ Run all side-effect-free checks with:
 npx nx run tools-scripts:verify
 ```
 
+## Markdown and working-tree checks
+
+```bash
+npx --no-install nx run tools-scripts:markdown-lint
+npx --no-install nx run tools-scripts:markdown-lint-fix
+npx --no-install nx run rust:fail-on-untracked-files
+```
+
+Root `rust:lint` includes `markdown-lint`, which runs without caching so new
+files cannot bypass checks. `.markdownlint-cli2.yaml` covers all first-party
+Markdown, including hidden directories and untracked files, while honoring Git
+ignore rules and excluding submodules, dependencies, and generated output.
+Long lines and inline HTML are allowed; the PR template alone is exempt from
+requiring a top-level heading.
+
+CI discovers Markdown lint as a Node check and runs it read-only. Autofixing is
+explicit and local. Host and container verification then invoke the root
+cleanliness gate, backed by `tools-scripts:clean-worktree`. The gate rejects
+staged and unstaged tracked changes, deletions, renames, dirty submodules, and
+unexpected nonignored untracked files, with status and diff diagnostics. It is
+not a dependency of local lint: normal authoring need not be committed first.
+
+## Registry commands
+
 The registry targets forward arguments to a Commander CLI:
 
 ```bash

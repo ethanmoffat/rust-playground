@@ -162,6 +162,25 @@ npx nx run rust-playground-build:verify
 npx nx run devcontainer:verify
 ```
 
+`rust:lint` checks all first-party Markdown as well as Rust Clippy. To check or
+autofix Markdown alone:
+
+```bash
+npx --no-install nx run tools-scripts:markdown-lint
+npx --no-install nx run tools-scripts:markdown-lint-fix
+```
+
+Markdown checks include new files and hidden documentation directories, exclude
+submodules and ignored/generated output, and allow long lines and inline HTML.
+CI runs read-only lint and rejects tracked changes or unexpected untracked files
+after verification. Check that gate explicitly on a committed checkout with:
+
+```bash
+npx --no-install nx run rust:fail-on-untracked-files
+```
+
+The gate is separate from local lint so uncommitted authoring remains supported.
+
 Run all verification targets serially with:
 
 ```bash

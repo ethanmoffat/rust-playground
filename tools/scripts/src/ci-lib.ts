@@ -206,7 +206,7 @@ export function verifyDevcontainer(
     containerId,
     'bash',
     '-lc',
-    'npx --no-install nx "$@" && npx --no-install nx run tools-scripts:clean-worktree --outputStyle=static',
+    'npx --no-install nx "$@" && npx --no-install nx run rust:fail-on-untracked-files --outputStyle=static',
     'ci-verify',
     ...args,
   ]);
@@ -238,7 +238,7 @@ export function verifyHost(
   }
   runChecked(runner, 'npx', ['--no-install', 'nx', ...args], { cwd: options.workspace });
   runChecked(runner, 'npx', [
-    '--no-install', 'nx', 'run', 'tools-scripts:clean-worktree', '--outputStyle=static',
+    '--no-install', 'nx', 'run', 'rust:fail-on-untracked-files', '--outputStyle=static',
   ], { cwd: options.workspace });
 }
 

@@ -446,7 +446,7 @@ test('runs parallel verification and the clean-tree gate in the exact container'
         sourceContainerId,
         'bash',
         '-lc',
-        'npx --no-install nx "$@" && npx --no-install nx run tools-scripts:clean-worktree --outputStyle=static',
+        'npx --no-install nx "$@" && npx --no-install nx run rust:fail-on-untracked-files --outputStyle=static',
         'ci-verify',
         'run-many',
         '-t',
@@ -763,12 +763,27 @@ test('host shards use argv and do not report clean-tree success after a failed c
   assert.deepEqual(runner.calls[0]?.args, [
     '--no-install', 'nx', 'run', 'tools-scripts:typecheck', '--parallel=4', '--outputStyle=static',
   ]);
-  assert.equal(runner.calls[1]?.args.includes('tools-scripts:clean-worktree'), true);
+  assert.equal(runner.calls[1]?.args.includes('rust:fail-on-untracked-files'), true);
   runner.assertComplete();
   const failed = new FakeRunner([failure(7)]);
   assert.throws(() => verifyHost({ task: 'tools-scripts:test', workspace: '/checkout' }, failed), CommandError);
   assert.equal(failed.calls.length, 1);
   failed.assertComplete();
+});
+
+test('host and container verification propagate cleanliness gate failures', () => {
+  const host = new FakeRunner([success(), failure(9)]);
+  assert.throws(
+    () => verifyHost({ task: 'tools-scripts:test', workspace: '/checkout' }, host),
+    (error: unknown) => error instanceof CommandError && error.exitCode === 9,
+  );
+  host.assertComplete();
+  const container = new FakeRunner([success(), failure(9)]);
+  assert.throws(
+    () => verifyDevcontainer({ containerId: sourceContainerId }, container),
+    (error: unknown) => error instanceof CommandError && error.exitCode === 9,
+  );
+  container.assertComplete();
 });
 
 test('host Node batches run every selected project target with one dependency graph', () => {

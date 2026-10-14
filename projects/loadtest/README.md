@@ -37,10 +37,10 @@ SQLSERVER_MEMORY_LIMIT_MB=8192 npx nx run loadtest:run -- --warmup 2m --concurre
 
 ## Watch and inspect
 
-- **Grafana:** http://localhost:3000/d/arrowcol (`admin` / `admin`).
+- **Grafana:** <http://localhost:3000/d/arrowcol> (`admin` / `admin`).
 - **SQL Server:** `localhost,14333`, username `sa`. The local password is printed
   at startup and stored in `projects/arrowcol-infra/secrets/sqlserver-sa-password.txt`.
-- **Portainer:** https://localhost:9444, username `admin`, the SQL Server password.
+- **Portainer:** <https://localhost:9444>, username `admin`, the SQL Server password.
   The local certificate is self-signed.
 - **Logs:** `docker logs -f rust-playground-loadtest-latest-dataflow-1-1`
   (use `direct-1-1` for the Direct collector).

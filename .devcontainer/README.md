@@ -30,7 +30,6 @@ Common Nx targets:
 - `nx run devcontainer:down -- --volumes`: remove only this workspace's
   discovered Compose project and its volumes.
 
-
 See
 [headless devcontainer operations](../docs/devcontainer/headless-operations.md)
 for exact lifecycle, capture, monitoring, cleanup, and regression commands.
