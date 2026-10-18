@@ -497,6 +497,9 @@ async fn publish_group(
         Ok::<_, ExportFailure>(committed.version)
     }
     .await;
+    if let Err(error) = &result {
+        tracing::error!(table = ?identity, rows, bytes, reason = %error, "Delta publication failed");
+    }
     metrics.publication_finished(identity, rows, bytes, result.as_ref().ok().copied());
     accounting.finished = true;
     let outcome = result.map(|_| ());
