@@ -18,6 +18,7 @@ import { startResourceSampler } from './resource-sampler.js';
 import { writeProvenance } from './provenance.js';
 import { benchmarkComposeFiles, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs } from './runtime-config.js';
 import { acquireBenchmarkController, resetBenchmark, type BenchmarkController } from './lifecycle.js';
+import { kustoComposeStartArguments, kustoStatusSummary, readKustoStatus, requireHealthyKusto, startKusto } from './kusto.js';
 
 const workspace = realpathSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..'));
 const composeFile = path.join(workspace, 'projects/loadtest/compose.yaml');
@@ -78,6 +79,7 @@ function environment(directory: string): NodeJS.ProcessEnv {
     ...process.env,
     LOADTEST_UID: String(process.getuid?.() ?? 10001),
     LOADTEST_GID: String(process.getgid?.() ?? 10001),
+    LOADTEST_WORKSPACE: workspace,
     ONELAKE_HOST_PATH: path.join(hostWorkspace(), path.relative(workspace, directory)),
     LOADTEST_SCRATCH_HOST_PATH: hostPath(path.join(workspace, 'projects/loadtest/.temp')),
     LOADTEST_BIN_HOST_PATH: hostPath(path.join(workspace, 'projects/loadtest/.temp/bin')),
@@ -243,6 +245,7 @@ function benchmarkEnvironment(
     LOADTEST_ROUTER_IP: network.router,
     LOADTEST_DIRECT_1_IP: network.direct,
     LOADTEST_DATAFLOW_1_IP: network.dataflow,
+    LOADTEST_KUSTO_IP: network.kusto,
     SQLSERVER_SA_PASSWORD_FILE: hostPath(path.join(infra, 'sqlserver-sa-password.txt')),
     ARROWCOL_APP_PASSWORD_FILE: hostPath(path.join(infra, 'arrowcol-app-password.txt')),
     ARROWCOL_MIGRATOR_PASSWORD_FILE: hostPath(path.join(infra, 'arrowcol-migrator-password.txt')),
@@ -260,14 +263,20 @@ interface BenchmarkContext {
   workspaceContainer?: string;
 }
 
-interface BenchmarkNetwork {
+export interface BenchmarkNetwork {
   subnet: string;
   sql: string;
   hive: string;
   router: string;
   direct: string;
   dataflow: string;
+  kusto: string;
 }
+
+export const benchmarkCoreServices = [
+  'sqlserver', 'database-bootstrap', 'arrowcol-migrate', 'hive-schema', 'hive-metastore',
+  'lgtm', 'cadvisor', 'portainer', 'direct-1', 'dataflow-1', 'router',
+];
 
 function cidrRange(value: string): [number, number] | undefined {
   const match = /^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/u.exec(value);
@@ -300,6 +309,7 @@ function selectBenchmarkNetwork(): BenchmarkNetwork {
     return {
       subnet, sql: `${base}.2`, hive: `${base}.3`, router: `${base}.10`,
       direct: `${base}.21`, dataflow: `${base}.31`,
+      kusto: `${base}.50`,
     };
   }
   throw new Error('No available benchmark subnet in 10.89.0.0/16');
@@ -333,7 +343,7 @@ function connectWorkspaceContainer(
   return { container, network };
 }
 
-function localLoadgenEnvironment(
+export function localLoadgenEnvironment(
   context: Pick<BenchmarkContext, 'directory' | 'env' | 'network' | 'options'>,
   results: string,
 ): NodeJS.ProcessEnv {
@@ -352,6 +362,7 @@ function localLoadgenEnvironment(
     LOADTEST_SCRATCH_ROOT: 'projects/loadtest/.temp/loadgen/latest',
     LOADTEST_DIRECT_ADMIN_ENDPOINTS: `http://${context.network.direct}:8081`,
     LOADTEST_DATAFLOW_ADMIN_ENDPOINTS: `http://${context.network.dataflow}:32011`,
+    LOADTEST_KUSTO_ENDPOINT: `http://${context.network.kusto}:8080`,
     ARROWCOL_SQL_HOST: context.network.sql,
     ARROWCOL_SQL_PASSWORD_FILE: path.join(infra, 'arrowcol-app-password.txt'),
     ARROWCOL_SDK_GEN: path.join(cargoTargetDirectory(), 'debug/arrowcol-sdk-gen'),
@@ -423,10 +434,7 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
     })}\n`);
     throw error;
   }
-  const services = [
-    'sqlserver', 'database-bootstrap', 'arrowcol-migrate', 'hive-schema', 'hive-metastore',
-    'lgtm', 'cadvisor', 'portainer', 'direct-1', 'dataflow-1', 'router',
-  ];
+  const services = benchmarkCoreServices;
   let workspaceConnection: { container?: string; network?: string } = {};
   let failure: unknown;
   let phase = 'compose-validation';
@@ -449,6 +457,18 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
     ], 3_600_000);
     controller.checkRunning();
     workspaceConnection = connectWorkspaceContainer(project, env);
+    phase = 'kusto-startup';
+    step('Starting optional Kusto inspection target separately from the collectors');
+    const kustoStartup = await startKusto({
+      endpoint: `http://${network.kusto}:8080`,
+      results: path.join(directory, 'results'),
+      start: () => { compose(project, env, kustoComposeStartArguments); },
+    });
+    step(`Kusto: http://localhost:${env.KUSTO_PORT ?? '8080'} (HTTP, no authentication; database loadtest)`);
+    if (kustoStartup.state === 'degraded') {
+      step(`Kusto startup DEGRADED: ${kustoStartup.error}. Load generation will continue; see results/kusto-startup.json`);
+    }
+    controller.checkRunning();
     phase = 'startup-provenance';
     writeProvenance(workspace, directory, project, options, env, true);
     phase = 'sampler-start';
@@ -475,10 +495,11 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
     step('Running load generator (Ctrl+C to stop; stack is kept)');
     await runLocalLoadgen(context, 'run', path.join(directory, 'results'), controller);
     if (options.validate) {
-      phase = 'delta-validation';
-      step('Validating Delta output');
+      phase = 'output-validation';
+      step('Validating Delta and native Kusto output');
       controller.checkRunning();
       await runLocalLoadgen(context, 'validate', path.join(directory, 'results'), controller);
+      requireHealthyKusto(readKustoStatus(path.join(directory, 'results')));
     }
   } catch (error) {
     failure = error;
@@ -506,7 +527,8 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
     step(`FAILED. Diagnostics: ${resultsDirectory}/compose.log`);
     throw failure;
   }
-  step(`Done. Results: ${resultsDirectory}. Stack kept for inspection; the next start resets it.`);
+  step(`Load generation finished. ${kustoStatusSummary(readKustoStatus(path.join(directory, 'results')))}. ` +
+    `Results: ${resultsDirectory}. Stack kept for inspection; the next start resets it.`);
   return {
     directory,
     env,

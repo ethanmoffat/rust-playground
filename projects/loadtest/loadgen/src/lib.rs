@@ -4,6 +4,7 @@
 
 pub mod cli;
 pub mod generator;
+mod kusto;
 pub mod manifest;
 pub mod runner;
 pub mod schema;

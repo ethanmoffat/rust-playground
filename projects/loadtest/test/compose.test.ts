@@ -12,25 +12,66 @@ const compose = YAML.parse(readFileSync(path.join(root, 'projects/loadtest/compo
     profiles?: string[];
     image?: string;
     cpus?: string;
+    mem_limit?: string;
     environment?: Record<string, string>;
     command?: string[];
     ports?: string[];
     secrets?: Array<string | { source: string; target?: string }>;
     tmpfs?: string[];
-    volumes?: Array<string | { source?: string; target?: string }>;
+    volumes?: Array<string | { type?: string; source?: string; target?: string; read_only?: boolean; bind?: { create_host_path?: boolean } }>;
+    depends_on?: Record<string, unknown>;
+    entrypoint?: string[];
     networks?: { default?: { ipv4_address?: string } };
   }>;
+  volumes: Record<string, { labels?: Record<string, string> } | null>;
 };
 
-test('stack is SQL, Hive, router, one collector per pool, LGTM, Portainer and validator', () => {
+test('stack includes SQL, Hive, router, one collector per pool, Kusto, monitoring and validator', () => {
   const names = Object.keys(compose.services);
-  for (const service of ['sqlserver', 'hive-metastore', 'router', 'direct-1', 'dataflow-1', 'lgtm', 'cadvisor', 'portainer', 'validator']) {
+  for (const service of ['sqlserver', 'hive-metastore', 'router', 'direct-1', 'dataflow-1', 'kusto', 'lgtm', 'cadvisor', 'portainer', 'validator']) {
     assert(names.includes(service), `missing ${service}`);
     assert.deepEqual(compose.services[service].profiles, ['benchmark']);
   }
   for (const gone of ['direct-2', 'dataflow-2', 'otelcol-rust', 'hello-world', 'load-driver', 'prometheus']) {
     assert(!names.includes(gone), `unexpected ${gone}`);
   }
+});
+
+test('Kusto is pinned, memory-bounded, loopback-only and keeps its documented default startup', () => {
+  const kusto = compose.services.kusto;
+  assert.match(kusto.image ?? '', /^mcr\.microsoft\.com\/azuredataexplorer\/kustainer-linux@sha256:[0-9a-f]{64}$/u);
+  assert.equal(kusto.mem_limit, '${KUSTO_MEMORY_LIMIT:-4g}');
+  assert.deepEqual(kusto.environment, { ACCEPT_EULA: 'Y' });
+  assert.deepEqual(kusto.ports, ['127.0.0.1:${KUSTO_PORT:-8080}:8080']);
+  assert.equal(kusto.entrypoint, undefined);
+  assert.equal(kusto.command, undefined);
+  assert.equal(kusto.networks?.default?.ipv4_address, '${LOADTEST_KUSTO_IP:-10.89.0.50}');
+  const devcontainer = JSON.parse(readFileSync(path.join(root, '.devcontainer/devcontainer.json'), 'utf8'));
+  assert.equal(devcontainer.portsAttributes['8080'].onAutoForward, 'ignore');
+});
+
+test('Kusto sees only read-only Delta roots plus owned persistent native storage', () => {
+  const kusto = compose.services.kusto;
+  assert.deepEqual(kusto.volumes, [
+    'kusto-data:/kustodata',
+    ...['direct', 'dataflow'].map(pool => ({
+      type: 'bind', source: `\${ONELAKE_HOST_PATH:?Run through Nx}/${pool}`,
+      target: `/delta/${pool}`, read_only: true, bind: { create_host_path: false },
+    })),
+  ]);
+  assert.deepEqual(compose.volumes['kusto-data']?.labels, {
+    'io.arrowcol.loadtest.workspace': '${LOADTEST_WORKSPACE:?Run through Nx}',
+  });
+  assert.equal(kusto.secrets, undefined);
+});
+
+test('Kusto cannot become a required collector dependency and the validator uses its internal address', () => {
+  for (const [name, service] of Object.entries(compose.services)) {
+    assert(!Object.hasOwn(service.depends_on ?? {}, 'kusto'), `${name} must not require Kusto startup`);
+  }
+  assert.equal(compose.services.kusto.depends_on, undefined);
+  assert.equal(compose.services.validator.environment?.LOADTEST_KUSTO_ENDPOINT,
+    'http://${LOADTEST_KUSTO_IP:-10.89.0.50}:8080');
 });
 
 test('direct and dataflow pools use separate Delta roots', () => {

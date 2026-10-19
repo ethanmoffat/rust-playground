@@ -32,6 +32,13 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
     let capabilities: Value = read_json(&arguments.results.join(CAPABILITY_EVIDENCE_FILE)).await?;
 
     let mut failures = Vec::new();
+    let kusto_settle = if arguments.kusto_endpoint.is_some() {
+        crate::kusto::settle_dataflow(&arguments.dataflow_admin_endpoints, arguments.timeout.get())
+            .await
+            .err()
+    } else {
+        None
+    };
     check(!sends.is_empty(), "send manifest is empty", &mut failures);
     check(
         contracts.len() == 13,
@@ -304,6 +311,48 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
     );
     validate_capabilities(&capabilities, &mut failures);
 
+    let kusto = if let Some(endpoint) = &arguments.kusto_endpoint {
+        let validation = if let Some(error) = kusto_settle {
+            Err(error)
+        } else if let (Some(direct), Some(dataflow)) = (&direct, &dataflow) {
+            tokio::time::timeout(
+                arguments.timeout.get(),
+                crate::kusto::validate(
+                    endpoint,
+                    &arguments.results,
+                    &arguments.direct_root,
+                    &arguments.dataflow_root,
+                    direct,
+                    dataflow,
+                ),
+            )
+            .await
+            .context("Kusto validation deadline elapsed")
+            .and_then(|report| report)
+        } else {
+            Err(anyhow::anyhow!(
+                "Kusto validation requires both independent Delta snapshots"
+            ))
+        };
+        Some(match validation {
+            Ok(report) => {
+                crate::kusto::write_validation(&arguments.results, &report)?;
+                report
+            }
+            Err(error) => {
+                failures.push(format!("Kusto validation failed: {error:#}"));
+                let metadata: Value = read_json(&arguments.results.join(crate::manifest::RUN_METADATA_FILE)).await?;
+                crate::kusto::degraded(
+                    &arguments.results,
+                    metadata["run_id"].as_str().context("run identity missing")?,
+                    &error,
+                )?;
+                crate::kusto::validation_failure(&arguments.results, &error)?
+            }
+        })
+    } else {
+        None
+    };
     let report = ValidationReport {
         passed: failures.is_empty(),
         failures,
@@ -312,6 +361,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         direct,
         dataflow,
         routing,
+        kusto,
     };
     let mut bytes = serde_json::to_vec_pretty(&report)?;
     bytes.push(b'\n');
@@ -625,6 +675,7 @@ struct ValidationReport {
     direct: Option<SnapshotSummary>,
     dataflow: Option<SnapshotSummary>,
     routing: RoutingEvidence,
+    kusto: Option<Value>,
 }
 
 #[cfg(test)]

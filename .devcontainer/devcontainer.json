@@ -36,6 +36,10 @@
     "9444": {
       "label": "Portainer (loadtest; published on the Docker host, reached via WSL localhost)",
       "onAutoForward": "ignore"
+    },
+    "8080": {
+      "label": "Kusto emulator (loadtest; published on the Docker host, reached via WSL localhost)",
+      "onAutoForward": "ignore"
     }
   },
   "customizations": {

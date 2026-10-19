@@ -202,6 +202,33 @@ services:
         ipv4_address: ${LOADTEST_DATAFLOW_1_IP:-10.89.0.31}
     stop_grace_period: 5m
 
+  kusto:
+    profiles: ["benchmark"]
+    image: mcr.microsoft.com/azuredataexplorer/kustainer-linux@sha256:51e2250da2faf292de903f871a073eb37d3f2641cf63381b183879d21ebb1013
+    mem_limit: ${KUSTO_MEMORY_LIMIT:-4g}
+    environment:
+      ACCEPT_EULA: "Y"
+    ports:
+      - "127.0.0.1:${KUSTO_PORT:-8080}:8080"
+    volumes:
+      - kusto-data:/kustodata
+      - type: bind
+        source: ${ONELAKE_HOST_PATH:?Run through Nx}/direct
+        target: /delta/direct
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ONELAKE_HOST_PATH:?Run through Nx}/dataflow
+        target: /delta/dataflow
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      default:
+        ipv4_address: ${LOADTEST_KUSTO_IP:-10.89.0.50}
+    stop_grace_period: ${STACK_STOP_SECONDS:-30}s
+
   lgtm:
     profiles: ["benchmark"]
     image: grafana/otel-lgtm@sha256:57c04cbd8e7022f32bb84c4ac005d79baf8b08e2c5be44facf11f5f1f9944ba2
@@ -311,6 +338,7 @@ services:
       LOADTEST_DATAFLOW_ROOT: /delta/dataflow
       LOADTEST_DRAIN_TIMEOUT: ${LOADTEST_DRAIN_TIMEOUT:-2m}
       LOADTEST_REQUIRE_ALL_COLLECTORS: ${LOADTEST_REQUIRE_ALL_COLLECTORS:-true}
+      LOADTEST_KUSTO_ENDPOINT: http://${LOADTEST_KUSTO_IP:-10.89.0.50}:8080
     volumes:
       - type: bind
         source: ${ONELAKE_HOST_PATH:?Run through Nx}/results
@@ -353,6 +381,9 @@ secrets:
 volumes:
   sqlserver-data:
   hive-warehouse:
+  kusto-data:
+    labels:
+      io.arrowcol.loadtest.workspace: ${LOADTEST_WORKSPACE:?Run through Nx}
 
 networks:
   default:
