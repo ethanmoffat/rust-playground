@@ -208,6 +208,10 @@ impl RoutingStore for SqlServerRoutingStore {
         retry_deadlock(|| self.inner.load_view(loaded_at)).await
     }
 
+    async fn load_lease(&self, key: &LeaseKey, loaded_at: UnixMillis) -> RoutingResult<Option<RoutingLease>> {
+        retry_deadlock(|| self.inner.load_lease(key, loaded_at)).await
+    }
+
     async fn claim_lease(&self, claim: &LeaseClaim) -> RoutingResult<RoutingLease> {
         retry_deadlock(|| self.inner.claim_lease(claim)).await
     }
@@ -554,6 +558,42 @@ impl RoutingStore for RawSqlStore {
         if let Err(error) = client.finish().await {
             tracing::warn!(
                 operation = "load_view",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
+    }
+
+    async fn load_lease(&self, key: &LeaseKey, _loaded_at: UnixMillis) -> RoutingResult<Option<RoutingLease>> {
+        let mut client = self.connect().await?;
+        let row = client
+            .query(
+                &format!(
+                    "SELECT {LEASE_COLUMNS} FROM arrowcol.routing_table_leases \
+                     WHERE implementation_pool=@P1 AND catalog_name=@P2 AND schema_name=@P3 AND table_name=@P4;"
+                ),
+                &[
+                    &key.implementation_pool.to_string(),
+                    &key.table.catalog().as_str(),
+                    &key.table.schema().as_str(),
+                    &key.table.table().as_str(),
+                ],
+            )
+            .await
+            .map_err(|cause| database_error("load routing lease", cause))?
+            .into_row()
+            .await
+            .map_err(|cause| database_error("read routing lease", cause))?;
+        // SQL collation may be case-insensitive; routing identities are exact.
+        let value = row
+            .as_ref()
+            .map(lease_from_row)
+            .transpose()?
+            .filter(|lease| &lease.key == key);
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "load_lease",
                 error = %error,
                 "SQL Server session cleanup failed after confirmed success; discarding connection"
             );

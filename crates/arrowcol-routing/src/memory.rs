@@ -22,6 +22,8 @@ struct MemoryState {
 pub struct MemoryOperationCounts {
     /// View loads.
     pub load_view: u64,
+    /// Authoritative lease point reads.
+    pub load_lease: u64,
     /// Lease claims.
     pub claim_lease: u64,
     /// Drain compare-and-set operations.
@@ -36,6 +38,7 @@ pub struct MemoryRoutingStore {
     state: Arc<Mutex<MemoryState>>,
     available: Arc<AtomicBool>,
     load_view: Arc<AtomicU64>,
+    load_lease: Arc<AtomicU64>,
     claim_lease: Arc<AtomicU64>,
     begin_drain: Arc<AtomicU64>,
     transfer: Arc<AtomicU64>,
@@ -47,6 +50,7 @@ impl Default for MemoryRoutingStore {
             state: Arc::new(Mutex::new(MemoryState::default())),
             available: Arc::new(AtomicBool::new(true)),
             load_view: Arc::new(AtomicU64::new(0)),
+            load_lease: Arc::new(AtomicU64::new(0)),
             claim_lease: Arc::new(AtomicU64::new(0)),
             begin_drain: Arc::new(AtomicU64::new(0)),
             transfer: Arc::new(AtomicU64::new(0)),
@@ -67,6 +71,7 @@ impl MemoryRoutingStore {
     pub fn operation_counts(&self) -> MemoryOperationCounts {
         MemoryOperationCounts {
             load_view: self.load_view.load(Ordering::Relaxed),
+            load_lease: self.load_lease.load(Ordering::Relaxed),
             claim_lease: self.claim_lease.load(Ordering::Relaxed),
             begin_drain: self.begin_drain.load(Ordering::Relaxed),
             transfer: self.transfer.load(Ordering::Relaxed),
@@ -185,6 +190,12 @@ impl RoutingStore for MemoryRoutingStore {
             collectors: state.collectors.clone(),
             leases: state.leases.clone(),
         })
+    }
+
+    async fn load_lease(&self, key: &crate::LeaseKey, _loaded_at: UnixMillis) -> RoutingResult<Option<RoutingLease>> {
+        self.load_lease.fetch_add(1, Ordering::Relaxed);
+        self.ensure_available()?;
+        Ok(self.state.lock().await.leases.get(key).cloned())
     }
 
     async fn claim_lease(&self, claim: &LeaseClaim) -> RoutingResult<RoutingLease> {

@@ -53,6 +53,10 @@ async fn live_routing_case(pooled: bool) -> anyhow::Result<()> {
         table: table.clone(),
     };
     let result: anyhow::Result<()> = async {
+        anyhow::ensure!(
+            store.load_lease(&key, now).await?.is_none(),
+            "point read found a lease for an unclaimed fixture table"
+        );
         for (instance, port) in [(first, 51_001), (second, 51_002)] {
             store
                 .register_collector(&CollectorRegistration {
@@ -124,6 +128,22 @@ async fn live_routing_case(pooled: bool) -> anyhow::Result<()> {
             "persisted winning lease differs from both router results"
         );
         anyhow::ensure!(
+            store.load_lease(&key, claim_at).await?.as_ref() == Some(initial_lease),
+            "point read differs from the authoritative winning lease"
+        );
+        let differently_cased_key = LeaseKey::new(
+            key.implementation_pool,
+            TableIdentity::new(
+                table.catalog().clone(),
+                table.schema().clone(),
+                TableName::new(table.table().as_str().to_ascii_uppercase())?,
+            ),
+        );
+        anyhow::ensure!(
+            store.load_lease(&differently_cased_key, claim_at).await?.is_none(),
+            "point read aliased a differently cased routing identity"
+        );
+        anyhow::ensure!(
             active_lease_count(&table).await? == 1,
             "fixture does not have exactly one active SQL lease"
         );
@@ -138,6 +158,10 @@ async fn live_routing_case(pooled: bool) -> anyhow::Result<()> {
             .leases
             .get(&key)
             .ok_or_else(|| anyhow::anyhow!("fixture lease disappeared during drain"))?;
+        anyhow::ensure!(
+            store.load_lease(&key, add(now, 3)?).await?.as_ref() == Some(draining),
+            "point read did not observe the draining lease"
+        );
         anyhow::ensure!(
             draining.state == LeaseState::Draining
                 && draining.holder_instance_id == holder
@@ -165,6 +189,10 @@ async fn live_routing_case(pooled: bool) -> anyhow::Result<()> {
             .leases
             .get(&key)
             .ok_or_else(|| anyhow::anyhow!("fixture lease disappeared during transfer"))?;
+        anyhow::ensure!(
+            store.load_lease(&key, add(now, 7)?).await?.as_ref() == Some(transferred),
+            "point read did not observe the transferred fencing epoch"
+        );
         anyhow::ensure!(
             transferred.state == LeaseState::Active
                 && transferred.holder_instance_id == fallback

@@ -37,15 +37,15 @@ impl StoreLeaseResolver {
 impl LeaseResolver for StoreLeaseResolver {
     async fn resolve(&self, table: &TableIdentity) -> RuntimeResult<RoutingLease> {
         let now = now_unix_millis().map_err(|_| RuntimeError::internal())?;
-        let view = self.store.load_view(now).await.map_err(|_| {
+        let key = LeaseKey::new(ImplementationPool::Dataflow, table.clone());
+        let lease = self.store.load_lease(&key, now).await.map_err(|_| {
             RuntimeError::new(
                 ErrorCode::PoolUnavailable,
                 Code::Unavailable,
                 "routing lease could not be verified",
             )
         })?;
-        let key = LeaseKey::new(ImplementationPool::Dataflow, table.clone());
-        let lease = view.leases.get(&key).cloned().ok_or_else(|| {
+        let lease = lease.ok_or_else(|| {
             RuntimeError::new(
                 ErrorCode::LeaseFenced,
                 Code::FailedPrecondition,
@@ -142,15 +142,12 @@ fn authority_worker(store: Arc<dyn RoutingStore>, receiver: Receiver<AuthorityRe
 
 async fn check_authority(store: &Arc<dyn RoutingStore>, expected: &LeaseEvidence) -> Result<(), PublicationFenceError> {
     let now = now_unix_millis().map_err(PublicationFenceError::check_failed)?;
-    let view = store
-        .load_view(now)
+    let key = LeaseKey::new(ImplementationPool::Dataflow, expected.table.clone());
+    let lease = store
+        .load_lease(&key, now)
         .await
         .map_err(|error| PublicationFenceError::check_failed(error.to_string()))?;
-    let key = LeaseKey::new(ImplementationPool::Dataflow, expected.table.clone());
-    let lease = view
-        .leases
-        .get(&key)
-        .ok_or_else(|| PublicationFenceError::stale("authoritative routing lease is absent"))?;
+    let lease = lease.ok_or_else(|| PublicationFenceError::stale("authoritative routing lease is absent"))?;
     let exact = lease.lease_id == expected.lease_id
         && lease.holder_instance_id == expected.holder_instance_id
         && lease.fencing_epoch == expected.fencing_token
@@ -294,6 +291,50 @@ mod tests {
         let resolver = StoreLeaseResolver::new(store as Arc<dyn RoutingStore>, CollectorInstanceId::new());
         let error = resolver.resolve(&table()).await.expect_err("fenced");
         assert_eq!(error.code(), ErrorCode::LeaseFenced);
+    }
+
+    #[tokio::test]
+    async fn point_reads_observe_drain_and_authority_changes_without_inventory_loads() {
+        let owner = CollectorInstanceId::new();
+        let (store, lease) = leased_store(owner).await;
+        let resolver = StoreLeaseResolver::new(Arc::clone(&store) as Arc<dyn RoutingStore>, owner);
+        assert_eq!(resolver.resolve(&table()).await.expect("owner"), lease);
+        let evidence = LeaseEvidence {
+            table: table(),
+            lease_id: lease.lease_id,
+            holder_instance_id: owner,
+            fencing_token: lease.fencing_epoch,
+        };
+        let routing_store = Arc::clone(&store) as Arc<dyn RoutingStore>;
+        check_authority(&routing_store, &evidence).await.expect("current fence");
+        store
+            .begin_lease_drain(&arrowcol_routing::LeaseCas {
+                key: lease.key.clone(),
+                expected_version: lease.lease_version,
+                now_unix_ms: now_unix_millis().expect("now"),
+            })
+            .await
+            .expect("drain");
+        assert_eq!(
+            resolver.resolve(&table()).await.expect_err("draining").code(),
+            ErrorCode::LeaseFenced
+        );
+        check_authority(&routing_store, &evidence)
+            .await
+            .expect("already admitted work may drain");
+        let mut replacement = lease.clone();
+        replacement.holder_instance_id = CollectorInstanceId::new();
+        replacement.fencing_epoch = replacement.fencing_epoch.next().expect("epoch");
+        store.insert_lease(replacement).await.expect("replace fixture");
+        assert!(check_authority(&routing_store, &evidence).await.is_err());
+        assert_eq!(store.operation_counts().load_view, 0);
+        assert_eq!(store.operation_counts().load_lease, 5);
+        store.set_available(false);
+        assert_eq!(
+            resolver.resolve(&table()).await.expect_err("unavailable").code(),
+            ErrorCode::PoolUnavailable
+        );
+        assert!(check_authority(&routing_store, &evidence).await.is_err());
     }
 
     /// Scenario: Routing ownership changes before a Delta publication boundary.

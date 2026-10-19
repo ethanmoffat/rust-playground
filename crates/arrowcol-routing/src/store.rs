@@ -76,6 +76,13 @@ pub trait RoutingStore: Send + Sync {
     /// Loads the complete immutable routing view.
     async fn load_view(&self, loaded_at: UnixMillis) -> RoutingResult<RoutingView>;
 
+    /// Reads one authoritative lease without caching ownership.
+    ///
+    /// Stores may override the full-view fallback with an indexed point lookup.
+    async fn load_lease(&self, key: &LeaseKey, loaded_at: UnixMillis) -> RoutingResult<Option<RoutingLease>> {
+        Ok(self.load_view(loaded_at).await?.leases.get(key).cloned())
+    }
+
     /// Atomically creates a lease or returns the unexpired winner.
     async fn claim_lease(&self, claim: &LeaseClaim) -> RoutingResult<RoutingLease>;
 
