@@ -60,8 +60,10 @@
           "**/node_modules/**": true,
           "**/target/**": true
         },
+        "remote.forwardOnOpen": false,
         "rust-analyzer.check.command": "clippy",
-        "terminal.integrated.defaultProfile.linux": "bash"
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "workbench.browser.enableRemoteProxy": false
       }
     }
   }

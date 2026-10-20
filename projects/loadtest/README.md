@@ -1,5 +1,7 @@
 # loadtest
 
+![Architecture](.imgs/loadtest-architecture.png)
+
 ```bash
 npx nx run loadtest:run -- --warmup 2m --concurrency 8 --batch-rows 1024
 ```

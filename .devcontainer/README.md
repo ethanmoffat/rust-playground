@@ -30,6 +30,13 @@ Common Nx targets:
 - `nx run devcontainer:down -- --volumes`: remove only this workspace's
   discovered Compose project and its volumes.
 
+Loadtest UIs (Grafana, kusto-explorer, Portainer) publish ports on the WSL
+Docker host's loopback, which WSL relays to Windows `localhost`. Nothing listens
+on those ports inside this container, so the configuration disables
+`remote.forwardOnOpen` and `workbench.browser.enableRemoteProxy`. Otherwise VS
+Code tunnels clicked `localhost` links into the container (usually on port+1,
+because the WSL relay owns the original port) and the page never loads.
+
 See
 [headless devcontainer operations](../docs/devcontainer/headless-operations.md)
 for exact lifecycle, capture, monitoring, cleanup, and regression commands.

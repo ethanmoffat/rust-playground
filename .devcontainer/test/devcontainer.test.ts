@@ -69,6 +69,12 @@ test('normal and source configurations share workspace, user, and lifecycle beha
   ]) {
     assert.deepEqual(source[key], normal[key], `configuration mismatch: ${key}`);
   }
+  // Loadtest ports are published on the WSL Docker host (relayed to Windows), not inside this
+  // container, so VS Code must open localhost links directly instead of tunnelling them here.
+  const settings = (normal.customizations as { vscode: { settings: Record<string, unknown> } })
+    .vscode.settings;
+  assert.equal(settings['remote.forwardOnOpen'], false);
+  assert.equal(settings['workbench.browser.enableRemoteProxy'], false);
   assert.equal(normal.dockerComposeFile, 'docker-compose.yml');
   assert.equal(normal.waitFor, 'postStartCommand');
   assert.deepEqual(normal.postStartCommand, [
