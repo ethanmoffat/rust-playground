@@ -13,7 +13,7 @@ use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::{FlightData, FlightDescriptor};
 use arrowcol_buffer::{
     BufferConfig, BufferManager, CapacityLimits, FlushReason, PublicationContext, PublicationOutcome,
-    PublicationSession, PublicationSink, SinkError,
+    PublicationSession, PublicationSink, QuiverStage, QuiverStageConfig, SinkError, StageLeases,
 };
 use arrowcol_catalog::{
     CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, FlightSqlDdlRequest, MemoryCatalogStore,
@@ -27,8 +27,9 @@ use arrowcol_protocol::{
     TableName, UnixMillis, fingerprint_schema,
 };
 use arrowcol_receipts::{
-    OwnerDrain, OwnerRegistration, PublicationBatch, ReceiptError, ReceiptErrorKind, ReceiptFailure, ReceiptRecord,
-    ReceiptResult, ReceiptStore, ReceiptVersion, ReconciliationReport, TableLeaseRequest, ValidatedDelivery,
+    OwnerDrain, OwnerRegistration, PublicationBatch, ReceiptAdoption, ReceiptAdoptionReport, ReceiptError,
+    ReceiptErrorKind, ReceiptFailure, ReceiptRecord, ReceiptResult, ReceiptStore, ReceiptVersion, ReconciliationReport,
+    RejectedAdoption, TableLeaseRequest, ValidatedDelivery,
 };
 use arrowcol_routing::{
     CollectorState, LeaseCas, LeaseClaim, LeaseKey, LeaseState, LeaseTransfer, RoutingLease, RoutingResult,
@@ -111,6 +112,73 @@ async fn identical_batches_receive_distinct_results_and_publish_together() -> Re
     Ok(())
 }
 
+/// Scenario: Native Quiver is enabled and a client sends two batches over Flight.
+/// Guarantees: Each receipt is returned only after its batch is persisted to
+/// disk, and the batches are then published from Quiver so both receipts reach
+/// `published` and the persisted backlog drains.
+#[tokio::test]
+async fn quiver_persists_before_receipt_and_publishes_from_disk() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let fixture = Fixture::with_options(
+        8,
+        64,
+        Duration::from_secs(5),
+        Arc::new(FakeSink::default()),
+        Some(directory.path()),
+    )
+    .await?;
+    let stage = Arc::clone(fixture.quiver.as_ref().context("Quiver stage missing")?);
+    let request = ingest_request(
+        fixture.identity.clone(),
+        fixture.schema.as_ref(),
+        vec![fixture.batch(1)?, fixture.batch(3)?],
+        fingerprint_schema(fixture.schema.as_ref()),
+    )
+    .await?;
+    let results = fixture
+        .service
+        .handle_do_put(request)
+        .await?
+        .into_inner()
+        .try_collect::<Vec<_>>()
+        .await?;
+    let ids = results
+        .iter()
+        .map(PutResultMetadata::from_put_result)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|metadata| metadata.receipt_id().context("missing receipt"))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(ids.len(), 2);
+    assert_eq!(stage.snapshot().persisted_bundles, 2);
+
+    stage.start();
+    let mut published = false;
+    for _ in 0..500 {
+        fixture.buffer.drain().await?;
+        let records = fixture.receipts.receipts(&ids).await?;
+        if records
+            .iter()
+            .flatten()
+            .filter(|record| record.can_client_purge())
+            .count()
+            == ids.len()
+        {
+            published = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(published, "persisted batches were not published from disk");
+    assert!(
+        stage.drain(Duration::from_secs(5)).await,
+        "Quiver backlog did not drain"
+    );
+    assert_eq!(stage.snapshot().published_bundles, 2);
+    fixture.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn bounded_capacity_returns_backpressure_after_one_incremental_receipt() -> Result<()> {
     let started = Arc::new(Notify::new());
@@ -119,7 +187,7 @@ async fn bounded_capacity_returns_backpressure_after_one_incremental_receipt() -
         started: Arc::clone(&started),
         release: Arc::clone(&release),
     });
-    let fixture = Fixture::with_options(1, 1, Duration::from_millis(100), sink).await?;
+    let fixture = Fixture::with_options(1, 1, Duration::from_millis(100), sink, None).await?;
     let request = ingest_request(
         fixture.identity.clone(),
         fixture.schema.as_ref(),
@@ -328,6 +396,7 @@ struct Fixture {
     buffer: Arc<BufferManager>,
     service: ArrowColFlightService,
     leases: Arc<TableLeaseManager>,
+    quiver: Option<Arc<QuiverStage>>,
 }
 
 impl Fixture {
@@ -337,6 +406,7 @@ impl Fixture {
             64,
             Duration::from_secs(5),
             Arc::new(FakeSink::default()),
+            None,
         )
         .await
     }
@@ -346,6 +416,7 @@ impl Fixture {
         capacity_batches: u64,
         admission_timeout: Duration,
         sink: Arc<dyn PublicationSink>,
+        quiver_directory: Option<&std::path::Path>,
     ) -> Result<Self> {
         let identity = TableIdentity::new(
             CatalogName::new("telemetry")?,
@@ -398,7 +469,7 @@ impl Fixture {
             sink,
         )?;
         let catalog_store: Arc<dyn CatalogStore> = catalog;
-        let admission = Arc::new(DirectAdmission::new(
+        let mut direct = DirectAdmission::new(
             Arc::clone(&catalog_store),
             Arc::clone(&receipt_store),
             Arc::clone(&buffer),
@@ -407,7 +478,33 @@ impl Fixture {
             owner,
             Duration::from_secs(30),
             admission_timeout,
-        ));
+        );
+        let quiver = match quiver_directory {
+            Some(directory) => {
+                let stage_leases: Arc<dyn StageLeases> = Arc::<TableLeaseManager>::clone(&leases);
+                let stage = QuiverStage::open(
+                    QuiverStageConfig {
+                        directory: directory.to_path_buf(),
+                        capacity_bytes: 256 * 1024 * 1024,
+                        wal_flush_interval: Duration::ZERO,
+                        segment_max_open: Duration::from_millis(20),
+                        max_in_flight: 16,
+                        retry_initial: Duration::from_millis(10),
+                        retry_max: Duration::from_millis(100),
+                    },
+                    Arc::clone(&buffer),
+                    Arc::clone(&receipt_store),
+                    stage_leases,
+                    owner,
+                    Duration::from_secs(30),
+                )
+                .await?;
+                direct = direct.with_quiver(Arc::clone(&stage));
+                Some(stage)
+            }
+            None => None,
+        };
+        let admission = Arc::new(direct);
         let service = ArrowColFlightService::new(
             ImplementationPool::Direct,
             catalog_store,
@@ -423,6 +520,7 @@ impl Fixture {
             buffer,
             service,
             leases,
+            quiver,
         })
     }
 
@@ -437,6 +535,9 @@ impl Fixture {
     }
 
     async fn shutdown(self) -> Result<()> {
+        if let Some(stage) = &self.quiver {
+            stage.shutdown().await;
+        }
         let report = self.buffer.shutdown().await?;
         assert!(report.incomplete.is_empty());
         self.leases.release_all().await?;
@@ -793,6 +894,30 @@ impl ReceiptStore for FakeReceipts {
             limit_reached: false,
         })
     }
+
+    async fn adopt_receipts(&self, request: &ReceiptAdoption) -> ReceiptResult<ReceiptAdoptionReport> {
+        request.validate()?;
+        let mut records = self.records.lock().await;
+        let mut report = ReceiptAdoptionReport::default();
+        for candidate in &request.receipts {
+            match records.get_mut(&candidate.receipt_id) {
+                Some(record) if candidate.matches(record) && record.table == *request.lease.table() => {
+                    record.owner_instance_id = request.successor;
+                    record.lease_id = request.lease.lease_id();
+                    record.fencing_epoch = request.lease.fencing_token();
+                    record.lease_deadline_unix_ms = request.lease_deadline;
+                    record.heartbeat_at_unix_ms = request.adopted_at;
+                    record.updated_at_unix_ms = request.adopted_at;
+                    report.adopted.push(record.clone());
+                }
+                current => report.rejected.push(RejectedAdoption {
+                    receipt_id: candidate.receipt_id,
+                    current: current.cloned(),
+                }),
+            }
+        }
+        Ok(report)
+    }
 }
 
 #[derive(Default)]
@@ -933,6 +1058,13 @@ impl RoutingStore for FakeRouting {
 
     async fn transfer_drained_lease(&self, _request: &LeaseTransfer) -> RoutingResult<RoutingLease> {
         unreachable!("unused")
+    }
+
+    async fn transfer_to_successor(&self, _request: &arrowcol_routing::LeaseSuccession) -> RoutingResult<RoutingLease> {
+        Err(arrowcol_routing::RoutingError::new(
+            arrowcol_routing::RoutingErrorKind::InvalidConfiguration,
+            "fake routing does not support crash succession",
+        ))
     }
 }
 

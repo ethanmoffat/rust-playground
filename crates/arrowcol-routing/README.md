@@ -11,6 +11,11 @@ cached lease is valid.
 - two-phase reassignment: stop admitting new streams, require a post-drain
   snapshot with zero table streams, buffered bytes/rows/batches, and pending
   commits, then transfer ownership;
+- crash succession: a valid lease whose holder registration expired or reached
+  `stopped`/`failed` moves directly to the live, eligible restart registered
+  with the same `instance_key` in the same pool, with a new lease ID and greater
+  epoch/version; no drain proof is needed because the restart replays the
+  predecessor's durable backlog, and different-key collectors still need one;
 - deterministic weighted rendezvous selection with stable fallbacks;
 - exclusion of expired registrations, stale snapshots, draining collectors,
   explicit subsystem blocks, and hard pressure;
@@ -29,7 +34,8 @@ use arrowcol_routing::{
 ```
 
 - `RoutingStore`: registration, heartbeat, rich pressure publication, immutable
-  view loading, lease claim, drain CAS, and fenced transfer CAS.
+  view loading, lease claim, drain CAS, fenced transfer CAS, and
+  same-instance-key crash-succession CAS (`transfer_to_successor`).
 - `SqlServerRoutingStore`: SQL Server implementation over migration `V0008`.
 - `MemoryRoutingStore`: deterministic unit/race-test implementation with
   operation counters.
@@ -37,8 +43,8 @@ use arrowcol_routing::{
   a missing or expired lease.
 - `RoutingEngine::route_control`: lease-free selection of a healthy,
   catalog-capable backend for explicit Flight SQL control metadata.
-- `RoutingEngine::rebalance`: refresh plus two-phase pressure/staleness drain and
-  transfer.
+- `RoutingEngine::rebalance`: refresh, crash succession to a same-instance-key
+  restart, and two-phase pressure/staleness drain and transfer.
 
 ## Rich pressure snapshot
 

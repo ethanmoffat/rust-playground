@@ -23,11 +23,14 @@ write independent Delta roots; they do **not** offer the same delivery guarantee
 | Hive Metastore | Catalog/database/table definitions through its official API | Store delivery receipts |
 | Router | Select a pool/table owner; forward Flight; read direct receipts from SQL | Decode/buffer the Flight body, retry DoPut, switch backends midstream |
 | Direct collector | Exact admission, bounded memory, SQL receipts, fenced Delta publication | Persist pending Arrow payloads in SQL |
-| DFE collector | Exact admission, bounded `arrowcol.flight@1.0` channel, fenced Delta publication | Return durable receipts or a client purge signal |
+| DFE collector | Exact admission, bounded `arrowcol.flight@1.1` channel, fenced Delta publication, optional Quiver durable buffer | Return durable receipts or a client purge signal |
 
-Direct clients retain source data until HTTP confirms publication. DFE completion
-means best-effort admission only. Neither pool provides payload deduplication,
-exactly-once delivery, or native Quiver persistence for arbitrary Arrow.
+Direct clients retain source data until HTTP confirms publication. By default,
+DFE completion means best-effort admission only. With
+[native Quiver](delivery-guarantees.md#native-quiver-disk-persistence), both
+pools fsync each batch to local disk before acknowledging it and replay it after
+a crash, so DFE completion means durable admission. Neither pool provides payload
+deduplication or exactly-once delivery.
 
 Start with the [root quick start](../../../README.md#arrow-collector-platform)
 or the [load generator guide](../loadtest/README.md). The HTML diagrams are

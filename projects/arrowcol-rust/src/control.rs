@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use arrowcol_buffer::{BufferManager, BufferPressureSnapshot};
+use arrowcol_buffer::{BufferManager, BufferPressureSnapshot, QuiverStage};
 use arrowcol_catalog::{CatalogStore, Metastore};
 use arrowcol_flight::{
     CapabilityReporter, DrainController, HealthReporter, HealthStatus, PressureReporter, ReadinessReporter,
@@ -13,7 +13,7 @@ use arrowcol_protocol::{
     BasisPoints, Capability, CollectorCapabilities, CollectorInstanceId, ImplementationPool, Measurement,
     PositiveMeasurement, PressureGauge, PressureSnapshot, ReceiptState, TableIdentity, UnixMillis,
 };
-use arrowcol_receipts::{OwnerRegistration, ReceiptStore};
+use arrowcol_receipts::{OwnerRegistration, ReceiptErrorKind, ReceiptStore};
 use arrowcol_routing::{
     CollectorRegistration, CollectorState, RichPressureSnapshot, RoutingStore, SubsystemState, TablePressure,
 };
@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::config::{CollectorConfig, RoutingConfig};
 use crate::delta_sink::verify_writable_root;
@@ -88,6 +88,7 @@ pub struct CollectorStatus {
     instance_id: CollectorInstanceId,
     drain: DrainController,
     buffer: Arc<BufferManager>,
+    quiver: Option<Arc<QuiverStage>>,
     leases: Arc<TableLeaseManager>,
     activity: Arc<TableActivity>,
     metrics: CollectorMetrics,
@@ -129,6 +130,7 @@ impl CollectorStatus {
             instance_id,
             drain,
             buffer,
+            quiver: None,
             leases,
             activity,
             metrics,
@@ -149,6 +151,13 @@ impl CollectorStatus {
                 delta_writable: false,
             }),
         })
+    }
+
+    /// Reports the Quiver durable stage in capabilities and pressure.
+    #[must_use]
+    pub fn with_quiver(mut self, quiver: Arc<QuiverStage>) -> Self {
+        self.quiver = Some(quiver);
+        self
     }
 
     /// Marks SQL/catalog/Hive dependency readiness.
@@ -260,9 +269,16 @@ impl CollectorStatus {
 
         let active = u64::try_from(self.drain.active_streams()).unwrap_or(u64::MAX);
         let active = gauge(active, self.max_concurrent_streams.get())?;
+        let quiver = self.quiver.as_ref().map(|stage| stage.snapshot());
+        // Persisted-but-unpublished batches still count as buffered work so a
+        // router never treats this collector as drained while Quiver holds data.
+        let backlog = quiver.map_or(0, |snapshot| snapshot.backlog_bundles);
         let buffered_bytes = gauge(pressure.global.bytes, pressure.global.limits.bytes)?;
         let buffered_rows = gauge(pressure.global.rows, pressure.global.limits.rows)?;
-        let buffered_batches = gauge(pressure.global.batches, pressure.global.limits.batches)?;
+        let buffered_batches = gauge(
+            pressure.global.batches.saturating_add(backlog),
+            pressure.global.limits.batches,
+        )?;
         let active_flushes = u64::try_from(pressure.active_flushes).unwrap_or(u64::MAX);
         let pending_commits = gauge(active_flushes, self.max_pending_publications)?;
         let available = self.max_concurrent_streams.get().saturating_sub(active.current().get());
@@ -278,6 +294,10 @@ impl CollectorStatus {
         .max()
         .unwrap_or(0);
         let poisoned = pressure.tables.iter().any(|table| table.poisoned);
+        let quiver_pressure = match quiver {
+            Some(snapshot) => disk_pressure_bps(snapshot.disk_used_bytes, snapshot.disk_capacity_bytes),
+            None => buffer_pressure,
+        };
         Ok(RichPressureSnapshot {
             instance_id: self.instance_id,
             observed_at_unix_ms: now,
@@ -295,7 +315,7 @@ impl CollectorStatus {
             pending_commits,
             oldest_buffer_age_ms: Measurement::ZERO,
             delta_pressure_bps: delta_pressure,
-            quiver_pressure_bps: BasisPoints::new(buffer_pressure)?,
+            quiver_pressure_bps: BasisPoints::new(quiver_pressure)?,
             dfe_pressure_bps: BasisPoints::new(0)?,
             delta_state: if poisoned {
                 SubsystemState::Blocked
@@ -304,9 +324,9 @@ impl CollectorStatus {
             } else {
                 SubsystemState::Ready
             },
-            quiver_state: if poisoned {
+            quiver_state: if poisoned || quiver_pressure >= 10_000 {
                 SubsystemState::Blocked
-            } else if buffer_pressure >= 8_000 {
+            } else if quiver_pressure >= 8_000 {
                 SubsystemState::Degraded
             } else {
                 SubsystemState::Ready
@@ -358,12 +378,18 @@ impl CapabilityReporter for CollectorStatus {
             self.max_request_bytes,
             self.max_concurrent_streams,
             self.max_pending_receipts,
-            BTreeSet::from([
-                Capability::ReceiptStatus,
-                Capability::DeltaPublication,
-                Capability::TableLeaseFencing,
-                Capability::PressureReporting,
-            ]),
+            {
+                let mut capabilities = BTreeSet::from([
+                    Capability::ReceiptStatus,
+                    Capability::DeltaPublication,
+                    Capability::TableLeaseFencing,
+                    Capability::PressureReporting,
+                ]);
+                if self.quiver.is_some() {
+                    capabilities.insert(Capability::DurablePayloadStorage);
+                }
+                capabilities
+            },
         ))
     }
 }
@@ -433,20 +459,7 @@ pub async fn start_control_loops(
         &metrics,
     )
     .await?;
-    let now = now_unix_millis()?;
-    let owner_expiry = add_duration(now, Duration::from_millis(config.receipts.owner_lease_ttl_ms))?;
-    receipts
-        .register_owner(OwnerRegistration {
-            instance_id,
-            instance_key: config.identity.instance_key.clone(),
-            generation: config.identity.generation,
-            host_name: config.identity.host_name.clone(),
-            build_version: config.identity.build_version.clone(),
-            started_at_unix_ms: now,
-            lease_deadline_unix_ms: owner_expiry,
-        })
-        .await
-        .context("register receipt owner")?;
+    let now = register_owner_when_predecessor_expires(config, instance_id, receipts.as_ref()).await?;
     let registration = registration(config, instance_id, now)?;
     routing
         .register_collector(&registration)
@@ -509,6 +522,49 @@ pub async fn start_control_loops(
         )),
     ];
     Ok(ControlLoops { tasks, fatal })
+}
+
+/// Registers the receipt owner, waiting for a crashed predecessor with the
+/// same instance key to expire. A restart right after a crash otherwise fails
+/// because the predecessor's owner lease is still live.
+async fn register_owner_when_predecessor_expires(
+    config: &CollectorConfig,
+    instance_id: CollectorInstanceId,
+    receipts: &dyn ReceiptStore,
+) -> Result<UnixMillis> {
+    let retry_until = tokio::time::Instant::now()
+        + Duration::from_millis(config.receipts.owner_lease_ttl_ms)
+        + Duration::from_secs(5);
+    loop {
+        let now = now_unix_millis()?;
+        let owner_expiry = add_duration(now, Duration::from_millis(config.receipts.owner_lease_ttl_ms))?;
+        let registration = OwnerRegistration {
+            instance_id,
+            instance_key: config.identity.instance_key.clone(),
+            generation: config.identity.generation,
+            host_name: config.identity.host_name.clone(),
+            build_version: config.identity.build_version.clone(),
+            started_at_unix_ms: now,
+            lease_deadline_unix_ms: owner_expiry,
+            durable_recovery_window_ms: config.buffer.native_quiver.recovery_window_ms(),
+        };
+        match receipts.register_owner(registration).await {
+            Ok(()) => return Ok(now),
+            Err(error) if error.kind() == ReceiptErrorKind::Conflict && tokio::time::Instant::now() < retry_until => {
+                info!(%error, "waiting for the previous owner lease to expire before registering");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => return Err(anyhow!(error)).context("register receipt owner"),
+        }
+    }
+}
+
+fn disk_pressure_bps(used: u64, capacity: u64) -> u16 {
+    if capacity == 0 {
+        return 10_000;
+    }
+    let bps = u128::from(used).saturating_mul(10_000) / u128::from(capacity);
+    u16::try_from(bps.min(10_000)).unwrap_or(10_000)
 }
 
 async fn reconcile_receipts(receipts: Arc<dyn ReceiptStore>, limit: usize, metrics: &CollectorMetrics) -> Result<()> {

@@ -33,9 +33,13 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
 
     let mut failures = Vec::new();
     let kusto_settle = if arguments.kusto_endpoint.is_some() {
-        crate::kusto::settle_dataflow(&arguments.dataflow_admin_endpoints, arguments.timeout.get())
-            .await
-            .err()
+        crate::kusto::settle_dataflow(
+            &arguments.dataflow_admin_endpoints,
+            arguments.timeout.get(),
+            arguments.quiver,
+        )
+        .await
+        .err()
     } else {
         None
     };
@@ -84,6 +88,18 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
             check(
                 send.pool == "dataflow" && send.receipt_id.is_none(),
                 "best-effort acknowledgement is not honest dataflow admission",
+                &mut failures,
+            );
+            check(
+                !arguments.quiver,
+                "dataflow acknowledged without durable admission while Quiver was enabled",
+                &mut failures,
+            );
+        }
+        if send.outcome == AckOutcome::DurableAdmission {
+            check(
+                send.pool == "dataflow" && send.receipt_id.is_none() && arguments.quiver,
+                "durable admission is not an honest Quiver-backed dataflow acknowledgement",
                 &mut failures,
             );
         }
@@ -191,7 +207,9 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
                 .or_default()
                 .entry(first.table.clone())
                 .or_insert(0);
-            if pool == "direct" {
+            // Direct receipts and Quiver durable admission promise every acknowledged row;
+            // best-effort dataflow admission only promises that the table was published.
+            if pool == "direct" || arguments.quiver {
                 *required += rows;
             } else if *required == 0 || rows < *required {
                 *required = rows;
@@ -309,7 +327,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         arguments.require_all_collectors,
         &mut failures,
     );
-    validate_capabilities(&capabilities, &mut failures);
+    validate_capabilities(&capabilities, arguments.quiver, &mut failures);
 
     let kusto = if let Some(endpoint) = &arguments.kusto_endpoint {
         let validation = if let Some(error) = kusto_settle {
@@ -518,14 +536,16 @@ fn validate_routing(
         .map(|collector| (collector.instance_id.as_str(), collector))
         .collect::<BTreeMap<_, _>>();
     for pool in expected_pools.keys() {
+        // Terminated registrations (for example a predecessor killed by the crash demo) remain
+        // in the routing tables; only live collectors must own and serve tables.
         let pool_collectors = routing
             .collectors
             .iter()
-            .filter(|collector| &collector.implementation_pool == pool)
+            .filter(|collector| &collector.implementation_pool == pool && !collector.terminated)
             .collect::<Vec<_>>();
         check(
             !pool_collectors.is_empty(),
-            &format!("{pool} did not register a collector"),
+            &format!("{pool} did not register a live collector"),
             failures,
         );
         let leases = routing
@@ -552,6 +572,11 @@ fn validate_routing(
                 &format!("{pool} {} is routed to a collector in the wrong pool", lease.table),
                 failures,
             );
+            check(
+                collector.is_none_or(|collector| !collector.terminated),
+                &format!("{pool} {} is still routed to a terminated collector", lease.table),
+                failures,
+            );
             holders.insert(lease.holder_instance_id.clone());
         }
         if require_all_collectors {
@@ -573,7 +598,7 @@ fn validate_routing(
     }
 }
 
-fn validate_capabilities(capabilities: &Value, failures: &mut Vec<String>) {
+fn validate_capabilities(capabilities: &Value, quiver: bool, failures: &mut Vec<String>) {
     let direct = capabilities
         .get("direct")
         .and_then(Value::as_array)
@@ -598,17 +623,39 @@ fn validate_capabilities(capabilities: &Value, failures: &mut Vec<String>) {
             "direct collector did not advertise durable receipt status",
             failures,
         );
+        check(
+            values.iter().any(|value| value == "durable_payload_storage") == quiver,
+            if quiver {
+                "direct collector did not advertise native Quiver payload storage"
+            } else {
+                "direct collector advertised native Quiver payload storage without --quiver"
+            },
+            failures,
+        );
     }
     for entry in dataflow {
         let response = &entry["response"];
         let values = response["capabilities"].as_array().cloned().unwrap_or_default();
-        check(
-            response["delivery_guarantee"] == "best_effort"
-                && response["completion_mode"] == "best_effort_admission"
-                && !values.iter().any(|value| value == "receipt_status"),
-            "dataflow collector capability gap was not reported honestly",
-            failures,
-        );
+        let honest_gap = !values.iter().any(|value| value == "receipt_status");
+        if quiver {
+            check(
+                response["delivery_guarantee"] == "durable_admission"
+                    && response["completion_mode"] == "durable_admission"
+                    && response["at_least_once"] == true
+                    && response["native_quiver"]["enabled"] == true
+                    && honest_gap,
+                "dataflow collector did not report native Quiver durable admission",
+                failures,
+            );
+        } else {
+            check(
+                response["delivery_guarantee"] == "best_effort"
+                    && response["completion_mode"] == "best_effort_admission"
+                    && honest_gap,
+                "dataflow collector capability gap was not reported honestly",
+                failures,
+            );
+        }
     }
 }
 
@@ -652,6 +699,8 @@ struct RoutingCollectorEvidence {
     implementation_pool: String,
     endpoint: String,
     state: String,
+    #[serde(default)]
+    terminated: bool,
     received_rows: Option<u64>,
     received_batches: Option<u64>,
 }
@@ -682,6 +731,61 @@ struct ValidationReport {
 mod tests {
     use super::*;
 
+    fn collector(instance_id: &str, terminated: bool) -> RoutingCollectorEvidence {
+        RoutingCollectorEvidence {
+            instance_id: instance_id.to_owned(),
+            instance_key: "loadtest-direct-1".to_owned(),
+            implementation_pool: "direct".to_owned(),
+            endpoint: "10.89.0.21:50051".to_owned(),
+            state: "ready".to_owned(),
+            terminated,
+            received_rows: Some(8),
+            received_batches: Some(1),
+        }
+    }
+
+    fn crash_succession(holder: &str) -> (RoutingEvidence, BTreeSet<String>, BTreeMap<String, BTreeSet<String>>) {
+        let tables = BTreeSet::from(["telemetry.prod.logs".to_owned(), "telemetry.prod.traces".to_owned()]);
+        let evidence = RoutingEvidence {
+            loaded_at_unix_ms: 1,
+            collectors: vec![collector("predecessor", true), collector("successor", false)],
+            leases: tables
+                .iter()
+                .map(|table| RoutingLeaseEvidence {
+                    implementation_pool: "direct".to_owned(),
+                    table: table.clone(),
+                    holder_instance_id: holder.to_owned(),
+                    fencing_epoch: 2,
+                    lease_version: 2,
+                    state: "active".to_owned(),
+                })
+                .collect(),
+        };
+        let pools = BTreeMap::from([("direct".to_owned(), tables.clone())]);
+        (evidence, tables, pools)
+    }
+
+    #[test]
+    fn crashed_predecessor_does_not_count_as_an_idle_collector() {
+        let (evidence, tables, pools) = crash_succession("successor");
+        let mut failures = Vec::new();
+        validate_routing(&evidence, &tables, &pools, true, &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn tables_must_not_stay_routed_to_a_terminated_collector() {
+        let (evidence, tables, pools) = crash_succession("predecessor");
+        let mut failures = Vec::new();
+        validate_routing(&evidence, &tables, &pools, true, &mut failures);
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("still routed to a terminated collector")),
+            "{failures:?}"
+        );
+    }
+
     fn ordinary_capabilities() -> Value {
         serde_json::json!({
             "direct": [{
@@ -703,14 +807,14 @@ mod tests {
     #[test]
     fn ordinary_collector_delivery_capabilities_are_valid() {
         let mut failures = Vec::new();
-        validate_capabilities(&ordinary_capabilities(), &mut failures);
+        validate_capabilities(&ordinary_capabilities(), false, &mut failures);
         assert!(failures.is_empty(), "{failures:?}");
     }
 
     #[test]
     fn capability_evidence_is_required_for_both_pools() {
         let mut failures = Vec::new();
-        validate_capabilities(&serde_json::json!({}), &mut failures);
+        validate_capabilities(&serde_json::json!({}), false, &mut failures);
         assert_eq!(
             failures,
             [
@@ -726,11 +830,60 @@ mod tests {
         capabilities["direct"][0]["response"]["capabilities"] = serde_json::json!([]);
         capabilities["dataflow"][0]["response"]["capabilities"] = serde_json::json!(["receipt_status"]);
         let mut failures = Vec::new();
-        validate_capabilities(&capabilities, &mut failures);
+        validate_capabilities(&capabilities, false, &mut failures);
         assert_eq!(
             failures,
             [
                 "direct collector did not advertise durable receipt status",
+                "dataflow collector capability gap was not reported honestly",
+            ]
+        );
+    }
+
+    fn quiver_capabilities() -> Value {
+        serde_json::json!({
+            "direct": [{
+                "response": {
+                    "implementation_pool": "direct",
+                    "capabilities": ["durable_payload_storage", "receipt_status"]
+                }
+            }],
+            "dataflow": [{
+                "response": {
+                    "delivery_guarantee": "durable_admission",
+                    "completion_mode": "durable_admission",
+                    "at_least_once": true,
+                    "native_quiver": {"supported": true, "enabled": true},
+                    "capabilities": []
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn quiver_collector_delivery_capabilities_are_valid() {
+        let mut failures = Vec::new();
+        validate_capabilities(&quiver_capabilities(), true, &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn capability_validation_requires_the_requested_quiver_mode() {
+        let mut failures = Vec::new();
+        validate_capabilities(&ordinary_capabilities(), true, &mut failures);
+        assert_eq!(
+            failures,
+            [
+                "direct collector did not advertise native Quiver payload storage",
+                "dataflow collector did not report native Quiver durable admission",
+            ]
+        );
+        let mut failures = Vec::new();
+        validate_capabilities(&quiver_capabilities(), false, &mut failures);
+        assert_eq!(
+            failures,
+            [
+                "direct collector advertised native Quiver payload storage without --quiver",
                 "dataflow collector capability gap was not reported honestly",
             ]
         );

@@ -16,7 +16,10 @@ import {
 } from './cli.js';
 import { startResourceSampler } from './resource-sampler.js';
 import { writeProvenance } from './provenance.js';
-import { benchmarkComposeFiles, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs } from './runtime-config.js';
+import { runQuiverCrash, QUIVER_RECOVERY_FILE } from './quiver-crash.js';
+import {
+  benchmarkComposeFiles, benchmarkQuiver, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs, dataflowConfigFile,
+} from './runtime-config.js';
 import { acquireBenchmarkController, resetBenchmark, type BenchmarkController } from './lifecycle.js';
 import { kustoComposeStartArguments, kustoStatusSummary, readKustoStatus, requireHealthyKusto, safeKustoError, startKusto } from './kusto.js';
 import { kustoExplorerStartArguments, runUiGate } from './ui-gate.js';
@@ -90,6 +93,23 @@ function environment(directory: string): NodeJS.ProcessEnv {
 function compose(project: string, env: NodeJS.ProcessEnv, args: string[], timeout = 300_000): string {
   const files = benchmarkComposeFiles(composeFile, env);
   return run('docker', ['compose', '--project-name', project, ...files, ...args], env, timeout);
+}
+
+function composeAsync(project: string, env: NodeJS.ProcessEnv, args: string[], timeout = 600_000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('docker', ['compose', '--project-name', project, ...benchmarkComposeFiles(composeFile, env), ...args], {
+      cwd: workspace, env, timeout, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk; });
+    child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('close', (code, signal) => {
+      if (code === 0 && signal === null) resolve(stdout);
+      else reject(new Error(`docker compose ${args.join(' ')} failed: ${signal ?? code}\n${stderr}`));
+    });
+  });
 }
 
 function composeToFile(project: string, env: NodeJS.ProcessEnv, args: string[], file: string): void {
@@ -175,7 +195,7 @@ function stageHelperBinaries(): string {
   return destination;
 }
 
-function writeDirectConfig(directory: string, service: string, network: BenchmarkNetwork): void {
+function writeDirectConfig(directory: string, service: string, network: BenchmarkNetwork, quiver: boolean): void {
   const state = path.join(directory, `direct-state-${service.split('-')[1]}`);
   mkdirSync(state, { recursive: true });
   const generationFile = path.join(state, 'generation');
@@ -189,19 +209,19 @@ function writeDirectConfig(directory: string, service: string, network: Benchmar
   const address = network.direct;
   const template = readFileSync(path.join(workspace, 'projects/loadtest/config/direct.yaml.tmpl'), 'utf8');
   const runtime = buildBenchmarkRuntimeConfigs(template,
-    readFileSync(path.join(workspace, 'projects/arrowcol-dataflow-rust/config.yaml'), 'utf8'),
-    { instanceKey: `loadtest-${service}`, advertisedEndpoint: `${address}:50051`, generation });
+    readFileSync(path.join(workspace, dataflowConfigFile(quiver)), 'utf8'),
+    { instanceKey: `loadtest-${service}`, advertisedEndpoint: `${address}:50051`, generation }, { quiver });
   writeFileSync(path.join(state, 'direct.yaml'), runtime.directYaml);
   const dataflowState = path.join(directory, 'dataflow-state-1');
   mkdirSync(dataflowState, { recursive: true });
   writeFileSync(path.join(dataflowState, 'dataflow.yaml'), runtime.dataflowYaml);
   writeFileSync(path.join(directory, 'router-state/compose-runtime.json'),
-    `${buildBenchmarkComposeOverride(hostPath(directory))}\n`);
+    `${buildBenchmarkComposeOverride(hostPath(directory), { quiver })}\n`);
   writeFileSync(generationFile, `${generation}\n`);
 }
 
-function writeRuntimeConfigs(directory: string, network: BenchmarkNetwork): void {
-  writeDirectConfig(directory, 'direct-1', network);
+function writeRuntimeConfigs(directory: string, network: BenchmarkNetwork, quiver: boolean): void {
+  writeDirectConfig(directory, 'direct-1', network, quiver);
   writeRouterConfig(directory, 500);
 }
 
@@ -236,6 +256,9 @@ function benchmarkEnvironment(
     LOADTEST_BATCH_ROWS: String(options.batchRows),
     LOADTEST_SEED: String(options.seed),
     LOADTEST_SCENARIOS: 'paired',
+    LOADTEST_QUIVER: String(options.quiver),
+    // The crash demo keeps retrying through the collector outage instead of exhausting attempts.
+    ...(options.crashAfterSeconds === undefined ? {} : { LOADTEST_RETRY_WINDOW: '5m' }),
     LOADTEST_EDGE_HMAC_FILE: hostPath(secrets.edge),
     LOADTEST_INTERNAL_HMAC_FILE: hostPath(secrets.internal),
     LOADTEST_SCRATCH_HOST_PATH: hostPath(path.join(workspace, 'projects/loadtest/.temp')),
@@ -401,6 +424,16 @@ export function sqlserverAccess(port: string, passwordFile: string): string {
   return `SQL Server: localhost,${port} (host port ${port} -> container port 1433, username sa, password ${password})`;
 }
 
+export function quiverLocations(directory: string): string {
+  const root = path.resolve(directory);
+  return [
+    'Quiver write-ahead logs and segments on disk (workspace paths)',
+    '-------------------------------------------------------------',
+    `  Direct:   ${path.join(root, benchmarkQuiver.directHostDirectory)}`,
+    `  Dataflow: ${path.join(root, benchmarkQuiver.dataflowHostDirectory)}`,
+  ].join('\n');
+}
+
 export function deltaTableLocations(directory: string): string {
   const root = path.resolve(directory);
   return [
@@ -412,7 +445,9 @@ export function deltaTableLocations(directory: string): string {
 }
 
 async function benchmark(options: BenchmarkOptions, controller: BenchmarkController): Promise<BenchmarkContext> {
-  step(`Load test: warmup ${options.warmupSeconds}s, concurrency ${options.concurrency}, batch rows ${options.batchRows}`);
+  step(`Load test: warmup ${options.warmupSeconds}s, concurrency ${options.concurrency}, batch rows ${options.batchRows}` +
+    (options.quiver ? ', native Quiver disk persistence' : '') +
+    (options.crashAfterSeconds === undefined ? '' : `, kill -9 both collectors ${options.crashAfterSeconds}s into load`));
   step('Starting fresh: removing previous loadtest containers, volumes, and generated data');
   const project = BENCHMARK_PROJECT;
   const directory = await resetBenchmark(workspace, args => run('docker', args));
@@ -421,6 +456,7 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
   for (const child of [
     'direct', 'dataflow', 'otel', 'results', 'router-state',
     'direct-state-1',
+    ...(options.quiver ? [benchmarkQuiver.directHostDirectory, benchmarkQuiver.dataflowHostDirectory] : []),
   ]) {
     mkdirSync(path.join(directory, child), { recursive: true });
   }
@@ -430,7 +466,7 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
     run(path.join(workspace, 'projects/arrowcol-infra/scripts/bootstrap-secrets.sh'), []);
     mkdirSync(path.join(workspace, 'projects/loadtest/.temp'), { recursive: true });
     network = selectBenchmarkNetwork();
-    writeRuntimeConfigs(directory, network);
+    writeRuntimeConfigs(directory, network, options.quiver);
     writeFileSync(path.join(directory, 'router-state/network.json'), `${JSON.stringify(network, null, 2)}\n`);
     env = benchmarkEnvironment(directory, options, network, stageHelperBinaries());
   } catch (error) {
@@ -505,10 +541,40 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
       path.join(workspace, 'projects/arrowcol-infra/secrets/sqlserver-sa-password.txt'),
     ));
     step(deltaTableLocations(directory));
+    if (options.quiver) step(quiverLocations(directory));
     const context = { directory, env, network, options };
     phase = 'load-generation';
     step('Running load generator (Ctrl+C to stop; stack is kept)');
-    await runLocalLoadgen(context, 'run', path.join(directory, 'results'), controller);
+    const loadEnded = new AbortController();
+    const crash = options.crashAfterSeconds === undefined ? undefined : runQuiverCrash({
+      crashAfterSeconds: options.crashAfterSeconds,
+      directAdmin: `http://${network.direct}:8081`,
+      dataflowAdmin: `http://${network.dataflow}:32011`,
+      results: path.join(directory, 'results'),
+      kill: async () => {
+        await composeAsync(project, env, ['--profile', 'benchmark', 'kill', '--signal', 'SIGKILL', 'direct-1', 'dataflow-1']);
+      },
+      restart: async () => {
+        // A restarted Direct process is a new receipt-owner generation that adopts its predecessor's receipts.
+        writeDirectConfig(directory, 'direct-1', network, true);
+        await composeAsync(project, env, [
+          '--profile', 'benchmark', 'up', '--detach', '--no-build', '--no-deps', '--wait', '--wait-timeout', '300',
+          'direct-1', 'dataflow-1',
+        ], 360_000);
+      },
+      log: step,
+      loadEnded: loadEnded.signal,
+      checkRunning: () => controller.checkRunning(),
+    });
+    const load = runLocalLoadgen(context, 'run', path.join(directory, 'results'), controller)
+      .finally(() => loadEnded.abort());
+    const [loadOutcome, crashOutcome] = await Promise.allSettled([load, crash]);
+    if (loadOutcome.status === 'rejected') throw loadOutcome.reason;
+    if (crashOutcome.status === 'rejected') {
+      phase = 'quiver-recovery';
+      throw crashOutcome.reason;
+    }
+    if (crash) step(`Quiver crash recovery evidence: ${resultsDirectory}/${QUIVER_RECOVERY_FILE}`);
     if (options.validate) {
       phase = 'output-validation';
       step('Validating Delta and native Kusto output');

@@ -97,7 +97,11 @@
         "build"
       ],
       "options": {
-        "command": "npx --no-install tsx projects/loadtest/src/main.ts --warmup 5s --measure 30s --batch-rows 1024 --validate",
+        "commands": [
+          "npx --no-install tsx projects/loadtest/src/main.ts --warmup 5s --measure 30s --batch-rows 1024 --validate",
+          "npx --no-install tsx projects/loadtest/src/main.ts --warmup 5s --measure 60s --batch-rows 1024 --validate --quiver --crash-after 15s"
+        ],
+        "parallel": false,
         "forwardAllArgs": false
       }
     },

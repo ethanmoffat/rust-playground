@@ -6,7 +6,7 @@ import path from 'node:path';
 import YAML from 'yaml';
 
 import type { BenchmarkOptions } from './cli.js';
-import { benchmarkComposeFiles } from './runtime-config.js';
+import { benchmarkComposeFiles, dataflowConfigFile } from './runtime-config.js';
 
 export function sha256(text: string | Buffer): string {
   return createHash('sha256').update(text).digest('hex');
@@ -40,6 +40,10 @@ export function safeCollectorPolicies(direct: Document, dataflow: Document): Doc
       sql_pool: pick(direct.sql_server.pool ?? {}, [
         'receipts_max_size', 'routing_max_size', 'catalog_max_size', 'acquire_timeout_ms',
       ]),
+      native_quiver: pick(direct.buffer.native_quiver ?? {}, [
+        'enabled', 'directory', 'capacity_bytes', 'wal_flush_interval_ms', 'segment_max_open_ms', 'max_in_flight',
+        'recovery_window_ms',
+      ]),
     },
     dataflow: {
       pipeline: pick(dataflow.groups.arrowcol.pipelines.ingest.policies, ['channel_capacity']),
@@ -55,6 +59,11 @@ export function safeCollectorPolicies(direct: Document, dataflow: Document): Doc
       batching: pick(nodes.delta.config.batching, [
         'global_capacity', 'per_table_capacity', 'max_arrow_memory_per_flush', 'max_rows_per_flush', 'max_batches_per_flush',
         'max_age', 'max_concurrent_flushes', 'adaptive_file',
+      ]),
+      native_quiver: nodes.flight.config.native_quiver === true,
+      durable_buffer: pick(Object.values(nodes as Document).find((node) => node.type === 'processor:durable_buffer')?.config ?? {}, [
+        'path', 'retention_size_cap', 'size_cap_policy', 'wal_flush_interval', 'max_segment_open_duration', 'poll_interval',
+        'initial_retry_interval', 'max_retry_interval', 'max_in_flight',
       ]),
     },
   };
@@ -114,7 +123,7 @@ export function writeProvenance(
   }
   const files = [
     'projects/loadtest/compose.yaml', 'projects/loadtest/config/direct.yaml.tmpl',
-    'projects/arrowcol-dataflow-rust/config.yaml', 'projects/loadtest/config/router.yaml',
+    dataflowConfigFile(options.quiver), 'projects/loadtest/config/router.yaml',
   ];
   const direct = YAML.parse(readFileSync(path.join(directory, 'direct-state-1/direct.yaml'), 'utf8')) as Document;
   const dataflow = YAML.parse(readFileSync(path.join(directory, 'dataflow-state-1/dataflow.yaml'), 'utf8')) as Document;

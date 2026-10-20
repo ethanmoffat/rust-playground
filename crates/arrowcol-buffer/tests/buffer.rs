@@ -9,8 +9,9 @@ use arrow_deltalake::CompletedFileObservation;
 use arrow_deltalake::record_batch_logical_bytes;
 use arrow_deltalake::sizing::AdaptiveFileSizeConfig;
 use arrowcol_buffer::{
-    Admission, BufferConfig, BufferErrorKind, BufferManager, CapacityLimits, FlushReason, PublicationContext,
-    PublicationOutcome, PublicationSession, PublicationSink, SinkError,
+    Admission, BufferConfig, BufferErrorKind, BufferManager, CapacityLimits, FlushReason, PersistRequest,
+    PublicationContext, PublicationOutcome, PublicationSession, PublicationSink, QuiverStage, QuiverStageConfig,
+    SinkError, StageLeases,
 };
 use arrowcol_catalog::{
     CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, FlightSqlDdlRequest, MemoryCatalogStore,
@@ -21,9 +22,9 @@ use arrowcol_protocol::{
     Measurement, ReceiptId, ReceiptState, TableLease, UnixMillis, fingerprint_schema,
 };
 use arrowcol_receipts::{
-    FailureDisposition, OwnerDrain, OwnerRegistration, PublicationBatch, ReceiptError, ReceiptErrorKind,
-    ReceiptFailure, ReceiptRecord, ReceiptResult, ReceiptStore, ReceiptVersion, ReconciliationReport,
-    TableLeaseRequest, ValidatedDelivery,
+    FailureDisposition, OwnerDrain, OwnerRegistration, PublicationBatch, ReceiptAdoption, ReceiptAdoptionReport,
+    ReceiptError, ReceiptErrorKind, ReceiptFailure, ReceiptRecord, ReceiptResult, ReceiptStore, ReceiptVersion,
+    ReconciliationReport, RejectedAdoption, TableLeaseRequest, ValidatedDelivery,
 };
 use async_trait::async_trait;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -268,6 +269,30 @@ impl ReceiptStore for FakeReceipts {
             reconciled: Vec::new(),
             limit_reached: false,
         })
+    }
+
+    async fn adopt_receipts(&self, request: &ReceiptAdoption) -> ReceiptResult<ReceiptAdoptionReport> {
+        request.validate()?;
+        let mut records = self.records.lock().await;
+        let mut report = ReceiptAdoptionReport::default();
+        for candidate in &request.receipts {
+            match records.get_mut(&candidate.receipt_id) {
+                Some(record) if candidate.matches(record) && record.table == *request.lease.table() => {
+                    record.owner_instance_id = request.successor;
+                    record.lease_id = request.lease.lease_id();
+                    record.fencing_epoch = request.lease.fencing_token();
+                    record.lease_deadline_unix_ms = request.lease_deadline;
+                    record.heartbeat_at_unix_ms = request.adopted_at;
+                    record.updated_at_unix_ms = request.adopted_at;
+                    report.adopted.push(record.clone());
+                }
+                current => report.rejected.push(RejectedAdoption {
+                    receipt_id: candidate.receipt_id,
+                    current: current.cloned(),
+                }),
+            }
+        }
+        Ok(report)
     }
 }
 
@@ -1009,4 +1034,220 @@ async fn wait_for_reason(sink: &FakeSink, count: usize) {
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
+}
+
+struct FixedLeases(TableLease);
+
+#[async_trait]
+impl StageLeases for FixedLeases {
+    async fn current_lease(
+        &self,
+        _table_id: uuid::Uuid,
+        _table: &arrowcol_protocol::TableIdentity,
+    ) -> Result<TableLease, String> {
+        Ok(self.0.clone())
+    }
+}
+
+fn quiver_config(directory: &std::path::Path) -> QuiverStageConfig {
+    QuiverStageConfig {
+        directory: directory.to_path_buf(),
+        capacity_bytes: 256 * 1024 * 1024,
+        wal_flush_interval: Duration::ZERO,
+        segment_max_open: Duration::from_millis(20),
+        max_in_flight: 16,
+        retry_initial: Duration::from_millis(10),
+        retry_max: Duration::from_millis(50),
+    }
+}
+
+fn quick_flush_config() -> BufferConfig {
+    let mut config = config_large();
+    config.max_age = Duration::from_millis(20);
+    config.age_check_interval = Duration::from_millis(2);
+    config
+}
+
+async fn open_stage(
+    directory: &std::path::Path,
+    manager: &Arc<BufferManager>,
+    receipts: &Arc<FakeReceipts>,
+    lease: &TableLease,
+) -> anyhow::Result<Arc<QuiverStage>> {
+    Ok(QuiverStage::open(
+        quiver_config(directory),
+        Arc::clone(manager),
+        Arc::<FakeReceipts>::clone(receipts),
+        Arc::new(FixedLeases(lease.clone())),
+        lease.holder_instance_id(),
+        Duration::from_secs(30),
+    )
+    .await?)
+}
+
+async fn persist(stage: &QuiverStage, admission: &Admission, lease: &TableLease) -> anyhow::Result<()> {
+    stage
+        .persist(
+            PersistRequest {
+                receipt: admission.receipt,
+                owner: lease.holder_instance_id(),
+                delivery: &admission.delivery,
+                lease,
+                batch: admission.batches[0].clone(),
+            },
+            Duration::from_secs(5),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn wait_for_published(receipts: &FakeReceipts, ids: &[ReceiptId]) -> anyhow::Result<Vec<ReceiptRecord>> {
+    for _ in 0..1_000 {
+        let records = receipts.records.lock().await;
+        let current = ids.iter().filter_map(|id| records.get(id).cloned()).collect::<Vec<_>>();
+        if current.len() == ids.len() && current.iter().all(|record| record.state == ReceiptState::Published) {
+            return Ok(current);
+        }
+        drop(records);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    anyhow::bail!("receipts were not published from Quiver in time")
+}
+
+async fn wait_for_empty_backlog(stage: &QuiverStage) -> anyhow::Result<()> {
+    for _ in 0..1_000 {
+        if stage.snapshot().backlog_bundles == 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    anyhow::bail!("Quiver backlog did not drain in time")
+}
+
+/// Scenario: A delivery is persisted to Quiver and the stage consumer runs.
+/// Guarantees: The batch is read back from disk, its receipt reaches `published`,
+/// and only then is the bundle acknowledged so the persisted backlog drains.
+#[tokio::test]
+async fn quiver_stage_publishes_persisted_batches_from_disk() -> anyhow::Result<()> {
+    let validation = validation("quiver_publish").await?;
+    let lease = lease(validation.registered().identity())?;
+    let receipts = Arc::new(FakeReceipts::default());
+    let sink = FakeSink::succeeding();
+    let manager = manager(quick_flush_config(), Arc::clone(&receipts), Arc::clone(&sink))?;
+    let directory = tempfile::tempdir()?;
+    let stage = open_stage(directory.path(), &manager, &receipts, &lease).await?;
+
+    let (admission, _) = admission(&validation, &lease, &[1, 2, 3], &receipts).await?;
+    persist(&stage, &admission, &lease).await?;
+    assert_eq!(stage.snapshot().persisted_bundles, 1);
+    assert_eq!(stage.snapshot().backlog_bundles, 1);
+    stage.start();
+
+    wait_for_published(&receipts, &[admission.receipt.receipt_id]).await?;
+    wait_for_empty_backlog(&stage).await?;
+    let snapshot = stage.snapshot();
+    assert_eq!(snapshot.published_bundles, 1);
+    assert_eq!(snapshot.recovered_bundles, 0);
+    assert!(snapshot.disk_capacity_bytes >= 256 * 1024 * 1024);
+    stage.shutdown().await;
+    manager.shutdown().await?;
+    Ok(())
+}
+
+/// Scenario: A collector persists batches and crashes before publishing them;
+/// a successor with a new owner and table lease opens the same Quiver directory.
+/// Guarantees: The successor replays every persisted batch, adopts each original
+/// receipt onto its own lease, and publishes them under the original receipt IDs.
+#[tokio::test]
+async fn quiver_stage_replays_and_adopts_receipts_after_crash() -> anyhow::Result<()> {
+    let validation = validation("quiver_crash").await?;
+    let predecessor_lease = lease(validation.registered().identity())?;
+    let successor_lease = lease(validation.registered().identity())?;
+    let receipts = Arc::new(FakeReceipts::default());
+    let directory = tempfile::tempdir()?;
+    let mut ids = Vec::new();
+    {
+        let sink = FakeSink::succeeding();
+        let manager = manager(quick_flush_config(), Arc::clone(&receipts), sink)?;
+        let crashed = open_stage(directory.path(), &manager, &receipts, &predecessor_lease).await?;
+        for values in [[1_i64, 2], [3, 4]] {
+            let (admission, _) = admission(&validation, &predecessor_lease, &values, &receipts).await?;
+            persist(&crashed, &admission, &predecessor_lease).await?;
+            ids.push(admission.receipt.receipt_id);
+        }
+        // Crash: the consumer never ran and the open segment was never finalized.
+    }
+
+    let sink = FakeSink::succeeding();
+    let manager = manager(quick_flush_config(), Arc::clone(&receipts), Arc::clone(&sink))?;
+    let successor = open_stage(directory.path(), &manager, &receipts, &successor_lease).await?;
+    assert_eq!(successor.snapshot().backlog_bundles, 2);
+    successor.start();
+
+    let published = wait_for_published(&receipts, &ids).await?;
+    assert!(published.iter().all(|record| {
+        record.owner_instance_id == successor_lease.holder_instance_id()
+            && record.lease_id == successor_lease.lease_id()
+    }));
+    wait_for_empty_backlog(&successor).await?;
+    let snapshot = successor.snapshot();
+    assert_eq!(snapshot.recovered_bundles, 2);
+    assert_eq!(snapshot.adopted_receipts, 2);
+    successor.shutdown().await;
+    manager.shutdown().await?;
+    Ok(())
+}
+
+/// Scenario: A persisted batch is replayed after its receipt was already
+/// published (the predecessor crashed before acknowledging the bundle).
+/// Guarantees: The successor acknowledges the bundle without publishing the
+/// batch to Delta again.
+#[tokio::test]
+async fn quiver_stage_acknowledges_already_published_replay_without_republishing() -> anyhow::Result<()> {
+    let validation = validation("quiver_published").await?;
+    let predecessor_lease = lease(validation.registered().identity())?;
+    let successor_lease = lease(validation.registered().identity())?;
+    let receipts = Arc::new(FakeReceipts::default());
+    let directory = tempfile::tempdir()?;
+    let (admission, _) = admission(&validation, &predecessor_lease, &[7], &receipts).await?;
+    {
+        let manager = manager(quick_flush_config(), Arc::clone(&receipts), FakeSink::succeeding())?;
+        let crashed = open_stage(directory.path(), &manager, &receipts, &predecessor_lease).await?;
+        persist(&crashed, &admission, &predecessor_lease).await?;
+    }
+    if let Some(record) = receipts.records.lock().await.get_mut(&admission.receipt.receipt_id) {
+        record.state = ReceiptState::Published;
+        record.revision = 3;
+    }
+
+    let sink = FakeSink::succeeding();
+    let manager = manager(quick_flush_config(), Arc::clone(&receipts), Arc::clone(&sink))?;
+    let successor = open_stage(directory.path(), &manager, &receipts, &successor_lease).await?;
+    successor.start();
+    wait_for_empty_backlog(&successor).await?;
+    let snapshot = successor.snapshot();
+    assert_eq!(snapshot.published_bundles, 1, "{snapshot:?}");
+    assert!(
+        sink.reasons.lock().await.is_empty(),
+        "replayed batch was published again"
+    );
+    successor.shutdown().await;
+    manager.shutdown().await?;
+    Ok(())
+}
+
+/// Scenario: A durable stage checks a delivery that can never fit the buffer.
+/// Guarantees: It is rejected before persistence with a typed capacity error,
+/// so a batch the buffer could never admit is never acknowledged.
+#[tokio::test]
+async fn admissibility_check_rejects_deliveries_that_never_fit() -> anyhow::Result<()> {
+    let receipts = Arc::new(FakeReceipts::default());
+    let manager = manager(config_large(), receipts, FakeSink::succeeding())?;
+    let Err(error) = manager.check_admissible(uuid::Uuid::new_v4(), 1_000, 8, 1) else {
+        anyhow::bail!("oversized delivery was admissible");
+    };
+    assert_eq!(error.kind(), BufferErrorKind::CapacityExceeded);
+    manager.check_admissible(uuid::Uuid::new_v4(), 1, 8, 1)?;
+    manager.shutdown().await?;
+    Ok(())
 }

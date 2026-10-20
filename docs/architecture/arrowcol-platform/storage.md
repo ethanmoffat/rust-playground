@@ -42,10 +42,26 @@ and pending Delta files. Healthy queues do not turn admission into durability.
 ## Persistence limits
 
 SQL stores receipt/control metadata, fixed-size hashes, bounded counts, errors,
-and publication observations, **not pending ingest payloads**. Collector loss
-loses in-memory Arrow arrays. Neither pool supports native Quiver for arbitrary
-Arrow: fixed OTAP bundle slots cannot preserve this table/schema/fingerprint
-representation. Unsupported modes are rejected rather than relabeled durable.
+and publication observations, **not pending ingest payloads**. By default,
+collector loss loses in-memory Arrow arrays.
+
+Native Quiver is optional local-disk payload persistence. It is enabled with
+`buffer.native_quiver` for Direct, and with `native_quiver: true` plus
+`processor:durable_buffer` for DFE. Each Quiver bundle carries bounded metadata,
+so it preserves the table, schema, fingerprint, and lease identity of
+arbitrary Arrow. Pending batches then survive a process crash, and the restarted
+collector replays them. See
+[delivery guarantees](delivery-guarantees.md#native-quiver-disk-persistence).
+
+| Quiver directory | Direct | DFE |
+| --- | --- | --- |
+| Config key | `buffer.native_quiver.directory` | `processor:durable_buffer` `path` (per-core `core_N/`) |
+| Benchmark host | `onelake/benchmark/latest/direct-state-1/quiver` | `onelake/benchmark/latest/dataflow-state-1/quiver` |
+| Benchmark container | `/state/quiver` | `/quiver` |
+
+A Quiver directory must outlive the process and belong to one
+`instance_key`. Disk usage is capped by the configured capacity, and a full
+budget backpressures ingest.
 
 Delta is append-only: no upsert, overwrite, compaction, cross-table transaction,
 or exactly-once guarantee. The single-host benchmark uses shared bind mounts;

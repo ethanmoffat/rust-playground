@@ -22,15 +22,9 @@ groups:
               registration:
                 instance_key: incompatible-otap
                 flight_endpoint: "127.0.0.1:32210"
-          durable:
-            type: processor:durable_buffer
-            config:
-              path: /onelake/quiver
-              poll_interval: 100ms
-              max_age: 1h
-              retention_size_cap: 1GB
-              size_cap_policy: backpressure
-              otlp_handling: pass_through
+          otap_batch:
+            type: processor:batch
+            config: {}
           delta:
             type: exporter:arrow_deltalake
             config:
@@ -39,6 +33,6 @@ groups:
                 type: memory
         connections:
           - from: flight
-            to: durable
-          - from: durable
+            to: otap_batch
+          - from: otap_batch
             to: delta

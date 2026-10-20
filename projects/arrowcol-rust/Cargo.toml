@@ -49,6 +49,7 @@ uuid = { version = "1", features = ["v4"] }
 assert_cmd.workspace = true
 parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 predicates.workspace = true
+tempfile = "3"
 tiberius = { version = "0.13", default-features = false, features = ["rustls", "tds73"] }
 
 [lints]

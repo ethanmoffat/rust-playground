@@ -12,9 +12,9 @@ use tiberius::{IsolationLevel, Row};
 use uuid::Uuid;
 
 use crate::{
-    CollectorRecord, CollectorRegistration, CollectorState, LeaseCas, LeaseClaim, LeaseKey, LeaseState, LeaseTransfer,
-    RichPressureSnapshot, RoutingError, RoutingErrorKind, RoutingLease, RoutingResult, RoutingStore, RoutingView,
-    SubsystemState,
+    CollectorRecord, CollectorRegistration, CollectorState, LeaseCas, LeaseClaim, LeaseKey, LeaseState,
+    LeaseSuccession, LeaseTransfer, RichPressureSnapshot, RoutingError, RoutingErrorKind, RoutingLease, RoutingResult,
+    RoutingStore, RoutingView, SubsystemState,
 };
 
 use arrowcol_sql_server::{ConnectionConfig, SqlClient, SqlConnection, SqlPool};
@@ -218,6 +218,10 @@ impl RoutingStore for SqlServerRoutingStore {
 
     async fn transfer_drained_lease(&self, request: &LeaseTransfer) -> RoutingResult<RoutingLease> {
         retry_deadlock(|| self.inner.transfer_drained_lease(request)).await
+    }
+
+    async fn transfer_to_successor(&self, request: &LeaseSuccession) -> RoutingResult<RoutingLease> {
+        retry_deadlock(|| self.inner.transfer_to_successor(request)).await
     }
 }
 
@@ -743,6 +747,82 @@ impl RoutingStore for RawSqlStore {
         }
         Ok(value)
     }
+
+    async fn transfer_to_successor(&self, request: &LeaseSuccession) -> RoutingResult<RoutingLease> {
+        request.validate()?;
+        let mut client = self.connect().await?;
+        let result: RoutingResult<_> = async {
+            client
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|cause| database_error("begin routing lease succession", cause))?;
+            let result = async {
+                let existing = select_locked_lease(&mut client, &request.key)
+                    .await?
+                    .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "routing lease was not found"))?;
+                if existing.lease_version != request.expected_version
+                    || existing.holder_instance_id != request.predecessor_instance_id
+                    || !existing.is_valid_at(request.now_unix_ms)
+                {
+                    return Err(RoutingError::new(
+                        RoutingErrorKind::Conflict,
+                        "routing lease changed or expired before succession compare-and-set",
+                    ));
+                }
+                verify_successor(&mut client, request).await?;
+                verify_candidate(
+                    &mut client,
+                    request.successor_instance_id,
+                    request.key.implementation_pool,
+                    request.minimum_snapshot_at_unix_ms,
+                    request.now_unix_ms,
+                )
+                .await
+                .map_err(|error| {
+                    if error.kind() == RoutingErrorKind::PoolUnavailable {
+                        RoutingError::new(
+                            RoutingErrorKind::Conflict,
+                            "routing lease successor is no longer ready with fresh accepting pressure",
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+                let epoch = existing.fencing_epoch.next().map_err(|cause| {
+                    RoutingError::new(
+                        RoutingErrorKind::CorruptState,
+                        format!("fencing epoch exhausted: {cause}"),
+                    )
+                })?;
+                let version = existing.lease_version.checked_add(1).ok_or_else(|| {
+                    RoutingError::new(RoutingErrorKind::CorruptState, "routing lease version exhausted")
+                })?;
+                update_lease_owner(
+                    &mut client,
+                    &request.key,
+                    existing.lease_version,
+                    request.successor_instance_id,
+                    epoch,
+                    version,
+                    request.now_unix_ms,
+                    request.expires_at_unix_ms,
+                )
+                .await
+            }
+            .await;
+            finish_transaction(&mut client, result, "transfer routing lease to successor").await
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "transfer_to_successor",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
+    }
 }
 
 struct SnapshotSqlValues {
@@ -836,6 +916,44 @@ async fn verify_candidate(
         return Err(RoutingError::new(
             RoutingErrorKind::PoolUnavailable,
             "selected collector is no longer ready with fresh accepting pressure",
+        ));
+    }
+    Ok(())
+}
+
+async fn verify_successor(client: &mut SqlClient, request: &LeaseSuccession) -> RoutingResult<()> {
+    let predecessor = request.predecessor_instance_id.as_uuid();
+    let successor = request.successor_instance_id.as_uuid();
+    let now = datetime(request.now_unix_ms)?;
+    // Binary collation plus byte length keeps the instance-key match exact,
+    // including case and trailing spaces, like the in-memory comparison.
+    let row = client
+        .query(
+            "SELECT successor.instance_id \
+             FROM arrowcol.routing_collectors AS predecessor WITH (UPDLOCK, HOLDLOCK) \
+             INNER JOIN arrowcol.routing_collectors AS successor WITH (UPDLOCK, HOLDLOCK) \
+               ON successor.instance_key COLLATE Latin1_General_100_BIN2 = predecessor.instance_key \
+              AND DATALENGTH(successor.instance_key) = DATALENGTH(predecessor.instance_key) \
+              AND successor.instance_id <> predecessor.instance_id \
+             WHERE predecessor.instance_id=@P1 AND successor.instance_id=@P2 \
+               AND predecessor.implementation_pool=@P3 AND successor.implementation_pool=@P3 \
+               AND (predecessor.lease_expires_at_utc<=@P4 OR predecessor.state IN ('stopped', 'failed'));",
+            &[
+                &predecessor,
+                &successor,
+                &request.key.implementation_pool.to_string(),
+                &now,
+            ],
+        )
+        .await
+        .map_err(|cause| database_error("verify routing lease successor", cause))?
+        .into_row()
+        .await
+        .map_err(|cause| database_error("read routing lease successor", cause))?;
+    if row.is_none() {
+        return Err(RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "routing lease predecessor is still live or the successor is not its same-key restart",
         ));
     }
     Ok(())

@@ -268,6 +268,7 @@ async fn live_compose_end_to_end() -> Result<()> {
             build_version: Some("test".to_owned()),
             started_at_unix_ms: crash_started,
             lease_deadline_unix_ms: add_millis(crash_started, 100)?,
+            durable_recovery_window_ms: None,
         })
         .await?;
     tokio::time::sleep(Duration::from_millis(160)).await;
@@ -282,6 +283,7 @@ async fn live_compose_end_to_end() -> Result<()> {
             build_version: Some("test".to_owned()),
             started_at_unix_ms: replacement_started,
             lease_deadline_unix_ms: add_millis(replacement_started, 60_000)?,
+            durable_recovery_window_ms: None,
         })
         .await?;
     assert!(
@@ -474,6 +476,7 @@ async fn register_live_owner(
             build_version: Some("test".to_owned()),
             started_at_unix_ms: now,
             lease_deadline_unix_ms: expiry,
+            durable_recovery_window_ms: None,
         })
         .await?;
     routing

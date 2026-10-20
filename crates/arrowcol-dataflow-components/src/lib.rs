@@ -2,9 +2,12 @@
 //!
 //! The receiver validates every schema through `arrowcol-catalog`, moves the
 //! resulting Arrow batches into pluggable DFE pdata without serialization or
-//! buffer copies, and reports best-effort admission. The exporter consumes only
-//! that representation, preserves its table/schema/lease envelope, and writes
-//! the original batch through `arrow-deltalake`.
+//! buffer copies, and reports either best-effort admission or, with
+//! `native_quiver: true` and a downstream `processor:durable_buffer`, durable
+//! admission once every batch was persisted. The exporter consumes only that
+//! representation, preserves its table/schema/lease envelope, rebinds
+//! durable-buffer replays to the lease this process currently holds, and
+//! writes the original batch through `arrow-deltalake`.
 
 #![deny(unsafe_code)]
 
@@ -27,11 +30,8 @@ pub use envelope::{
 };
 pub use exporter::{ARROW_DELTALAKE_EXPORTER, ARROW_DELTALAKE_EXPORTER_URN, GenericDeltaExporter};
 pub use metrics::{
-    DashboardCapabilities, DashboardPressure, RuntimeMetrics, TableVersionStatus, global_metrics, process_instance_id,
+    DashboardCapabilities, DashboardPressure, NativeQuiverCapability, RuntimeMetrics, TableVersionStatus,
+    global_metrics, process_instance_id, process_instance_key,
 };
 pub use receiver::{ARROW_FLIGHT_RECEIVER, ARROW_FLIGHT_RECEIVER_URN, DfeAdmission, PdataSendError, PdataSender};
 pub use routing::{LeaseResolver, StoreLeaseResolver};
-
-/// Exact native Quiver feature gap exposed by config validation and capability metadata.
-pub const QUIVER_UNSUPPORTED_GAP: &str =
-    "Quiver capability `persist` is unavailable for pdata representation `arrowcol.flight@1.0`";

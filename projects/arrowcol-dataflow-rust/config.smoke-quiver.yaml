@@ -1,0 +1,72 @@
+version: otel_dataflow/v1
+engine: {}
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: 1
+groups:
+  arrowcol:
+    pipelines:
+      ingest:
+        policies:
+          channel_capacity:
+            control:
+              node: 16
+              pipeline: 16
+            pdata: 2
+        nodes:
+          flight:
+            type: receiver:arrow_flight
+            config:
+              listening_addr: "127.0.0.1:32410"
+              admin_listening_addr: "127.0.0.1:32411"
+              native_quiver: true
+              catalog:
+                type: memory
+              routing:
+                type: memory
+              registration:
+                instance_key: dfe-smoke-quiver
+                flight_endpoint: "127.0.0.1:32410"
+                max_concurrent_streams: 2
+                heartbeat_interval: 1s
+                pressure_interval: 1s
+                registration_ttl: 5s
+                rss_limit_bytes: 2147483648
+                buffered_bytes_limit: 1048576
+                buffered_rows_limit: 10000
+                buffered_batches_limit: 16
+              limits:
+                batch_channel_capacity: 1
+                admission_timeout: 2s
+                max_stream_duration: 10s
+          durable:
+            type: processor:durable_buffer
+            config:
+              path: "${env:ARROWCOL_QUIVER_PATH:-/var/lib/arrowcol/quiver}"
+              wal_flush_interval: 0s
+              retention_size_cap: "${env:ARROWCOL_QUIVER_CAPACITY:-256 MiB}"
+              size_cap_policy: backpressure
+              max_segment_open_duration: 1s
+              poll_interval: 100ms
+              initial_retry_interval: 250ms
+              max_retry_interval: 2s
+          delta:
+            type: exporter:arrow_deltalake
+            config:
+              base_path: /onelake/arrowcol-dataflow-smoke
+              routing:
+                type: memory
+              commit:
+                batch_window: 100ms
+                max_files_per_commit: 1
+                max_pending_files: 2
+              batching:
+                max_age: 100ms
+              authority_timeout: 1s
+        connections:
+          - from: flight
+            to: durable
+          - from: durable
+            to: delta

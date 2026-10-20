@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use arrowcol_buffer::QuiverStage;
 use arrowcol_flight::{PressureEvent, PressureHooks, StreamOutcome};
 use arrowcol_sql_server::SqlPool;
 use prometheus::core::{Collector, Desc};
@@ -121,6 +122,15 @@ impl CollectorMetrics {
         self.registry.register(Box::new(SqlPoolCollector::new(pools)?))
     }
 
+    /// Registers scrape-time Quiver durable-stage metrics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Quiver metric registration fails.
+    pub fn register_quiver(&self, stage: Arc<QuiverStage>) -> Result<(), prometheus::Error> {
+        self.registry.register(Box::new(QuiverCollector::new(stage)?))
+    }
+
     /// Encodes Prometheus text exposition.
     ///
     /// # Errors
@@ -239,6 +249,131 @@ impl Collector for SqlPoolCollector {
                     }
                     family.mut_metric().push(metric);
                 }
+                family
+            })
+            .collect()
+    }
+}
+
+struct QuiverCollector {
+    stage: Arc<QuiverStage>,
+    descriptors: Vec<Desc>,
+}
+
+const QUIVER_METRICS: [(&str, &str, MetricType); 11] = [
+    (
+        "disk_used_bytes",
+        "Bytes used on disk by the Quiver WAL and segments",
+        MetricType::GAUGE,
+    ),
+    (
+        "disk_capacity_bytes",
+        "Configured Quiver disk capacity",
+        MetricType::GAUGE,
+    ),
+    (
+        "backlog_bundles",
+        "Persisted batches not yet published to Delta",
+        MetricType::GAUGE,
+    ),
+    (
+        "persisted_bundles_total",
+        "Batches persisted to Quiver",
+        MetricType::COUNTER,
+    ),
+    (
+        "persisted_bytes_total",
+        "Logical Arrow bytes persisted to Quiver",
+        MetricType::COUNTER,
+    ),
+    (
+        "published_bundles_total",
+        "Persisted batches published to Delta and removed from the backlog",
+        MetricType::COUNTER,
+    ),
+    (
+        "rejected_bundles_total",
+        "Persisted batches dropped after a terminal receipt failure",
+        MetricType::COUNTER,
+    ),
+    (
+        "deferred_bundles_total",
+        "Persisted batch deliveries deferred for a retry",
+        MetricType::COUNTER,
+    ),
+    (
+        "recovered_bundles_total",
+        "Distinct persisted batches a crashed predecessor left on disk and this process replayed",
+        MetricType::COUNTER,
+    ),
+    (
+        "adopted_receipts_total",
+        "Receipts adopted from a crashed predecessor or rebound to a newer lease",
+        MetricType::COUNTER,
+    ),
+    (
+        "backpressure_waits_total",
+        "Persistence attempts that waited for Quiver disk capacity",
+        MetricType::COUNTER,
+    ),
+];
+
+impl QuiverCollector {
+    fn new(stage: Arc<QuiverStage>) -> Result<Self, prometheus::Error> {
+        let descriptors = QUIVER_METRICS
+            .iter()
+            .map(|(name, help, _)| {
+                Desc::new(
+                    format!("arrowcol_direct_quiver_{name}"),
+                    (*help).to_owned(),
+                    Vec::new(),
+                    Default::default(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { stage, descriptors })
+    }
+}
+
+impl Collector for QuiverCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        self.descriptors.iter().collect()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let snapshot = self.stage.snapshot();
+        let values = [
+            snapshot.disk_used_bytes,
+            snapshot.disk_capacity_bytes,
+            snapshot.backlog_bundles,
+            snapshot.persisted_bundles,
+            snapshot.persisted_bytes,
+            snapshot.published_bundles,
+            snapshot.rejected_bundles,
+            snapshot.deferred_bundles,
+            snapshot.recovered_bundles,
+            snapshot.adopted_receipts,
+            snapshot.backpressure_waits,
+        ];
+        QUIVER_METRICS
+            .iter()
+            .zip(values)
+            .map(|((name, help, kind), value)| {
+                let mut family = MetricFamily::default();
+                family.set_name(format!("arrowcol_direct_quiver_{name}"));
+                family.set_help((*help).to_owned());
+                family.set_field_type(*kind);
+                let mut metric = Metric::default();
+                if *kind == MetricType::COUNTER {
+                    let mut counter = Counter::default();
+                    counter.set_value(value as f64);
+                    metric.set_counter(counter);
+                } else {
+                    let mut gauge = Gauge::default();
+                    gauge.set_value(value as f64);
+                    metric.set_gauge(gauge);
+                }
+                family.mut_metric().push(metric);
                 family
             })
             .collect()

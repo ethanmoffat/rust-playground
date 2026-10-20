@@ -2,14 +2,18 @@ use arrowcol_protocol::{CollectorInstanceId, ReceiptId, TableLease, UnixMillis};
 use async_trait::async_trait;
 
 use crate::{
-    OwnerDrain, OwnerRegistration, PublicationBatch, ReceiptFailure, ReceiptRecord, ReceiptResult, ReceiptVersion,
-    ReconciliationReport, TableLeaseRequest, ValidatedDelivery,
+    OwnerDrain, OwnerRegistration, PublicationBatch, ReceiptAdoption, ReceiptAdoptionReport, ReceiptFailure,
+    ReceiptRecord, ReceiptResult, ReceiptVersion, ReconciliationReport, TableLeaseRequest, ValidatedDelivery,
 };
 
 /// Durable receipt operations used by direct collector and buffer workers.
 #[async_trait]
 pub trait ReceiptStore: Send + Sync {
     /// Registers a process lifetime as active for receipt ownership.
+    ///
+    /// A registration with a durable recovery window protects the owner's
+    /// active receipts from expiry reconciliation; see
+    /// [`OwnerRegistration::durable_recovery_window_ms`].
     async fn register_owner(&self, registration: OwnerRegistration) -> ReceiptResult<()>;
 
     /// Extends an active owner lease.
@@ -91,6 +95,27 @@ pub trait ReceiptStore: Send + Sync {
     ///
     /// Accepted or buffered work becomes retryable. Expired flushing work is
     /// recorded as publication-outcome-unknown and requires explicit operator
-    /// or storage reconciliation before any resend.
+    /// or storage reconciliation before any resend. Receipts whose owner
+    /// registered a durable recovery window are skipped while that owner's
+    /// lease is unexpired and until the window elapses after the owner lease
+    /// expires, so durably buffered backlog may outlive receipt deadlines and
+    /// a restarted successor can adopt it.
     async fn reconcile_expired(&self, now: UnixMillis, limit: usize) -> ReceiptResult<ReconciliationReport>;
+
+    /// Atomically adopts recovered active receipts for a successor owner.
+    ///
+    /// A candidate is adopted only when the receipt still has its expected
+    /// owner, state, and revision and is accepted, buffered, or flushing; the
+    /// successor is active with an unexpired owner lease; the supplied lease is
+    /// the successor's unreleased, unexpired lease for the receipt's table; the
+    /// new deadline fits within both leases; and the expected owner is either
+    /// the successor itself (rebinding to a newer table lease) or a failed or
+    /// stopped predecessor with the same instance key and a lower generation.
+    ///
+    /// Adoption rebinds the owner, table lease, fencing epoch, deadline, and
+    /// heartbeat, keeps state and revision, and appends an `adopted` receipt
+    /// event. Every other candidate is reported as rejected together with its
+    /// current record so the caller can drop, retry, or replay it. Adopting
+    /// flushing work does not resolve its publication uncertainty.
+    async fn adopt_receipts(&self, request: &ReceiptAdoption) -> ReceiptResult<ReceiptAdoptionReport>;
 }

@@ -239,7 +239,7 @@ async fn run_phase(
         let run_id = run_id.to_owned();
         let phase = phase.to_owned();
         let request_timeout = arguments.request_timeout.get();
-        let max_attempts = arguments.max_attempts;
+        let retry = RetryPolicy::from_arguments(arguments);
         lanes.spawn(async move {
             loop {
                 if cancellation.is_cancelled() {
@@ -270,7 +270,7 @@ async fn run_phase(
                             &manifests,
                             &receipt_sender,
                             request_timeout,
-                            max_attempts,
+                            retry,
                         )
                         .await?;
                     }
@@ -289,7 +289,7 @@ async fn run_phase(
                             &manifests,
                             &receipt_sender,
                             request_timeout,
-                            max_attempts,
+                            retry,
                         )
                         .await?;
                     }
@@ -308,7 +308,7 @@ async fn run_phase(
                             &manifests,
                             &receipt_sender,
                             request_timeout,
-                            max_attempts,
+                            retry,
                         );
                         let dataflow = send_pool_with_retry(
                             &run_id,
@@ -324,7 +324,7 @@ async fn run_phase(
                             &manifests,
                             &receipt_sender,
                             request_timeout,
-                            max_attempts,
+                            retry,
                         );
                         let (direct, dataflow) = tokio::join!(direct, dataflow);
                         direct?;
@@ -389,10 +389,12 @@ async fn send_pool_with_retry(
     manifests: &ManifestWriter,
     receipt_sender: &mpsc::Sender<PendingReceipt>,
     request_timeout: Duration,
-    max_attempts: u32,
+    retry: RetryPolicy,
 ) -> Result<()> {
-    let mut last_error = None;
-    for attempt in 1..=max_attempts {
+    let started = Instant::now();
+    let mut attempt = 0_u32;
+    loop {
+        attempt = attempt.saturating_add(1);
         let sent_at = now_unix_millis();
         match transport
             .send_batch(&batch.table, pool, Arc::clone(&batch.encoded), request_timeout)
@@ -412,6 +414,12 @@ async fn send_pool_with_retry(
                             bail!("direct pool returned best-effort admission");
                         }
                         (AckOutcome::BestEffortAdmission, None)
+                    }
+                    FlightAcknowledgement::DurableAdmission => {
+                        if pool != ImplementationPool::Dataflow {
+                            bail!("direct pool returned durable admission");
+                        }
+                        (AckOutcome::DurableAdmission, None)
                     }
                 };
                 manifests
@@ -480,16 +488,41 @@ async fn send_pool_with_retry(
                         error: Some(message),
                     })
                     .await?;
-                last_error = Some(error);
-                if attempt < max_attempts {
-                    let exponent = attempt.saturating_sub(1).min(5);
-                    let delay = 100_u64.saturating_mul(1_u64 << exponent).min(2_000);
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                if !retry.allows_another(attempt, started.elapsed()) {
+                    return Err(error.context("delivery attempts exhausted"));
                 }
+                tokio::time::sleep(RetryPolicy::backoff(attempt)).await;
             }
         }
     }
-    Err(last_error.context("delivery attempts exhausted")?)
+}
+
+/// Bounds physical delivery attempts for one pool/logical batch.
+///
+/// `max_attempts` is the floor; an optional window keeps retrying past it so a
+/// load run can ride out a deliberate collector outage (the Quiver crash demo).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetryPolicy {
+    max_attempts: u32,
+    window: Option<Duration>,
+}
+
+impl RetryPolicy {
+    fn from_arguments(arguments: &RunArgs) -> Self {
+        Self {
+            max_attempts: arguments.max_attempts,
+            window: arguments.retry_window.map(|window| window.get()),
+        }
+    }
+
+    fn allows_another(&self, attempts: u32, elapsed: Duration) -> bool {
+        attempts < self.max_attempts || self.window.is_some_and(|window| elapsed < window)
+    }
+
+    fn backoff(attempt: u32) -> Duration {
+        let exponent = attempt.saturating_sub(1).min(5);
+        Duration::from_millis(100_u64.saturating_mul(1_u64 << exponent).min(2_000))
+    }
 }
 
 #[derive(Clone)]
@@ -647,6 +680,7 @@ async fn capture_routing(arguments: &RunArgs) -> Result<RoutingEvidence> {
             implementation_pool: collector.registration.implementation_pool.to_string(),
             endpoint: collector.registration.flight_endpoint.to_string(),
             state: format!("{:?}", collector.state).to_lowercase(),
+            terminated: collector.is_terminated_at(loaded_at),
             received_rows: collector.pressure.as_ref().map(|pressure| pressure.received_rows.get()),
             received_batches: collector
                 .pressure
@@ -687,6 +721,9 @@ struct RoutingCollectorEvidence {
     implementation_pool: String,
     endpoint: String,
     state: String,
+    /// Registration expired or the process stopped/failed, such as a predecessor killed by the
+    /// Quiver crash demo whose leases moved to its restarted successor.
+    terminated: bool,
     received_rows: Option<u64>,
     received_batches: Option<u64>,
 }
@@ -699,4 +736,40 @@ struct RoutingLeaseEvidence {
     fencing_epoch: u64,
     lease_version: u64,
     state: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_policy_honors_attempts_without_a_window() {
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            window: None,
+        };
+        assert!(policy.allows_another(2, Duration::from_secs(3_600)));
+        assert!(!policy.allows_another(3, Duration::ZERO));
+    }
+
+    #[test]
+    fn retry_window_extends_attempts_through_an_outage() {
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            window: Some(Duration::from_secs(120)),
+        };
+        assert!(policy.allows_another(50, Duration::from_secs(119)));
+        assert!(!policy.allows_another(50, Duration::from_secs(120)));
+        assert!(
+            policy.allows_another(1, Duration::from_secs(600)),
+            "attempt floor still applies"
+        );
+    }
+
+    #[test]
+    fn retry_backoff_is_capped() {
+        assert_eq!(RetryPolicy::backoff(1), Duration::from_millis(100));
+        assert_eq!(RetryPolicy::backoff(5), Duration::from_millis(1_600));
+        assert_eq!(RetryPolicy::backoff(40), Duration::from_millis(2_000));
+    }
 }

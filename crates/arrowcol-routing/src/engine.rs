@@ -5,8 +5,8 @@ use arrowcol_protocol::{CollectorInstanceId, ImplementationPool, IngestMetadata,
 use tokio::sync::RwLock;
 
 use crate::{
-    LeaseCas, LeaseClaim, LeaseKey, LeaseState, LeaseTransfer, RoutingError, RoutingErrorKind, RoutingLease,
-    RoutingPolicy, RoutingResult, RoutingStore, RoutingView, collector_is_eligible, rank_collectors,
+    LeaseCas, LeaseClaim, LeaseKey, LeaseState, LeaseSuccession, LeaseTransfer, RoutingError, RoutingErrorKind,
+    RoutingLease, RoutingPolicy, RoutingResult, RoutingStore, RoutingView, collector_is_eligible, rank_collectors,
 };
 
 /// Flight SQL control operation declared before the request body.
@@ -62,6 +62,9 @@ pub struct RebalanceReport {
     pub drains_started: u64,
     /// Fully drained leases transferred with a greater epoch.
     pub transfers_completed: u64,
+    /// Crashed holders' leases handed to their same-instance-key restart with
+    /// a greater epoch.
+    pub successions_completed: u64,
     /// Compare-and-set races safely lost to another router.
     pub conflicts: u64,
 }
@@ -219,7 +222,9 @@ impl RoutingEngine {
         })
     }
 
-    /// Refreshes SQL state and performs fenced two-phase drain transfers.
+    /// Refreshes SQL state, hands crashed holders' leases to their
+    /// same-instance-key restart, and performs fenced two-phase drain
+    /// transfers.
     ///
     /// # Errors
     ///
@@ -229,6 +234,33 @@ impl RoutingEngine {
         let mut report = RebalanceReport::default();
         for lease in view.leases.values() {
             if !lease.is_valid_at(now) {
+                continue;
+            }
+            // A crashed holder can never publish a drain proof. Its same-key
+            // restart owns the durable buffer and replays the backlog instead.
+            if let Some(successor) = crash_successor(&view, lease, now, &self.policy) {
+                match self
+                    .store
+                    .transfer_to_successor(&LeaseSuccession {
+                        key: lease.key.clone(),
+                        expected_version: lease.lease_version,
+                        predecessor_instance_id: lease.holder_instance_id,
+                        successor_instance_id: successor,
+                        now_unix_ms: now,
+                        expires_at_unix_ms: add_millis(now, self.policy.lease_ttl_ms)?,
+                        minimum_snapshot_at_unix_ms: subtract_millis(now, self.policy.pressure.max_snapshot_age_ms)?,
+                    })
+                    .await
+                {
+                    Ok(updated) => {
+                        self.cache_lease(updated).await?;
+                        report.successions_completed = report.successions_completed.saturating_add(1);
+                    }
+                    Err(error) if error.kind() == RoutingErrorKind::Conflict => {
+                        report.conflicts = report.conflicts.saturating_add(1);
+                    }
+                    Err(error) => return Err(error),
+                }
                 continue;
             }
             match lease.state {
@@ -372,6 +404,37 @@ fn holder_is_drained(view: &RoutingView, lease: &RoutingLease, now: UnixMillis, 
     pressure
         .table_is_drained(&lease.key.table)
         .unwrap_or_else(|| pressure.is_globally_drained())
+}
+
+/// Returns the live, eligible restart of a terminated lease holder.
+///
+/// The restart must share the holder's instance key and the lease's pool. When
+/// several restarts qualify, the most recently started one wins.
+fn crash_successor(
+    view: &RoutingView,
+    lease: &RoutingLease,
+    now: UnixMillis,
+    policy: &RoutingPolicy,
+) -> Option<CollectorInstanceId> {
+    let holder = view.collectors.get(&lease.holder_instance_id)?;
+    if holder.registration.implementation_pool != lease.key.implementation_pool || !holder.is_terminated_at(now) {
+        return None;
+    }
+    view.collectors
+        .values()
+        .filter(|collector| {
+            collector.registration.instance_id != holder.registration.instance_id
+                && collector.registration.instance_key == holder.registration.instance_key
+                && collector.registration.implementation_pool == lease.key.implementation_pool
+                && collector_is_eligible(collector, now, policy, false)
+        })
+        .max_by_key(|collector| {
+            (
+                collector.registration.started_at_unix_ms,
+                collector.registration.instance_id,
+            )
+        })
+        .map(|collector| collector.registration.instance_id)
 }
 
 fn synthetic_control_table(route: &ControlRoute) -> RoutingResult<TableIdentity> {

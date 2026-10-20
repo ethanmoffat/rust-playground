@@ -50,6 +50,13 @@ The DFE collector implements the same traits but completes with
 `"delivery_guarantee":"best_effort"`; it is not presented as a durable
 receipt.
 
+When the DFE collector persists batches to an on-disk durable buffer (Quiver)
+and waits for every batch to be persisted before completing, it completes with
+`StreamCompletion::durable_admission()`. That `PutResult` uses
+`"kind":"durable_admission"` and `"delivery_guarantee":"durable_admission"`.
+The collector then owns delivery to Delta, including after a crash, but there
+is still no receipt to poll.
+
 Implementations can emit bounded progress acknowledgements through the supplied
 `PutResultEmitter`. `PressureHooks` receives non-blocking stream/channel
 transitions. `CapabilityReporter`, `PressureReporter`, `HealthReporter`, and

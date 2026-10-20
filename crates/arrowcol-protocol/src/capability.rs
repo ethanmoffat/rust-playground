@@ -20,6 +20,9 @@ pub enum Capability {
     TableLeaseFencing,
     /// The instance emits bounded pressure snapshots.
     PressureReporting,
+    /// Accepted payloads are persisted to local durable storage before they
+    /// are acknowledged and are replayed after a restart.
+    DurablePayloadStorage,
 }
 
 /// Versioned capability document for one collector instance.

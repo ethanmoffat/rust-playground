@@ -8,8 +8,9 @@ use arrowcol_protocol::{
     TableName, UnixMillis,
 };
 use arrowcol_routing::{
-    CollectorRegistration, CollectorState, LeaseKey, LeaseState, RichPressureSnapshot, RoutingEngine, RoutingPolicy,
-    RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore, SubsystemState, TablePressure,
+    CollectorRegistration, CollectorState, LeaseCas, LeaseClaim, LeaseKey, LeaseState, LeaseSuccession,
+    RichPressureSnapshot, RouteSource, RoutingEngine, RoutingError, RoutingErrorKind, RoutingPolicy, RoutingStore,
+    SqlServerRoutingConfig, SqlServerRoutingStore, SubsystemState, TablePressure,
 };
 use arrowcol_sql_server::{ConnectionConfig, PoolConfig, SqlConnection, SqlPool};
 use uuid::Uuid;
@@ -201,17 +202,233 @@ async fn live_routing_case(pooled: bool) -> anyhow::Result<()> {
         Ok(())
     }
     .await;
+    finish_fixture(&store, result, &[first, second], &table, add(now, 10)?).await
+}
+
+/// Scenario: a SQL-registered holder starts draining, its registration expires
+/// without a drain proof, and its process restarts under the same instance key
+/// beside healthy collectors whose keys differ only by case or a trailing space.
+/// Guarantees: SQL rejects succession while the holder is live or to a near-miss
+/// key, rebalance hands the lease to the exact-key restart with a new lease ID
+/// and greater epoch, and cached routing follows the restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the live arrowcol-infra SQL Server"]
+async fn live_sql_hands_crashed_holder_lease_to_same_key_restart() -> anyhow::Result<()> {
+    if std::env::var("ARROWCOL_SQLSERVER_TEST").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    // Routing eligibility includes collectors from every fixture in the database.
+    let _isolation = LIVE_ROUTING_CASE.lock().await;
+    let store = Arc::new(SqlServerRoutingStore::new(sql_config()?));
+    let now = now()?;
+    let crashed = CollectorInstanceId::new();
+    let restart = CollectorInstanceId::new();
+    let case_variant = CollectorInstanceId::new();
+    let padded_variant = CollectorInstanceId::new();
+    let restarted_key = format!("live-succession-{}", Uuid::new_v4().simple());
+    let table = TableIdentity::new(
+        CatalogName::new("telemetry")?,
+        SchemaName::new("live")?,
+        TableName::new(format!("succession_{}", &Uuid::new_v4().simple().to_string()[..12]))?,
+    );
+    let key = LeaseKey::new(ImplementationPool::Direct, table.clone());
+    let result: anyhow::Result<()> = async {
+        // The crashed registration closes before wall-clock now, so later
+        // cases can never select it even though it never records a state.
+        store
+            .register_collector(&live_registration(
+                crashed,
+                restarted_key.clone(),
+                51_011,
+                subtract(now, 10_000)?,
+                subtract(now, 5_000)?,
+            )?)
+            .await?;
+        store
+            .publish_pressure(&snapshot(crashed, subtract(now, 9_500)?, 500, 0, None)?)
+            .await?;
+        let initial = store
+            .claim_lease(&LeaseClaim {
+                key: key.clone(),
+                candidate_instance_id: crashed,
+                now_unix_ms: subtract(now, 9_000)?,
+                expires_at_unix_ms: add(now, 60_000)?,
+                minimum_snapshot_at_unix_ms: subtract(now, 24_000)?,
+            })
+            .await?;
+        anyhow::ensure!(
+            initial.holder_instance_id == crashed,
+            "fixture lease was not claimed by the holder"
+        );
+        for (instance, instance_key, port) in [
+            (restart, restarted_key.clone(), 51_013),
+            (case_variant, restarted_key.to_uppercase(), 51_012),
+            (padded_variant, format!("{restarted_key} "), 51_014),
+        ] {
+            store
+                .register_collector(&live_registration(
+                    instance,
+                    instance_key,
+                    port,
+                    subtract(now, 7_000)?,
+                    add(now, 180_000)?,
+                )?)
+                .await?;
+            store
+                .publish_pressure(&snapshot(instance, subtract(now, 7_000)?, 500, 0, None)?)
+                .await?;
+        }
+        let succession = |successor: CollectorInstanceId,
+                          expected_version: u64,
+                          at: UnixMillis|
+         -> anyhow::Result<LeaseSuccession> {
+            Ok(LeaseSuccession {
+                key: key.clone(),
+                expected_version,
+                predecessor_instance_id: crashed,
+                successor_instance_id: successor,
+                now_unix_ms: at,
+                expires_at_unix_ms: add(at, 60_000)?,
+                minimum_snapshot_at_unix_ms: subtract(at, 15_000)?,
+            })
+        };
+
+        let live = store
+            .transfer_to_successor(&succession(restart, initial.lease_version, subtract(now, 6_000)?)?)
+            .await;
+        anyhow::ensure!(
+            live.as_ref().err().map(RoutingError::kind) == Some(RoutingErrorKind::Conflict),
+            "succession from a live holder did not conflict: {live:?}"
+        );
+        let draining = store
+            .begin_lease_drain(&LeaseCas {
+                key: key.clone(),
+                expected_version: initial.lease_version,
+                now_unix_ms: subtract(now, 5_500)?,
+            })
+            .await?;
+        for near_miss in [case_variant, padded_variant] {
+            let mismatched = store
+                .transfer_to_successor(&succession(near_miss, draining.lease_version, now)?)
+                .await;
+            anyhow::ensure!(
+                mismatched.as_ref().err().map(RoutingError::kind) == Some(RoutingErrorKind::Conflict),
+                "succession to a near-miss instance key did not conflict: {mismatched:?}"
+            );
+        }
+        anyhow::ensure!(
+            store.load_view(now).await?.leases.get(&key) == Some(&draining),
+            "rejected succession mutated the SQL lease"
+        );
+
+        let policy = RoutingPolicy {
+            warmup_ms: 0,
+            lease_ttl_ms: 60_000,
+            ..RoutingPolicy::default()
+        };
+        let engine_store: Arc<dyn RoutingStore> = Arc::<SqlServerRoutingStore>::clone(&store);
+        let engine = RoutingEngine::new(engine_store, policy)?;
+        let report = engine.rebalance(now).await?;
+        anyhow::ensure!(
+            report.successions_completed >= 1,
+            "rebalance did not complete the fixture succession: {report:?}"
+        );
+        let succeeded = store
+            .load_view(now)
+            .await?
+            .leases
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("fixture lease disappeared during succession"))?;
+        anyhow::ensure!(
+            succeeded.holder_instance_id == restart
+                && succeeded.state == LeaseState::Active
+                && succeeded.drain_started_at_unix_ms.is_none()
+                && succeeded.lease_id != initial.lease_id
+                && succeeded.fencing_epoch.get() == draining.fencing_epoch.get() + 1
+                && succeeded.lease_version == draining.lease_version + 1,
+            "SQL succession did not establish a single new fenced owner: {succeeded:?}"
+        );
+        let replayed = store
+            .transfer_to_successor(&succession(restart, draining.lease_version, now)?)
+            .await;
+        anyhow::ensure!(
+            replayed.as_ref().err().map(RoutingError::kind) == Some(RoutingErrorKind::Conflict),
+            "replayed succession did not conflict: {replayed:?}"
+        );
+        anyhow::ensure!(
+            active_lease_count(&table).await? == 1,
+            "succession created multiple active SQL leases"
+        );
+
+        let metadata = IngestMetadata::new(
+            ProtocolVersion::CURRENT,
+            ImplementationPool::Direct,
+            table.clone(),
+            ClaimedSchemaFingerprint::new(SchemaFingerprint::from_bytes([12; 32])),
+        );
+        let route = engine.route_ingest(&metadata, add(now, 1_000)?).await?;
+        anyhow::ensure!(
+            route.instance_id == restart
+                && route.source == RouteSource::CachedLease
+                && route.lease.as_ref() == Some(&succeeded),
+            "cached routing did not follow the same-key restart"
+        );
+        Ok(())
+    }
+    .await;
+    // A SIGKILLed holder records no terminal state; its registration already
+    // expired, so only the live fixture collectors need stopping.
+    finish_fixture(
+        &store,
+        result,
+        &[restart, case_variant, padded_variant],
+        &table,
+        add(now, 10_000)?,
+    )
+    .await
+}
+
+fn live_registration(
+    instance_id: CollectorInstanceId,
+    instance_key: String,
+    port: u16,
+    started_at: UnixMillis,
+    lease_expires_at: UnixMillis,
+) -> anyhow::Result<CollectorRegistration> {
+    Ok(CollectorRegistration {
+        instance_id,
+        instance_key,
+        implementation_pool: ImplementationPool::Direct,
+        flight_endpoint: format!("127.0.0.1:{port}").parse()?,
+        catalog_capable: true,
+        max_concurrent_streams: positive(64)?,
+        started_at_unix_ms: started_at,
+        heartbeat_at_unix_ms: started_at,
+        lease_expires_at_unix_ms: lease_expires_at,
+    })
+}
+
+/// Stops fixture collectors and deletes the fixture lease, preserving the
+/// primary test failure when cleanup also fails.
+async fn finish_fixture(
+    store: &SqlServerRoutingStore,
+    result: anyhow::Result<()>,
+    instances: &[CollectorInstanceId],
+    table: &TableIdentity,
+    cleanup_after: UnixMillis,
+) -> anyhow::Result<()> {
     let mut cleanup_errors = Vec::new();
-    let cleanup_at = crate::now()?.max(add(now, 10)?);
-    for instance in [first, second] {
+    let cleanup_at = now()?.max(cleanup_after);
+    for instance in instances {
         if let Err(error) = store
-            .set_collector_state(instance, CollectorState::Stopped, cleanup_at)
+            .set_collector_state(*instance, CollectorState::Stopped, cleanup_at)
             .await
         {
             cleanup_errors.push(error.to_string());
         }
     }
-    if let Err(error) = delete_fixture_lease(&table).await {
+    if let Err(error) = delete_fixture_lease(table).await {
         cleanup_errors.push(error.to_string());
     }
     match result {
