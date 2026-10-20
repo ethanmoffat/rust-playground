@@ -160,8 +160,8 @@ export async function runQuiverCrash(options: QuiverCrashOptions): Promise<Quive
   writeFileSync(path.join(options.results, QUIVER_RECOVERY_FILE), `${JSON.stringify(evidence, null, 2)}\n`);
   if (failures.length > 0) throw new Error(`Quiver crash recovery failed: ${failures.join('; ')}`);
   options.log(
-    `Quiver replay after crash: direct recovered ${afterRecovery.direct.recovered} batches from disk ` +
-    `(${afterRecovery.direct.adoptedReceipts} receipts adopted); dataflow made ${afterRecovery.dataflow.recovered} ` +
+    `Quiver replay after crash: direct replayed ${afterRecovery.direct.recovered} batches from disk and adopted ` +
+    `${afterRecovery.direct.adoptedReceipts} unpublished receipts; dataflow made ${afterRecovery.dataflow.recovered} ` +
     `replay export attempts (${afterRecovery.dataflow.reboundBatches} rebound to its new leases)`,
   );
   return evidence;

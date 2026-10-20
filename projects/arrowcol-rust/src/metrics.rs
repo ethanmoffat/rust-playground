@@ -303,7 +303,7 @@ const QUIVER_METRICS: [(&str, &str, MetricType); 11] = [
     ),
     (
         "recovered_bundles_total",
-        "Distinct persisted batches a crashed predecessor left on disk and this process replayed",
+        "Distinct persisted batches a crashed predecessor left unacknowledged on disk and this process replayed",
         MetricType::COUNTER,
     ),
     (

@@ -29,7 +29,18 @@ if "$binary" --validate-and-exit \
   echo "OTAP-only batch processor wiring unexpectedly passed" >&2
   exit 1
 fi
-grep -F "IncompatiblePdataWiring" "$work/incompatible-otap.log" >/dev/null
-grep -F 'node: "otap_batch"' "$work/incompatible-otap.log" >/dev/null
-grep -F "incoming: PdataRepresentationSet(PLUGGABLE_ARROW)" "$work/incompatible-otap.log" >/dev/null
-grep -F "accepted: PdataRepresentationSet(STANDARD)" "$work/incompatible-otap.log" >/dev/null
+log="$work/incompatible-otap.log"
+reports() {
+  grep -F 'IncompatiblePdataWiring' "$log" >/dev/null &&
+    grep -F "node: \"$1\"" "$log" >/dev/null &&
+    grep -F "incoming: PdataRepresentationSet($2)" "$log" >/dev/null &&
+    grep -F "accepted: PdataRepresentationSet($3)" "$log" >/dev/null
+}
+# Wiring validation visits edges in hash order, so it reports either side of the
+# STANDARD-only processor: pluggable Arrow into otap_batch, or its STANDARD output
+# into the pluggable-only Delta exporter.
+if ! reports otap_batch PLUGGABLE_ARROW STANDARD && ! reports delta STANDARD PLUGGABLE_ARROW; then
+  echo "OTAP-only batch processor wiring failed for an unexpected reason:" >&2
+  cat "$log" >&2
+  exit 1
+fi
