@@ -176,6 +176,7 @@ test('every project exposes clean and the root includes every child', () => {
     'projects/arrowcol-dataflow-rust/project.json',
     'projects/arrowcol-router-rust/project.json',
     'projects/arrowcol-rust/project.json',
+    'projects/kusto-explorer/project.json',
     'projects/loadtest/project.json',
     'projects/otelcol-rust/project.json',
     'tools/auth-automation/project.json',

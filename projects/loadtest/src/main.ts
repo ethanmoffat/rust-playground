@@ -18,7 +18,8 @@ import { startResourceSampler } from './resource-sampler.js';
 import { writeProvenance } from './provenance.js';
 import { benchmarkComposeFiles, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs } from './runtime-config.js';
 import { acquireBenchmarkController, resetBenchmark, type BenchmarkController } from './lifecycle.js';
-import { kustoComposeStartArguments, kustoStatusSummary, readKustoStatus, requireHealthyKusto, startKusto } from './kusto.js';
+import { kustoComposeStartArguments, kustoStatusSummary, readKustoStatus, requireHealthyKusto, safeKustoError, startKusto } from './kusto.js';
+import { kustoExplorerStartArguments, runUiGate } from './ui-gate.js';
 
 const workspace = realpathSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..'));
 const composeFile = path.join(workspace, 'projects/loadtest/compose.yaml');
@@ -246,6 +247,8 @@ function benchmarkEnvironment(
     LOADTEST_DIRECT_1_IP: network.direct,
     LOADTEST_DATAFLOW_1_IP: network.dataflow,
     LOADTEST_KUSTO_IP: network.kusto,
+    LOADTEST_KUSTO_EXPLORER_IP: network.kustoExplorer,
+    LOADTEST_PLAYWRIGHT_IP: network.playwright,
     SQLSERVER_SA_PASSWORD_FILE: hostPath(path.join(infra, 'sqlserver-sa-password.txt')),
     ARROWCOL_APP_PASSWORD_FILE: hostPath(path.join(infra, 'arrowcol-app-password.txt')),
     ARROWCOL_MIGRATOR_PASSWORD_FILE: hostPath(path.join(infra, 'arrowcol-migrator-password.txt')),
@@ -271,6 +274,8 @@ export interface BenchmarkNetwork {
   direct: string;
   dataflow: string;
   kusto: string;
+  kustoExplorer: string;
+  playwright: string;
 }
 
 export const benchmarkCoreServices = [
@@ -309,7 +314,7 @@ function selectBenchmarkNetwork(): BenchmarkNetwork {
     return {
       subnet, sql: `${base}.2`, hive: `${base}.3`, router: `${base}.10`,
       direct: `${base}.21`, dataflow: `${base}.31`,
-      kusto: `${base}.50`,
+      kusto: `${base}.50`, kustoExplorer: `${base}.51`, playwright: `${base}.52`,
     };
   }
   throw new Error('No available benchmark subnet in 10.89.0.0/16');
@@ -469,6 +474,16 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
       step(`Kusto startup DEGRADED: ${kustoStartup.error}. Load generation will continue; see results/kusto-startup.json`);
     }
     controller.checkRunning();
+    phase = 'kusto-explorer-startup';
+    step('Starting kusto-explorer (connects to Kusto over the Compose network)');
+    try {
+      compose(project, env, kustoExplorerStartArguments, 300_000);
+      step(`kusto-explorer: http://localhost:${env.KUSTO_EXPLORER_PORT ?? '8090'} (browser UI for the Kusto emulator)`);
+    } catch (error) {
+      if (options.validate) throw error;
+      step(`kusto-explorer startup DEGRADED: ${safeKustoError(error)}. Load generation will continue`);
+    }
+    controller.checkRunning();
     phase = 'startup-provenance';
     writeProvenance(workspace, directory, project, options, env, true);
     phase = 'sampler-start';
@@ -500,6 +515,17 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
       controller.checkRunning();
       await runLocalLoadgen(context, 'validate', path.join(directory, 'results'), controller);
       requireHealthyKusto(readKustoStatus(path.join(directory, 'results')));
+      phase = 'ui-validation';
+      step('Validating that the loadtest data is queryable through kusto-explorer (Playwright)');
+      controller.checkRunning();
+      const gate = await runUiGate({
+        workspace,
+        results: path.join(directory, 'results'),
+        browserEndpoint: `ws://${network.playwright}:3000/`,
+        compose: (args, timeout) => compose(project, env, args, timeout),
+        log: step,
+      });
+      step(`kusto-explorer UI gate passed: ${gate.tables} tables and ${gate.rows} rows matched through the UI`);
     }
   } catch (error) {
     failure = error;

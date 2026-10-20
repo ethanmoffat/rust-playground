@@ -40,6 +40,10 @@
     "8080": {
       "label": "Kusto emulator (loadtest; published on the Docker host, reached via WSL localhost)",
       "onAutoForward": "ignore"
+    },
+    "8090": {
+      "label": "kusto-explorer UI (loadtest; published on the Docker host, reached via WSL localhost)",
+      "onAutoForward": "ignore"
     }
   },
   "customizations": {

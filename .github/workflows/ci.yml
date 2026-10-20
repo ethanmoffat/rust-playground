@@ -241,6 +241,8 @@ jobs:
           path: |
             onelake/benchmark/latest/results/kusto-*.json
             onelake/benchmark/latest/results/kusto-*.jsonl
+            onelake/benchmark/latest/results/kusto-explorer-*.png
+            onelake/benchmark/latest/results/kusto-explorer-browser.log
             onelake/benchmark/latest/results/validation.json
           if-no-files-found: ignore
           retention-days: 7

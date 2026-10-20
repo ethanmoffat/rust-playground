@@ -22,6 +22,12 @@ const compose = YAML.parse(readFileSync(path.join(root, 'projects/loadtest/compo
     depends_on?: Record<string, unknown>;
     entrypoint?: string[];
     networks?: { default?: { ipv4_address?: string } };
+    network_mode?: string;
+    extra_hosts?: unknown;
+    pull_policy?: string;
+    read_only?: boolean;
+    cap_drop?: string[];
+    user?: string;
   }>;
   volumes: Record<string, { labels?: Record<string, string> } | null>;
 };
@@ -119,4 +125,44 @@ test('portainer is pinned, loopback-only, seeded from the SA secret and stateles
   'admin must be re-seeded on every start');
   assert(portainer.tmpfs?.some((mount) => mount.startsWith('/data:')));
   assert(portainer.networks?.default?.ipv4_address, 'a dynamic address could take a static service IP');
+});
+
+test('kusto-explorer reaches Kusto only through the Compose network and publishes a loopback UI port', () => {
+  const explorer = compose.services['kusto-explorer'];
+  assert.deepEqual(explorer.profiles, ['benchmark']);
+  assert.equal(explorer.image, 'ghcr.io/mdrakiburrahman/rust-playground/kusto-explorer:dev');
+  assert.equal(explorer.pull_policy, 'never');
+  assert.deepEqual(explorer.environment, {
+    KUSTO_EXPLORER_CONNECTIONS: 'Loadtest emulator=http://kusto:8080',
+    KUSTO_EXPLORER_DEFAULT_DATABASE: 'loadtest',
+  });
+  for (const value of Object.values(explorer.environment ?? {})) {
+    assert.doesNotMatch(value, /localhost|127\.0\.0\.1|host\.docker\.internal|KUSTO_PORT|LOADTEST_KUSTO_IP/u);
+  }
+  assert.equal(explorer.network_mode, undefined);
+  assert.equal(explorer.extra_hosts, undefined);
+  assert.equal(explorer.depends_on, undefined, 'kusto-explorer must tolerate a cold Kusto instead of blocking on it');
+  assert.equal(explorer.networks?.default?.ipv4_address, '${LOADTEST_KUSTO_EXPLORER_IP:-10.89.0.51}');
+  assert.deepEqual(explorer.ports, ['127.0.0.1:${KUSTO_EXPLORER_PORT:-8090}:8080']);
+  assert.equal(explorer.read_only, true);
+  assert.deepEqual(explorer.cap_drop, ['ALL']);
+  const devcontainer = JSON.parse(readFileSync(path.join(root, '.devcontainer/devcontainer.json'), 'utf8'));
+  assert.equal(devcontainer.portsAttributes['8090'].onAutoForward, 'ignore');
+});
+
+test('the UI gate browser is pinned to the installed Playwright release and stays off the host network', () => {
+  const browser = compose.services.playwright;
+  assert.deepEqual(browser.profiles, ['ui-gate']);
+  const image = /^mcr\.microsoft\.com\/playwright:v([0-9.]+)-noble@sha256:[0-9a-f]{64}$/u.exec(browser.image ?? '');
+  assert(image, 'the Playwright image must be version-tagged and digest-pinned');
+  const lock = JSON.parse(readFileSync(path.join(root, 'package-lock.json'), 'utf8')) as {
+    packages: Record<string, { version?: string }>;
+  };
+  assert.equal(image[1], lock.packages['node_modules/playwright-core']?.version,
+    'bump the Playwright image together with the playwright npm package');
+  assert.equal(browser.user, 'pwuser');
+  assert.equal(browser.ports, undefined);
+  assert.equal(browser.network_mode, undefined);
+  assert.deepEqual(browser.command?.slice(0, 3), ['node', '/opt/playwright-core/cli.js', 'run-server']);
+  assert.equal(browser.networks?.default?.ipv4_address, '${LOADTEST_PLAYWRIGHT_IP:-10.89.0.52}');
 });

@@ -18,6 +18,15 @@ updates:
       timezone: Etc/UTC
     open-pull-requests-limit: 10
 
+  - package-ecosystem: npm
+    directory: /projects/kusto-explorer
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 10
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

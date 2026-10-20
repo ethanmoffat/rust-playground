@@ -58,7 +58,7 @@ Tag metadata contains a collision-resistant mutable
 structured `latest` metadata only for the default branch. Image targets and
 workflows consume the JSON CLI output.
 
-`image-publish-plan` reads the Nx graph, fails closed unless the four production
+`image-publish-plan` reads the Nx graph, fails closed unless the five production
 runtime images and retained `hello-world` sample expose the complete image,
 smoke, cached CI build, guarded publish, and manifest contract, then emits the
 GitHub Actions matrix through `GITHUB_OUTPUT`.

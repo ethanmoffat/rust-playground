@@ -5,9 +5,10 @@ npx nx run loadtest:run -- --warmup 2m --concurrency 8 --batch-rows 1024
 ```
 
 This starts a fresh SQL Server, Hive, router, Direct collector, Dataflow
-collector, Kusto emulator, and monitoring stack, then sends the same Arrow
-batches to both collectors across all 13 tables. Kusto mirrors the committed
-output into native tables for live functional inspection.
+collector, Kusto emulator, [kusto-explorer](../kusto-explorer/README.md) query
+UI, and monitoring stack, then sends the same Arrow batches to both collectors
+across all 13 tables. Kusto mirrors the committed output into native tables for
+live functional inspection.
 
 **Each start replaces the previous loadtest. Its SQL, Hive, and Kusto volumes,
 Delta tables, and results are deleted.** Other Docker projects and workspace
@@ -47,11 +48,15 @@ SQLSERVER_MEMORY_LIMIT_MB=8192 npx nx run loadtest:run -- --warmup 2m --concurre
   The local certificate is self-signed.
 - **Kusto:** <http://localhost:8080>, database `loadtest`, no authentication.
   This is an HTTP query endpoint, not a browser UI.
+- **kusto-explorer:** <http://localhost:8090>, a browser KQL workbench with the
+  `loadtest` database preselected. Its server reaches Kusto at
+  `http://kusto:8080` over the Compose network.
 - **Logs:** `docker logs -f rust-playground-loadtest-latest-dataflow-1-1`
   (use `direct-1-1` for the Direct collector).
 
-Use `SQLSERVER_PORT`, `GRAFANA_PORT`, `PORTAINER_PORT`, or `KUSTO_PORT` to override
-host ports. Published ports bind to host loopback only. Inside the devcontainer,
+Use `SQLSERVER_PORT`, `GRAFANA_PORT`, `PORTAINER_PORT`, `KUSTO_PORT`, or
+`KUSTO_EXPLORER_PORT` to override host ports. Published ports bind to host
+loopback only. Inside the devcontainer,
 the runner uses the emulator's allocated `10.89.x.50:8080` address instead of
 `localhost`; the host connection remains `http://localhost:${KUSTO_PORT:-8080}`.
 Do not share startup logs containing local-development passwords.
@@ -103,10 +108,11 @@ curl --fail-with-body --silent --show-error \
   -d '{"db":"loadtest","csl":"union withsource=TableName direct_*, dataflow_* | summarize Rows=count() by TableName | order by TableName asc"}'
 ```
 
-Kusto.Explorer can also connect to `http://localhost:8080` with unsafe HTTP
-connections enabled and `AAD Federated Security=True` removed from its
-connection string. No desktop client, Azure subscription, or cloud credentials
-are required.
+For an interactive view, open kusto-explorer at <http://localhost:8090>. It lists
+every table in its connections tree; run the same query there with **F5** and
+chart it with `| render columnchart`. The browser talks only to kusto-explorer,
+whose server queries Kusto through the Compose service name. No Azure
+subscription or cloud credentials are required.
 
 ### Failures, validation, and retained data
 
@@ -123,6 +129,15 @@ for all 26 tables and an in-run live-query observation. They fail if Kusto is
 unavailable, incomplete, inconsistent, or unverifiable. Counts are compared with
 each pool's captured Delta snapshot, not with acknowledgements or an assumption
 that the two pools have equal physical row multiplicities.
+
+They also require the kusto-explorer UI gate. After the KQL assertions pass, the
+runner starts a Playwright browser container (Compose profile `ui-gate`) on the
+stack's network and drives `http://kusto-explorer:8080` like a user. The gate
+checks the configured cluster is `http://kusto:8080`, the connections tree lists
+all 26 tables, and the per-table row counts exported from the UI match
+`kusto-validation.json`. It also runs a management command and a column chart,
+and fails on any browser console error. In ordinary runs, a kusto-explorer
+startup failure is only a warning.
 
 Run the focused verification suite with:
 
@@ -142,6 +157,9 @@ Inspect these files under `onelake/benchmark/latest/results/`:
 | `kusto-ingestions.jsonl` | Committed-file ingestion and replay evidence |
 | `kusto-queries.jsonl` | Executed KQL and query results, including live observations |
 | `kusto-validation.json` | Final native-table correctness assertions |
+| `kusto-explorer-validation.json` | UI gate checks, screenshots, and any browser console errors |
+| `kusto-explorer-export.json` | Per-table row counts exported through the UI |
+| `kusto-explorer-*.png` | UI screenshots in the dark and light themes, or `kusto-explorer-failure.png` |
 | `provenance.json` | Image identities and sanitized effective resource configuration |
 
 Startup diagnostics remain separate if synchronization subsequently recovers.

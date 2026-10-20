@@ -24,7 +24,7 @@ const args = [
   '--file', path.join(workspace, 'projects/loadtest/compose.yaml'),
   '--file', overrideFile,
 ];
-args.push('--profile', 'benchmark', 'config', '--quiet');
+args.push('--profile', 'benchmark', '--profile', 'ui-gate', 'config', '--quiet');
 const result = spawnSync('docker', args, {
   cwd: workspace,
   env: {
