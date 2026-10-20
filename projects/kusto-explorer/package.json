@@ -1,0 +1,23 @@
+{
+  "name": "kusto-explorer",
+  "private": true,
+  "type": "module",
+  "description": "Browser assets for kusto-explorer: the KQL editor and the build that bundles it with the Rust UI.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "nx": {
+    "includedScripts": []
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p web/tsconfig.json",
+    "build": "node web/build.mjs"
+  },
+  "devDependencies": {
+    "@kusto/monaco-kusto": "15.0.1",
+    "esbuild": "0.28.2",
+    "monaco-editor": "0.55.1",
+    "typescript": "5.9.2"
+  }
+}

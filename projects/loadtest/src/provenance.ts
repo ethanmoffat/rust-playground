@@ -61,7 +61,8 @@ export function safeCollectorPolicies(direct: Document, dataflow: Document): Doc
 }
 
 export function safeComposeSettings(compose: Document): Document {
-  return Object.fromEntries(['direct-1', 'dataflow-1', 'sqlserver'].map((name) => {
+  const names = ['direct-1', 'dataflow-1', 'sqlserver', 'kusto'].filter(name => compose.services[name]);
+  return Object.fromEntries(names.map((name) => {
     const service = compose.services[name];
     const environment = service.environment ?? {};
     return [name, {
@@ -70,10 +71,16 @@ export function safeComposeSettings(compose: Document): Document {
       cpuPeriod: service.cpu_period,
       memoryLimit: service.mem_limit,
       environment: pick(environment, [
-        'TOKIO_WORKER_THREADS', 'ARROWCOL_MAX_MESSAGE_BYTES', 'MSSQL_MEMORY_LIMIT_MB',
+        'TOKIO_WORKER_THREADS', 'ARROWCOL_MAX_MESSAGE_BYTES', 'MSSQL_MEMORY_LIMIT_MB', 'ACCEPT_EULA',
       ]),
       numCores: name === 'dataflow-1' && service.command?.includes('--num-cores')
         ? service.command[service.command.indexOf('--num-cores') + 1] : undefined,
+      ...(name === 'kusto' ? {
+        image: service.image,
+        purpose: 'functional inspection only; not a performance benchmark',
+        ports: (service.ports ?? []).map((port: Document) => pick(port, ['target', 'published', 'host_ip', 'protocol'])),
+        mounts: (service.volumes ?? []).map((volume: Document) => pick(volume, ['type', 'target', 'read_only'])),
+      } : {}),
     }];
   }));
 }

@@ -95,6 +95,7 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         arguments.drain_timeout.get(),
         arguments.lanes.saturating_mul(16).max(32),
     );
+    let kusto_sync = crate::kusto::LiveSync::start(&arguments, &run_id);
 
     let mut run_error = None;
     for scenario in arguments.effective_scenarios() {
@@ -148,8 +149,21 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
             break;
         }
     }
+    if let Some(sync) = &kusto_sync {
+        sync.finish_generation();
+    }
     drop(receipt_sender);
-    let receipt_report = receipt_task.await.context("receipt tracker task failed")??;
+    let receipt_report = receipt_task
+        .await
+        .context("receipt tracker task failed")
+        .and_then(|report| report);
+    if let Some(sync) = kusto_sync
+        && let Err(error) = sync.stop().await
+    {
+        eprintln!("Kusto DEGRADED (collector run retained): {error:#}");
+        crate::kusto::degraded(&arguments.results, &run_id, &error)?;
+    }
+    let receipt_report = receipt_report?;
     let routing = capture_routing(&arguments).await?;
     manifests.write_json(ROUTING_EVIDENCE_FILE, &routing).await?;
     manifests.flush().await?;
@@ -165,7 +179,7 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         );
     }
     println!(
-        "PASS run={} logical_batches={} receipts_published={}",
+        "PASS collector run={} logical_batches={} receipts_published={}",
         run_id,
         scheduler.scheduled(),
         receipt_report.published

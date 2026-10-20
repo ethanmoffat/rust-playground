@@ -161,6 +161,108 @@ pub struct FileSummary {
     pub rows: u64,
 }
 
+/// Committed file names and schemas without reading or hashing Parquet rows.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SnapshotInventory {
+    pub tables: BTreeMap<String, TableInventory>,
+}
+
+/// One independent Delta snapshot selected for incremental ingestion.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TableInventory {
+    pub schema: Value,
+    pub version: u64,
+    pub files: Vec<String>,
+}
+
+/// Reads one reference row from a file selected by a captured full summary.
+///
+/// # Errors
+///
+/// Rejects unsafe paths, missing/corrupt data, and empty snapshots.
+pub fn sample_row(directory: &Path, identity: &str, summary: &TableSummary) -> Result<Value> {
+    if identity
+        .split('.')
+        .any(|part| part.is_empty() || part.contains(['/', '\\']))
+    {
+        bail!("invalid table identity");
+    }
+    let directory = fs::canonicalize(directory)?;
+    let root = fs::canonicalize(directory.join(identity.replace('.', "/")))?;
+    if !root.starts_with(&directory) {
+        bail!("table escapes Delta root");
+    }
+    let file = summary.files.first().context("snapshot has no data files")?;
+    let path = local_active_file(&root, root.join(&file.path).to_str().context("non-UTF8 data path")?)?;
+    let reader = SerializedFileReader::new(File::open(path)?)?;
+    let row = reader
+        .get_row_iter(None)?
+        .next()
+        .context("snapshot file has no rows")??;
+    Ok(row_value(&row))
+}
+
+/// Lists only committed, local active files. An empty root is pending, not a
+/// completed validation; corrupt tables and unsafe paths remain errors.
+///
+/// # Errors
+///
+/// Rejects missing roots, corrupt logs, unsupported layouts, and unsafe paths.
+pub async fn inventory(directory: &Path) -> Result<SnapshotInventory> {
+    let directory =
+        fs::canonicalize(directory).with_context(|| format!("canonicalize Delta root {}", directory.display()))?;
+    let mut tables = BTreeMap::new();
+    for root in find_delta_roots(&directory)? {
+        let identity = table_identity(&directory, &root)?;
+        let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table path"))?;
+        let delta = deltalake_core::open_table(url)
+            .await
+            .with_context(|| format!("open Delta table {identity}"))?;
+        let snapshot = delta.snapshot()?;
+        if !snapshot.metadata().partition_columns().is_empty() {
+            bail!("partitioned inspection is not supported");
+        }
+        let mut files = Vec::new();
+        for uri in delta.get_file_uris_by_partitions(&[]).await? {
+            let file = local_active_file(&root, &uri)?;
+            files.push(
+                file.strip_prefix(&root)?
+                    .to_str()
+                    .context("non-UTF8 data path")?
+                    .to_owned(),
+            );
+        }
+        files.sort();
+        if tables
+            .insert(
+                identity.clone(),
+                TableInventory {
+                    schema: serde_json::to_value(snapshot.schema())?,
+                    version: snapshot.version(),
+                    files,
+                },
+            )
+            .is_some()
+        {
+            bail!("duplicate Delta table identity {identity}");
+        }
+    }
+    Ok(SnapshotInventory { tables })
+}
+
+fn table_identity(directory: &Path, root: &Path) -> Result<String> {
+    let identity = root
+        .strip_prefix(directory)?
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(".");
+    if identity.is_empty() {
+        bail!("Delta table identity is empty");
+    }
+    Ok(identity)
+}
+
 /// Recursively opens every Delta table below a root and summarizes only files
 /// selected by each independent delta-rs snapshot.
 ///
@@ -178,15 +280,7 @@ pub async fn summarize(directory: &Path) -> Result<SnapshotSummary> {
     let mut tables = BTreeMap::new();
     let mut total_files = 0_usize;
     for root in roots {
-        let relative = root.strip_prefix(&directory)?;
-        let identity = relative
-            .components()
-            .map(|component| component.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(".");
-        if identity.is_empty() {
-            bail!("Delta table identity is empty");
-        }
+        let identity = table_identity(&directory, &root)?;
         let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table path"))?;
         let delta = deltalake_core::open_table(url)
             .await
@@ -294,6 +388,9 @@ fn local_active_file(root: &Path, uri: &str) -> Result<PathBuf> {
     } else {
         bail!("non-local data file URI {uri}");
     };
+    if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+        bail!("active data file is a symlink");
+    }
     let path = fs::canonicalize(path)?;
     if !path.starts_with(root) {
         bail!("data file escapes table root");
@@ -415,6 +512,66 @@ mod tests {
         assert_eq!(summary.tables["generic"].rows, 3);
         assert_eq!(summary.tables["generic"].active_files, 2);
         assert!(summary.tables["generic"].bytes > 0);
+        let selected = inventory(directory.path()).await?;
+        assert_eq!(selected.tables["generic"].version, 3);
+        assert_eq!(selected.tables["generic"].files.len(), 2);
+        assert!(
+            !selected.tables["generic"]
+                .files
+                .iter()
+                .any(|file| file == "orphan.parquet")
+        );
+        assert_eq!(selected, inventory(directory.path()).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inventories_follow_late_commits_below_nested_table_roots() -> Result<()> {
+        use arrow::array::{Int32Array, RecordBatch};
+        use arrow_deltalake::delta::DeltaTableWriter;
+        use std::sync::Arc;
+        let directory = TestDirectory::new("inventory")?;
+        assert!(inventory(directory.path()).await?.tables.is_empty());
+        assert!(inventory(&directory.path().join("absent")).await.is_err());
+        let root = directory.path().join("telemetry/sqlserver/example");
+        let mut writer = DeltaTableWriter::open(&root)?;
+        let batch = RecordBatch::try_from_iter(vec![("id", Arc::new(Int32Array::from(vec![1])) as _)])?;
+        writer.write(&batch).await?;
+        writer.flush().await?;
+        let first = inventory(directory.path()).await?;
+        writer.write(&batch).await?;
+        writer.close().await?;
+        let second = inventory(directory.path()).await?;
+        let table = "telemetry.sqlserver.example";
+        assert_eq!(first.tables[table].files.len(), 1);
+        assert_eq!(second.tables[table].files.len(), 2);
+        assert!(second.tables[table].version > first.tables[table].version);
+        assert!(second.tables[table].files.contains(&first.tables[table].files[0]));
+        fs::write(root.join("_delta_log/00000000000000000003.json"), b"invalid")?;
+        assert!(inventory(directory.path()).await.is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inventories_reject_symlink_traversal_and_active_file_escapes() -> Result<()> {
+        let directory = TestDirectory::new("inventory-paths")?;
+        let outside = TestDirectory::new("inventory-outside")?;
+        std::os::unix::fs::symlink(outside.path().canonicalize()?, directory.path().join("linked"))?;
+        assert!(inventory(directory.path()).await.is_err());
+        fs::write(outside.path().join("data.parquet"), b"not parquet")?;
+        assert!(
+            local_active_file(
+                directory.path(),
+                outside
+                    .path()
+                    .join("data.parquet")
+                    .canonicalize()?
+                    .to_str()
+                    .context("path")?
+            )
+            .is_err()
+        );
         Ok(())
     }
 

@@ -246,6 +246,10 @@ pub struct RunArgs {
         default_value = "http://dataflow-1:32011"
     )]
     pub dataflow_admin_endpoints: Vec<String>,
+
+    /// Optional local Kusto emulator HTTP endpoint for live committed-file ingestion.
+    #[arg(long, env = "LOADTEST_KUSTO_ENDPOINT")]
+    pub kusto_endpoint: Option<String>,
 }
 
 impl RunArgs {
@@ -282,6 +286,19 @@ pub struct ValidateArgs {
     /// Require every collector in each implementation pool to own a table.
     #[arg(long, env = "LOADTEST_REQUIRE_ALL_COLLECTORS", default_value_t = true)]
     pub require_all_collectors: bool,
+
+    /// Local Kusto endpoint; when configured, KQL correctness is required.
+    #[arg(long, env = "LOADTEST_KUSTO_ENDPOINT")]
+    pub kusto_endpoint: Option<String>,
+
+    /// Dataflow metrics used to wait for publication before freezing snapshots.
+    #[arg(
+        long,
+        env = "LOADTEST_DATAFLOW_ADMIN_ENDPOINTS",
+        value_delimiter = ',',
+        default_value = "http://dataflow-1:32011"
+    )]
+    pub dataflow_admin_endpoints: Vec<String>,
 }
 
 #[cfg(test)]
@@ -394,6 +411,7 @@ mod tests {
             sdk_generator: "arrowcol-sdk-gen".into(),
             direct_admin_endpoints: Vec::new(),
             dataflow_admin_endpoints: Vec::new(),
+            kusto_endpoint: None,
         };
         assert_eq!(arguments.effective_scenarios(), vec![Scenario::Paired]);
     }

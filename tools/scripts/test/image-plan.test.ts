@@ -38,12 +38,13 @@ function workspaceProjects(): Record<string, ProjectConfiguration> {
   return projects;
 }
 
-test('discovers the four production images and retains the sample publication', () => {
+test('discovers the five production images and retains the sample publication', () => {
   assert.deepEqual(PRODUCTION_RUNTIME_IMAGE_PROJECTS, [
     'otelcol-rust',
     'arrowcol-rust',
     'arrowcol-dataflow-rust',
     'arrowcol-router-rust',
+    'kusto-explorer',
   ]);
   assert.deepEqual(RETAINED_RUNTIME_IMAGE_PROJECTS, ['hello-world']);
 
@@ -88,6 +89,23 @@ test('fails closed when a source-built publication is missing or unexpected', ()
   );
 });
 
+// Collector images compile the otel-arrow protobuf crates and bake read-only configuration files.
+const COLLECTOR_IMAGE_PROJECTS = [
+  'otelcol-rust',
+  'arrowcol-rust',
+  'arrowcol-dataflow-rust',
+  'arrowcol-router-rust',
+];
+// Web images compile a wasm UI and serve read-only static assets instead of configuration files.
+const WEB_IMAGE_PROJECTS = ['kusto-explorer'];
+
+test('every production runtime image is classified for Dockerfile policy', () => {
+  assert.deepEqual(
+    [...COLLECTOR_IMAGE_PROJECTS, ...WEB_IMAGE_PROJECTS].sort(),
+    [...PRODUCTION_RUNTIME_IMAGE_PROJECTS].sort(),
+  );
+});
+
 test('runtime Dockerfiles pin build and runtime bases and enforce production boundaries', () => {
   for (const project of PRODUCTION_RUNTIME_IMAGE_PROJECTS) {
     const dockerfile = readFileSync(
@@ -104,13 +122,15 @@ test('runtime Dockerfiles pin build and runtime bases and enforce production bou
       /FROM debian:bookworm-slim@sha256:[a-f0-9]{64} AS runtime/u,
       project,
     );
+    for (const from of dockerfile.match(/^FROM [^\n]*/gmu) ?? []) {
+      assert.match(from, /^FROM \S+@sha256:[a-f0-9]{64} AS \S+$/u, project);
+    }
     assert.match(
       dockerfile,
       /COPY Cargo\.toml Cargo\.lock rust-toolchain\.toml/u,
       project,
     );
     assert.match(dockerfile, /COPY submodules\/otel-arrow/u, project);
-    assert.match(dockerfile, /cmake protobuf-compiler/u, project);
     assert.match(dockerfile, /ca-certificates curl/u, project);
     assert.match(
       dockerfile,
@@ -122,10 +142,24 @@ test('runtime Dockerfiles pin build and runtime bases and enforce production bou
       /org\.opencontainers\.image\.revision="\$\{VCS_REF\}"/u,
       project,
     );
-    assert.match(dockerfile, /COPY --chmod=0444/u, project);
     assert.match(dockerfile, /USER 10001:10001/u, project);
     assert.match(dockerfile, /HEALTHCHECK/u, project);
     assert.doesNotMatch(dockerfile, /FROM [^\n]*:latest/u, project);
+
+    if (COLLECTOR_IMAGE_PROJECTS.includes(project)) {
+      assert.match(dockerfile, /cmake protobuf-compiler/u, project);
+      assert.match(dockerfile, /COPY --chmod=0444/u, project);
+    } else {
+      assert.match(dockerfile, /rustup target add wasm32-unknown-unknown/u, project);
+      assert.match(
+        dockerfile,
+        /COPY Cargo\.lock [^\n]*\n[^\n]*name = "wasm-bindgen"/u,
+        `${project} must derive the wasm-bindgen CLI version from Cargo.lock`,
+      );
+      assert.match(dockerfile, /find \/out\/www -type d -exec chmod 0555/u, project);
+      assert.match(dockerfile, /find \/out\/www -type f -exec chmod 0444/u, project);
+      assert.match(dockerfile, /COPY --from=builder --chmod=0555/u, project);
+    }
   }
 });
 
