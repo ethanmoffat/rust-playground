@@ -44,7 +44,7 @@ use tonic::transport::Server;
 use crate::FlightReceiverConfig;
 use crate::config::{checked_add_millis, config_error, now_unix_millis, parse_config};
 use crate::envelope::{ArrowcolBatchEnvelope, encode_record_batch};
-use crate::metrics::{PendingTracker, RuntimeMetrics, global_metrics, process_instance_id};
+use crate::metrics::{DurableStream, PendingTracker, RuntimeMetrics, global_metrics, process_instance_id};
 use crate::routing::{LeaseResolver, StoreLeaseResolver};
 
 /// DFE URN for arbitrary Arrow Flight ingress.
@@ -104,23 +104,35 @@ fn map_send_error(error: TypedError<OtapPdata>) -> PdataSendError {
     }
 }
 
-/// Best-effort Arrow Flight admission into DFE channels.
+/// Arrow Flight admission into DFE channels.
+///
+/// By default a stream completes with `best_effort_admission` once every batch
+/// entered its bounded DFE route. With [`DfeAdmission::with_durable_admission`]
+/// the stream completes with `durable_admission` only after the downstream
+/// durable buffer acknowledged every batch.
 pub struct DfeAdmission {
     sender: Arc<dyn PdataSender>,
     leases: Arc<dyn LeaseResolver>,
     instance_id: CollectorInstanceId,
+    instance_key: String,
     permits: Arc<Semaphore>,
     pending: Arc<PendingTracker>,
     metrics: Arc<RuntimeMetrics>,
+    durable_timeout: Option<Duration>,
 }
 
 impl DfeAdmission {
-    /// Creates admission with a hard concurrent-stream bound.
+    /// Creates best-effort admission with a hard concurrent-stream bound.
+    ///
+    /// `instance_key` is the collector's stable `registration.instance_key`;
+    /// it is stamped into every pdata envelope so a restarted collector can
+    /// recognize durable-buffer replays from its predecessor.
     #[must_use]
     pub fn new(
         sender: Arc<dyn PdataSender>,
         leases: Arc<dyn LeaseResolver>,
         instance_id: CollectorInstanceId,
+        instance_key: impl Into<String>,
         max_concurrent_streams: usize,
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
@@ -128,15 +140,31 @@ impl DfeAdmission {
             sender,
             leases,
             instance_id,
+            instance_key.into(),
             Arc::new(Semaphore::new(max_concurrent_streams)),
             metrics,
         )
+    }
+
+    /// Completes streams only after the downstream durable buffer acknowledged
+    /// every batch, waiting at most `timeout` once the stream ends.
+    ///
+    /// The topology must route this admission into `processor:durable_buffer`:
+    /// its acknowledgement follows the write-ahead-log append. A rejected
+    /// batch, a failed send, or the timeout fails the stream with a retryable
+    /// error, so the client resends; batches persisted before the failure are
+    /// still delivered, which can produce duplicates.
+    #[must_use]
+    pub fn with_durable_admission(mut self, timeout: Duration) -> Self {
+        self.durable_timeout = Some(timeout);
+        self
     }
 
     fn with_permits(
         sender: Arc<dyn PdataSender>,
         leases: Arc<dyn LeaseResolver>,
         instance_id: CollectorInstanceId,
+        instance_key: String,
         permits: Arc<Semaphore>,
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
@@ -144,9 +172,11 @@ impl DfeAdmission {
             sender,
             leases,
             instance_id,
+            instance_key,
             permits,
             pending: Arc::new(PendingTracker::new(Arc::clone(&metrics))),
             metrics,
+            durable_timeout: None,
         }
     }
 
@@ -181,6 +211,7 @@ impl BatchAdmission for DfeAdmission {
             lease_id: lease.lease_id,
             holder_instance_id: lease.holder_instance_id,
             fencing_token: lease.fencing_epoch,
+            instance_key: self.instance_key.clone(),
         };
         self.metrics.stream_started(&envelope.table);
         Ok(Box::new(DfeStreamLifecycle {
@@ -190,8 +221,62 @@ impl BatchAdmission for DfeAdmission {
             envelope,
             permit: Some(permit),
             finished: false,
+            durable: self.durable_timeout.map(DurableAdmission::new),
         }))
     }
+}
+
+/// Durable-admission state of one stream.
+struct DurableAdmission {
+    stream: Arc<DurableStream>,
+    timeout: Duration,
+}
+
+impl DurableAdmission {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            stream: Arc::new(DurableStream::new()),
+            timeout,
+        }
+    }
+
+    /// Ends slightly before the Flight service's identical admission deadline so
+    /// the client receives the explicit durable-admission failure rather than a
+    /// generic deadline error.
+    fn wait_budget(&self) -> Duration {
+        self.timeout
+            .saturating_sub((self.timeout / 10).min(DURABLE_DEADLINE_MARGIN))
+    }
+
+    fn ensure_not_rejected(&self) -> RuntimeResult<()> {
+        if self.stream.progress().rejected > 0 {
+            return Err(durable_rejection_error());
+        }
+        Ok(())
+    }
+
+    async fn wait(&self) -> RuntimeResult<()> {
+        match self.stream.settled(self.wait_budget()).await {
+            Some(progress) if progress.rejected == 0 => Ok(()),
+            Some(_) => Err(durable_rejection_error()),
+            None => Err(RuntimeError::new(
+                ErrorCode::BackpressureTimeout,
+                tonic::Code::Unavailable,
+                "durable buffer did not acknowledge every batch before the admission timeout; \
+                 the stream was not durably admitted and must be retried",
+            )),
+        }
+    }
+}
+
+const DURABLE_DEADLINE_MARGIN: Duration = Duration::from_millis(100);
+
+fn durable_rejection_error() -> RuntimeError {
+    RuntimeError::new(
+        ErrorCode::CapacityExhausted,
+        tonic::Code::Unavailable,
+        "durable buffer rejected a batch before persisting it; the stream was not durably admitted and must be retried",
+    )
 }
 
 struct DfeStreamLifecycle {
@@ -201,6 +286,7 @@ struct DfeStreamLifecycle {
     envelope: ArrowcolBatchEnvelope,
     permit: Option<OwnedSemaphorePermit>,
     finished: bool,
+    durable: Option<DurableAdmission>,
 }
 
 struct PendingSendGuard {
@@ -255,18 +341,23 @@ impl Drop for DfeStreamLifecycle {
 #[async_trait]
 impl StreamLifecycle for DfeStreamLifecycle {
     async fn push_batch(&mut self, batch: RecordBatch) -> RuntimeResult<()> {
+        if let Some(durable) = &self.durable {
+            // A rejected batch already fails the stream; stop accepting more of it.
+            durable.ensure_not_rejected()?;
+        }
         let rows = u64::try_from(batch.num_rows()).unwrap_or(u64::MAX);
         let bytes = arrow_deltalake::record_batch_logical_bytes(&batch).map_err(|_| RuntimeError::internal())?;
         self.metrics.batch_received(rows, bytes);
         let records = encode_record_batch(self.envelope.clone(), batch).map_err(|_| RuntimeError::internal())?;
         let correlation_id = self
             .pending
-            .insert(
+            .insert_for_stream(
                 self.envelope.table.clone(),
                 rows,
                 bytes,
                 self.envelope.source_schema_version,
                 self.envelope.target_schema_version,
+                self.durable.as_ref().map(|durable| Arc::clone(&durable.stream)),
             )
             .map_err(|_| RuntimeError::internal())?;
         let mut pending_send = PendingSendGuard::new(Arc::clone(&self.pending), correlation_id);
@@ -288,8 +379,17 @@ impl StreamLifecycle for DfeStreamLifecycle {
     }
 
     async fn complete(&mut self, _summary: StreamSummary) -> RuntimeResult<StreamCompletion> {
+        let Some(durable) = &self.durable else {
+            self.finish(true);
+            return Ok(StreamCompletion::best_effort());
+        };
+        if let Err(error) = durable.wait().await {
+            // The service aborts the lifecycle next, which releases the stream as aborted.
+            self.metrics.durable_admission_failed();
+            return Err(error);
+        }
         self.finish(true);
-        Ok(StreamCompletion::best_effort())
+        Ok(StreamCompletion::durable_admission())
     }
 
     async fn abort(mut self: Box<Self>, _reason: StreamAbortReason) {
@@ -320,6 +420,9 @@ fn create_receiver(
     config.validate().map_err(config_error)?;
     let routing = config.routing.build().map_err(config_error)?;
     let metrics = global_metrics();
+    metrics
+        .configure_admission(&config.registration.instance_key, config.native_quiver)
+        .map_err(config_error)?;
     let permits = metrics
         .stream_permits(config.registration.max_concurrent_streams)
         .map_err(config_error)?;
@@ -377,15 +480,20 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
             .map_err(|error| receiver_error(&effect_handler, ReceiverErrorKind::Connect, error.to_string()))?;
         self.metrics.set_catalog_ready(true);
         let leases: Arc<dyn LeaseResolver> = Arc::new(StoreLeaseResolver::new(Arc::clone(&self.routing), instance_id));
-        let admission = Arc::new(DfeAdmission::with_permits(
+        let mut admission = DfeAdmission::with_permits(
             Arc::new(EnginePdataSender {
                 effect_handler: effect_handler.clone(),
             }),
             leases,
             instance_id,
+            self.config.registration.instance_key.clone(),
             Arc::clone(&self.permits),
             Arc::clone(&self.metrics),
-        ));
+        );
+        if self.config.native_quiver {
+            admission = admission.with_durable_admission(limits.admission_timeout);
+        }
+        let admission = Arc::new(admission);
         let admission_trait: Arc<dyn BatchAdmission> = Arc::clone(&admission) as Arc<dyn BatchAdmission>;
         let drain = DrainController::new();
         let ddl_handler: Arc<dyn FlightSqlDdlHandler> = ddl;
@@ -457,7 +565,7 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
                             self.metrics.set_accepting(false);
                             shutdown.cancel();
                             let remaining = deadline.saturating_duration_since(Instant::now());
-                            let _ = drain.graceful_stop(remaining).await;
+                            drain_streams(&drain, remaining, &mut control, &admission).await;
                             finalize_registration(
                                 &self.routing,
                                 instance_id,
@@ -472,7 +580,7 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
                             self.metrics.set_accepting(false);
                             shutdown.cancel();
                             let remaining = deadline.saturating_duration_since(Instant::now());
-                            let _ = drain.graceful_stop(remaining).await;
+                            drain_streams(&drain, remaining, &mut control, &admission).await;
                             finalize_registration(
                                 &self.routing,
                                 instance_id,
@@ -515,6 +623,43 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
 
 fn correlation_id(call_data: &CallData) -> Option<u64> {
     call_data.first().copied().map(u64::from)
+}
+
+/// Waits for admitted Flight streams to finish while still resolving DFE feedback.
+///
+/// Durable-admission streams complete only after their acknowledgements arrive
+/// on this control channel, so draining keeps consuming Ack/Nack messages
+/// instead of blocking the control loop until the drain deadline.
+async fn drain_streams(
+    drain: &DrainController,
+    timeout: Duration,
+    control: &mut receiver::ControlChannel<OtapPdata>,
+    admission: &DfeAdmission,
+) {
+    let stop = drain.graceful_stop(timeout);
+    tokio::pin!(stop);
+    loop {
+        tokio::select! {
+            _ = &mut stop => return,
+            message = control.recv() => match message {
+                Ok(NodeControlMsg::Ack(ack)) => {
+                    if let Some(id) = correlation_id(&ack.unwind.route.calldata) {
+                        admission.resolve_feedback(id, true);
+                    }
+                }
+                Ok(NodeControlMsg::Nack(nack)) => {
+                    if let Some(id) = correlation_id(&nack.unwind.route.calldata) {
+                        admission.resolve_feedback(id, false);
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = (&mut stop).await;
+                    return;
+                }
+            },
+        }
+    }
 }
 
 fn allow_all_authenticator() -> Result<AllowAllAuthenticator, String> {
@@ -734,7 +879,7 @@ async fn admin_readiness(State(state): State<AdminState>) -> impl IntoResponse {
         Json(ReadinessDocument {
             ready,
             accepting_deliveries: ready,
-            delivery_guarantee: "best_effort",
+            delivery_guarantee: state.metrics.delivery_guarantee(),
             receipt_polling: false,
         }),
     )
@@ -784,7 +929,7 @@ mod tests {
         CollectorRegistration, LeaseClaim, LeaseKey, MemoryRoutingStore, RichPressureSnapshot, RoutingStore,
         SubsystemState,
     };
-    use futures::{TryStreamExt, stream};
+    use futures::{FutureExt, TryStreamExt, stream};
     use tonic::Request;
     use tonic::metadata::MetadataValue;
 
@@ -833,6 +978,7 @@ mod tests {
             lease_id: arrowcol_protocol::LeaseId::new(),
             holder_instance_id: CollectorInstanceId::new(),
             fencing_token: arrowcol_protocol::FencingToken::new(1).expect("fence"),
+            instance_key: "dfe-flight-test".to_owned(),
         }
     }
 
@@ -1001,6 +1147,7 @@ mod tests {
             envelope,
             permit: Some(permit),
             finished: false,
+            durable: None,
         };
 
         let error = lifecycle.push_batch(batch()).await.expect_err("send failure");
@@ -1031,6 +1178,7 @@ mod tests {
             envelope,
             permit: Some(permit),
             finished: false,
+            durable: None,
         };
 
         let send = lifecycle.push_batch(batch());
@@ -1061,6 +1209,7 @@ mod tests {
             envelope,
             permit: Some(permit),
             finished: false,
+            durable: None,
         };
 
         Box::new(lifecycle).abort(StreamAbortReason::ClientCancelled).await;
@@ -1114,6 +1263,7 @@ mod tests {
                 instance_id,
             )),
             instance_id,
+            "dfe-flight-test",
             2,
             metrics,
         ));
@@ -1179,6 +1329,7 @@ mod tests {
                 instance_id,
             )),
             instance_id,
+            "dfe-flight-test",
             2,
             metrics,
         ));
@@ -1206,11 +1357,12 @@ mod tests {
         Ok(())
     }
 
-    /// Scenario: Native Quiver persistence is requested for Arrowcol pdata.
-    /// Guarantees: Strict validation reports the exact typed capability gap instead of inventing persistence.
+    /// Scenario: `native_quiver: true` is configured on `receiver:arrow_flight`.
+    /// Guarantees: Strict validation accepts durable admission now that the durable buffer persists
+    /// Arrowcol pdata, while unknown receiver fields are still rejected.
     #[test]
-    fn native_quiver_is_rejected_honestly() {
-        let value = serde_json::json!({
+    fn native_quiver_config_is_accepted() {
+        let mut value = serde_json::json!({
             "listening_addr": "127.0.0.1:32010",
             "admin_listening_addr": "127.0.0.1:32011",
             "catalog": {"type": "memory"},
@@ -1221,7 +1373,392 @@ mod tests {
             },
             "native_quiver": true
         });
-        let error = validate_receiver_config(&value).expect_err("unsupported");
-        assert!(error.to_string().contains(crate::QUIVER_UNSUPPORTED_GAP));
+        validate_receiver_config(&value).expect("durable admission is supported");
+        value["native_quiver_gap"] = serde_json::json!(true);
+        assert!(validate_receiver_config(&value).is_err());
+    }
+
+    fn durable_metrics(native_quiver: bool) -> Arc<RuntimeMetrics> {
+        let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
+        metrics.configure_receiver(4, u64::MAX / 4, 1_000_000, 1_000, 10, 4);
+        metrics.configure_exporter(4);
+        metrics
+            .configure_admission("dfe-flight-test", native_quiver)
+            .expect("admission mode");
+        metrics
+    }
+
+    async fn durable_lifecycle(
+        metrics: &Arc<RuntimeMetrics>,
+        sender: Arc<dyn PdataSender>,
+        timeout: Option<Duration>,
+    ) -> (DfeStreamLifecycle, Arc<PendingTracker>, Arc<Semaphore>) {
+        let pending = Arc::new(PendingTracker::new(Arc::clone(metrics)));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&semaphore).acquire_owned().await.expect("permit");
+        let envelope = envelope();
+        metrics.stream_started(&envelope.table);
+        let lifecycle = DfeStreamLifecycle {
+            sender,
+            pending: Arc::clone(&pending),
+            metrics: Arc::clone(metrics),
+            envelope,
+            permit: Some(permit),
+            finished: false,
+            durable: timeout.map(DurableAdmission::new),
+        };
+        (lifecycle, pending, semaphore)
+    }
+
+    fn capture_sender() -> Arc<CaptureSender> {
+        Arc::new(CaptureSender {
+            sent: Mutex::new(Vec::new()),
+            gate: None,
+        })
+    }
+
+    fn sent_ids(sender: &CaptureSender) -> Vec<u64> {
+        sender
+            .sent
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    fn summary() -> StreamSummary {
+        StreamSummary::new(2, 2, 16)
+    }
+
+    /// Scenario: A durable-admission stream pushed two batches and ends before the durable buffer
+    /// acknowledged them.
+    /// Guarantees: Completion stays pending until every correlated ACK arrives, then reports
+    /// `durable_admission`, and pressure moves both batches from in-memory DFE work into the durable backlog.
+    #[tokio::test]
+    async fn durable_completion_waits_for_every_ack() {
+        let metrics = durable_metrics(true);
+        let sender = capture_sender();
+        let (mut lifecycle, pending, semaphore) = durable_lifecycle(
+            &metrics,
+            Arc::clone(&sender) as Arc<dyn PdataSender>,
+            Some(Duration::from_secs(5)),
+        )
+        .await;
+        lifecycle.push_batch(batch()).await.expect("first batch");
+        lifecycle.push_batch(batch()).await.expect("second batch");
+        let ids = sent_ids(&sender);
+        assert_eq!(ids.len(), 2);
+        {
+            let mut completion = lifecycle.complete(summary());
+            assert!((&mut completion).now_or_never().is_none());
+            pending.resolve(ids[0], true);
+            assert!((&mut completion).now_or_never().is_none());
+            pending.resolve(ids[1], true);
+            let completion = tokio::time::timeout(Duration::from_secs(1), completion)
+                .await
+                .expect("bounded completion")
+                .expect("durable admission");
+            assert_eq!(completion, StreamCompletion::durable_admission());
+        }
+        drop(lifecycle);
+        assert_eq!(semaphore.available_permits(), 1);
+
+        let pressure = metrics.pressure().expect("pressure");
+        assert_eq!(pressure.rich.buffered_batches.current().get(), 2);
+        assert_eq!(pressure.rich.dfe_pressure_bps.get(), 0);
+        assert_eq!(pressure.rich.quiver_pressure_bps.get(), 2_000);
+        assert_eq!(pressure.rich.quiver_state, SubsystemState::Ready);
+        assert_eq!(pressure.rich.tables[0].buffered_batches.get(), 2);
+        let encoded = serde_json::to_value(&pressure).expect("pressure JSON");
+        assert_eq!(encoded["dfe_channel_occupancy"], 0);
+        assert_eq!(
+            encoded["dfe_channel_occupancy_source"],
+            "ack_tracked_until_durable_admission"
+        );
+        assert_eq!(encoded["native_quiver_buffered_batches"], 2);
+        assert!(
+            metrics
+                .prometheus()
+                .contains("arrowcol_dataflow_durable_admitted_batches_total 2\n")
+        );
+    }
+
+    /// Scenario: The durable buffer acknowledges one batch of a stream and rejects the other.
+    /// Guarantees: Completion fails with a retryable UNAVAILABLE error, later pushes fail fast without
+    /// reaching DFE, and only the acknowledged batch enters the durable backlog.
+    #[tokio::test]
+    async fn durable_nack_fails_stream_retryably() {
+        let metrics = durable_metrics(true);
+        let sender = capture_sender();
+        let (mut lifecycle, pending, semaphore) = durable_lifecycle(
+            &metrics,
+            Arc::clone(&sender) as Arc<dyn PdataSender>,
+            Some(Duration::from_secs(5)),
+        )
+        .await;
+        lifecycle.push_batch(batch()).await.expect("first batch");
+        lifecycle.push_batch(batch()).await.expect("second batch");
+        let ids = sent_ids(&sender);
+        pending.resolve(ids[0], true);
+        pending.resolve(ids[1], false);
+
+        let error = lifecycle.complete(summary()).await.expect_err("rejected batch");
+        assert_eq!(error.code(), ErrorCode::CapacityExhausted);
+        assert_eq!(error.grpc_code(), tonic::Code::Unavailable);
+        assert!(error.code().is_retryable());
+        assert!(error.public_message().contains("durable buffer rejected"));
+        let error = lifecycle.push_batch(batch()).await.expect_err("fail fast");
+        assert_eq!(error.code(), ErrorCode::CapacityExhausted);
+        assert_eq!(sent_ids(&sender).len(), 2);
+
+        Box::new(lifecycle).abort(StreamAbortReason::AdmissionFailure).await;
+        assert_eq!(semaphore.available_permits(), 1);
+        let pressure = metrics.pressure().expect("pressure");
+        assert_eq!(pressure.rich.active_streams.current().get(), 0);
+        assert_eq!(pressure.rich.buffered_batches.current().get(), 1);
+        assert!(
+            metrics
+                .prometheus()
+                .contains("arrowcol_dataflow_durable_admission_failures_total 1\n")
+        );
+    }
+
+    /// Scenario: The durable buffer never acknowledges a pushed batch before the admission timeout.
+    /// Guarantees: Completion fails with a retryable UNAVAILABLE timeout, the batch stays in-flight DFE
+    /// work until feedback arrives, and a late ACK still moves it into the durable backlog.
+    #[tokio::test]
+    async fn durable_timeout_fails_stream_retryably() {
+        let metrics = durable_metrics(true);
+        let sender = capture_sender();
+        let (mut lifecycle, pending, _semaphore) = durable_lifecycle(
+            &metrics,
+            Arc::clone(&sender) as Arc<dyn PdataSender>,
+            Some(Duration::from_millis(100)),
+        )
+        .await;
+        lifecycle.push_batch(batch()).await.expect("batch");
+        let error = tokio::time::timeout(Duration::from_secs(2), lifecycle.complete(summary()))
+            .await
+            .expect("bounded by the admission timeout")
+            .expect_err("timeout");
+        assert_eq!(error.code(), ErrorCode::BackpressureTimeout);
+        assert_eq!(error.grpc_code(), tonic::Code::Unavailable);
+        assert!(error.code().is_retryable());
+        Box::new(lifecycle).abort(StreamAbortReason::AdmissionFailure).await;
+        let pressure = metrics.pressure().expect("pressure");
+        assert_eq!(pressure.rich.dfe_pressure_bps.get(), 1_000);
+        assert_eq!(pressure.rich.quiver_pressure_bps.get(), 0);
+
+        pending.resolve(sent_ids(&sender)[0], true);
+        let pressure = metrics.pressure().expect("pressure");
+        assert_eq!(pressure.rich.dfe_pressure_bps.get(), 0);
+        assert_eq!(pressure.rich.buffered_batches.current().get(), 1);
+        assert_eq!(pressure.rich.quiver_pressure_bps.get(), 1_000);
+    }
+
+    /// Scenario: Native Quiver is disabled and DFE feedback is still outstanding when a stream ends.
+    /// Guarantees: Completion returns `best_effort_admission` immediately, exactly as before durable
+    /// admission existed, and a later ACK never creates a durable backlog.
+    #[tokio::test]
+    async fn best_effort_completion_is_unchanged() {
+        let metrics = durable_metrics(false);
+        let sender = capture_sender();
+        let (mut lifecycle, pending, semaphore) =
+            durable_lifecycle(&metrics, Arc::clone(&sender) as Arc<dyn PdataSender>, None).await;
+        lifecycle.push_batch(batch()).await.expect("batch");
+        let completion = lifecycle
+            .complete(summary())
+            .now_or_never()
+            .expect("immediate completion")
+            .expect("best effort");
+        assert_eq!(completion, StreamCompletion::best_effort());
+        drop(lifecycle);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert_eq!(
+            metrics
+                .pressure()
+                .expect("pressure")
+                .rich
+                .buffered_batches
+                .current()
+                .get(),
+            1
+        );
+
+        pending.resolve(sent_ids(&sender)[0], true);
+        let pressure = metrics.pressure().expect("pressure");
+        assert_eq!(pressure.rich.buffered_batches.current().get(), 0);
+        assert_eq!(pressure.rich.quiver_state, SubsystemState::Disabled);
+        assert!(
+            metrics
+                .prometheus()
+                .contains("arrowcol_dataflow_durable_backlog_batches 0\n")
+        );
+    }
+
+    /// Scenario: Durable-admission streams are aborted while one batch awaits durable-buffer feedback
+    /// and another send is still backpressured.
+    /// Guarantees: The cancelled send releases its pending entry immediately, the late ACK releases the
+    /// other, and neither leaves a per-stream waiter or pending entry behind.
+    #[tokio::test]
+    async fn aborted_durable_streams_release_waiters() {
+        let metrics = durable_metrics(true);
+        let sender = capture_sender();
+        let (mut lifecycle, pending, semaphore) = durable_lifecycle(
+            &metrics,
+            Arc::clone(&sender) as Arc<dyn PdataSender>,
+            Some(Duration::from_secs(5)),
+        )
+        .await;
+        lifecycle.push_batch(batch()).await.expect("batch");
+        let stream = Arc::clone(&lifecycle.durable.as_ref().expect("durable").stream);
+        assert_eq!(Arc::strong_count(&stream), 3);
+        Box::new(lifecycle).abort(StreamAbortReason::ClientCancelled).await;
+        assert_eq!(semaphore.available_permits(), 1);
+        assert_eq!(Arc::strong_count(&stream), 2);
+        pending.resolve(sent_ids(&sender)[0], true);
+        assert_eq!(Arc::strong_count(&stream), 1);
+        assert!(pending.pending_ids().is_empty());
+
+        let gate = Arc::new(Semaphore::new(0));
+        let (mut blocked, pending, _semaphore) = durable_lifecycle(
+            &metrics,
+            Arc::new(CaptureSender {
+                sent: Mutex::new(Vec::new()),
+                gate: Some(gate),
+            }),
+            Some(Duration::from_secs(5)),
+        )
+        .await;
+        let stream = Arc::clone(&blocked.durable.as_ref().expect("durable").stream);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), blocked.push_batch(batch()))
+                .await
+                .is_err()
+        );
+        assert!(pending.pending_ids().is_empty());
+        assert_eq!(stream.progress().rejected, 1);
+        Box::new(blocked).abort(StreamAbortReason::ClientCancelled).await;
+        assert_eq!(Arc::strong_count(&stream), 1);
+    }
+
+    struct AckingSender {
+        sent: Mutex<Vec<ArrowcolBatchEnvelope>>,
+        acks: tokio::sync::mpsc::UnboundedSender<u64>,
+    }
+
+    #[async_trait]
+    impl PdataSender for AckingSender {
+        async fn send(&self, correlation_id: u64, pdata: OtapPdata) -> Result<(), PdataSendError> {
+            let (_, payload) = pdata.into_parts();
+            let otel_arrow_dfe_pdata::PayloadData::PdataArrowRecords(records) = payload.into_data() else {
+                return Err(PdataSendError::Unavailable);
+            };
+            let decoded = crate::decode_record_set(*records).map_err(|_| PdataSendError::Unavailable)?;
+            self.sent
+                .lock()
+                .expect("capture lock")
+                .extend(decoded.into_iter().map(|batch| batch.envelope));
+            self.acks.send(correlation_id).map_err(|_| PdataSendError::Closed)
+        }
+    }
+
+    /// Scenario: Flight ingests an exact schema with durable admission enabled while a fake durable
+    /// buffer acknowledges each batch asynchronously through DFE feedback.
+    /// Guarantees: The final PutResult is labeled `durable_admission` without a receipt, and every
+    /// emitted envelope carries the receiver's instance key.
+    #[tokio::test]
+    async fn exact_flight_ingest_returns_durable_admission() -> Result<()> {
+        let catalog = Arc::new(MemoryCatalogStore::new());
+        let control = CatalogControlPlane::new(
+            DdlParser::default(),
+            Arc::clone(&catalog) as Arc<dyn CatalogStore>,
+            Arc::new(MemoryMetastore::new()),
+        );
+        let ddl = control
+            .execute_ddl(arrowcol_catalog::FlightSqlDdlRequest::new(
+                "CREATE TABLE demo.generated.events (id BIGINT NOT NULL)",
+            ))
+            .await?;
+        let current = catalog
+            .current_schema(ddl.identity())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("missing schema"))?;
+        let schema = Arc::new(current.arrow_schema()?);
+        let batches = (0..3_i64)
+            .map(|value| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef],
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let routing = Arc::new(MemoryRoutingStore::default());
+        let instance_id = CollectorInstanceId::new();
+        routing_lease(&routing, instance_id, ddl.identity()).await?;
+        let (acks, mut feedback) = tokio::sync::mpsc::unbounded_channel();
+        let sender = Arc::new(AckingSender {
+            sent: Mutex::new(Vec::new()),
+            acks,
+        });
+        let metrics = Arc::new(RuntimeMetrics::new(instance_id));
+        metrics.configure_receiver(2, u64::MAX / 4, 1_000_000, 10_000, 16, 2);
+        metrics
+            .configure_admission("dfe-flight-test", true)
+            .map_err(anyhow::Error::msg)?;
+        let admission = Arc::new(
+            DfeAdmission::new(
+                Arc::clone(&sender) as Arc<dyn PdataSender>,
+                Arc::new(StoreLeaseResolver::new(
+                    Arc::clone(&routing) as Arc<dyn RoutingStore>,
+                    instance_id,
+                )),
+                instance_id,
+                "dfe-flight-test",
+                2,
+                Arc::clone(&metrics),
+            )
+            .with_durable_admission(Duration::from_secs(5)),
+        );
+        let durable_buffer = {
+            let admission = Arc::clone(&admission);
+            tokio::spawn(async move {
+                while let Some(correlation_id) = feedback.recv().await {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    admission.resolve_feedback(correlation_id, true);
+                }
+            })
+        };
+        let service = ArrowColFlightService::new(
+            ImplementationPool::Dataflow,
+            catalog as Arc<dyn CatalogStore>,
+            Arc::new(allow_all_authenticator().map_err(anyhow::Error::msg)?),
+            Arc::clone(&admission) as Arc<dyn BatchAdmission>,
+            arrowcol_flight::RuntimeLimits::default(),
+        )?;
+        let results = service
+            .handle_do_put(flight_request(ddl.identity(), current.version(), schema, batches).await?)
+            .await?
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(results.len(), 1);
+        let completion = PutResultMetadata::from_put_result(&results[0])?;
+        assert_eq!(
+            completion.delivery_guarantee(),
+            Some(DeliveryGuarantee::DurableAdmission)
+        );
+        assert_eq!(completion.receipt_id(), None);
+        let sent = sender.sent.lock().expect("capture lock").clone();
+        assert_eq!(sent.len(), 3);
+        assert!(sent.iter().all(|envelope| envelope.instance_key == "dfe-flight-test"));
+        assert!(sent.iter().all(|envelope| envelope.holder_instance_id == instance_id));
+        let pressure = metrics.pressure().map_err(anyhow::Error::msg)?;
+        assert_eq!(pressure.rich.buffered_batches.current().get(), 3);
+        assert_eq!(pressure.rich.quiver_state, SubsystemState::Ready);
+        drop(service);
+        durable_buffer.abort();
+        Ok(())
     }
 }

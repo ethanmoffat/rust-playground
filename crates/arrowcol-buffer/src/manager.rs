@@ -16,7 +16,7 @@ use arrowcol_receipts::{
     FailureDisposition, PublicationBatch, ReceiptFailure, ReceiptRecord, ReceiptStore, ReceiptVersion,
     ValidatedDelivery,
 };
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore, oneshot};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -58,6 +58,50 @@ pub struct Admission {
     pub lease: TableLease,
     /// Record batches retained without concatenation or deep copy.
     pub batches: Vec<RecordBatch>,
+}
+
+/// Durable receipt state of a delivery admitted from a local durable stage.
+///
+/// Fresh deliveries are `Accepted`. Deliveries recovered from durable storage
+/// (for example after crash adoption) may already be `Buffered` or `Flushing`;
+/// the manager then skips the receipt transitions that already happened.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrackedState {
+    /// The receipt is `accepted`; admission marks it buffered.
+    Accepted,
+    /// The receipt is already `buffered` by the admitting owner.
+    Buffered,
+    /// The receipt is already `flushing`; its earlier publication outcome is
+    /// unknown, so the delivery is published again (at least once).
+    Flushing,
+}
+
+/// Final outcome of one tracked delivery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryOutcome {
+    /// Delta committed the rows and the receipt reached `published`.
+    Published,
+    /// Delta committed the rows but the receipt transaction failed.
+    PublishedUnrecorded,
+    /// The receipt reached a terminal failure that the client observes.
+    Failed,
+    /// The durable outcome is unknown; the receipt may still be in progress.
+    Unknown,
+}
+
+/// Resolves to the [`DeliveryOutcome`] of one tracked delivery.
+///
+/// A delivery dropped before publication (for example after table poisoning
+/// or shutdown) resolves to [`DeliveryOutcome::Unknown`].
+pub struct DeliveryCompletion {
+    receiver: oneshot::Receiver<DeliveryOutcome>,
+}
+
+impl DeliveryCompletion {
+    /// Waits for the delivery outcome.
+    pub async fn outcome(self) -> DeliveryOutcome {
+        self.receiver.await.unwrap_or(DeliveryOutcome::Unknown)
+    }
 }
 
 /// Current global retained/in-flight pressure.
@@ -171,6 +215,8 @@ struct QueueContext {
 struct QueuedDelivery {
     receipt: ReceiptVersion,
     batches: Vec<RecordBatch>,
+    already_flushing: bool,
+    completion: Option<oneshot::Sender<DeliveryOutcome>>,
     _capacity: CapacityReservation,
 }
 
@@ -184,6 +230,7 @@ struct JobResult {
     observation: Option<CompletedFileObservation>,
     incomplete: Option<IncompleteWork>,
     poison: Option<String>,
+    outcome: DeliveryOutcome,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -281,7 +328,52 @@ impl BufferManager {
     ///
     /// Returns validation, capacity, receipt-store, poison, or shutdown errors.
     pub async fn admit(self: &Arc<Self>, admission: Admission) -> BufferResult<ReceiptRecord> {
-        self.admit_inner(admission).await
+        self.admit_inner(admission, TrackedState::Accepted, None).await
+    }
+
+    /// Admits one delivery from a local durable stage and returns a completion
+    /// that resolves once its publication outcome is known.
+    ///
+    /// `state` is the receipt's current durable state. `Buffered` and
+    /// `Flushing` skip the transitions that already happened, so recovered
+    /// deliveries can be published by their (adopting) owner. The returned
+    /// record is the receipt as admitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, capacity, receipt-store, poison, or shutdown errors.
+    pub async fn admit_tracked(
+        self: &Arc<Self>,
+        admission: Admission,
+        state: TrackedState,
+    ) -> BufferResult<(ReceiptVersion, DeliveryCompletion)> {
+        let (sender, receiver) = oneshot::channel();
+        let receipt = self.admit_tracked_inner(admission, state, sender).await?;
+        Ok((receipt, DeliveryCompletion { receiver }))
+    }
+
+    /// Checks, without reserving capacity, that a delivery could be admitted.
+    ///
+    /// Durable stages call this before persisting a delivery so that a batch
+    /// which can never fit, or a poisoned table, is rejected while the client
+    /// can still be told synchronously.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferErrorKind::CapacityExceeded`] when one delivery exceeds
+    /// the global or per-table capacity, or the same lifecycle and poison
+    /// errors as [`Self::admit`].
+    pub fn check_admissible(&self, table_id: Uuid, rows: u64, bytes: u64, batches: u64) -> BufferResult<()> {
+        let usage = Usage { bytes, rows, batches };
+        if !self.config.global_capacity.contains(usage.as_limits())
+            || !self.config.per_table_capacity.contains(usage.as_limits())
+        {
+            return Err(BufferError::new(
+                BufferErrorKind::CapacityExceeded,
+                "one delivery exceeds global or per-table buffer capacity",
+            ));
+        }
+        self.ensure_table_accepting(table_id)
     }
 
     /// Admits one delivery with a bounded backpressure wait.
@@ -295,7 +387,7 @@ impl BufferManager {
         admission: Admission,
         timeout: Duration,
     ) -> BufferResult<ReceiptRecord> {
-        tokio::time::timeout(timeout, self.admit_inner(admission))
+        tokio::time::timeout(timeout, self.admit_inner(admission, TrackedState::Accepted, None))
             .await
             .map_err(|_| {
                 BufferError::new(
@@ -356,7 +448,42 @@ impl BufferManager {
         self.pressure_locked(&state)
     }
 
-    async fn admit_inner(self: &Arc<Self>, admission: Admission) -> BufferResult<ReceiptRecord> {
+    async fn admit_tracked_inner(
+        self: &Arc<Self>,
+        admission: Admission,
+        state: TrackedState,
+        completion: oneshot::Sender<DeliveryOutcome>,
+    ) -> BufferResult<ReceiptVersion> {
+        if state == TrackedState::Accepted {
+            let record = self.admit_inner(admission, state, Some(completion)).await?;
+            return Ok(ReceiptVersion::new(record.receipt_id, record.revision));
+        }
+        let _admission_guard = self.start_admission()?;
+        let (usage, context) = validate_admission(&admission)?;
+        self.ensure_table_accepting(context.table_id)?;
+        let reservation = self.capacity.acquire(context.table_id, usage).await?;
+        self.enqueue(
+            context,
+            QueuedDelivery {
+                receipt: admission.receipt,
+                batches: admission.batches,
+                already_flushing: state == TrackedState::Flushing,
+                completion: Some(completion),
+                _capacity: reservation,
+            },
+            usage,
+        )?;
+        self.schedule_ready()?;
+        Ok(admission.receipt)
+    }
+
+    async fn admit_inner(
+        self: &Arc<Self>,
+        admission: Admission,
+        state: TrackedState,
+        completion: Option<oneshot::Sender<DeliveryOutcome>>,
+    ) -> BufferResult<ReceiptRecord> {
+        debug_assert_eq!(state, TrackedState::Accepted);
         let _admission_guard = self.start_admission()?;
         let (usage, context) = validate_admission(&admission)?;
         self.ensure_table_accepting(context.table_id)?;
@@ -407,6 +534,8 @@ impl BufferManager {
             QueuedDelivery {
                 receipt: buffered_version,
                 batches: admission.batches,
+                already_flushing: false,
+                completion,
                 _capacity: reservation,
             },
             usage,
@@ -578,7 +707,18 @@ impl BufferManager {
             }
         };
         let _permit = permit;
-        let versions: Vec<_> = job.entries.iter().map(|entry| entry.receipt).collect();
+        let versions: Vec<_> = job
+            .entries
+            .iter()
+            .filter(|entry| !entry.already_flushing)
+            .map(|entry| entry.receipt)
+            .collect();
+        let recovered_flushing: Vec<_> = job
+            .entries
+            .iter()
+            .filter(|entry| entry.already_flushing)
+            .map(|entry| entry.receipt)
+            .collect();
         let lease = match self.sink.current_lease(&job.context.table, &job.context.lease).await {
             Ok(lease) => lease,
             Err(error) => {
@@ -601,25 +741,30 @@ impl BufferManager {
                 return incomplete_job(job, error.message(), None, Some(error.message().to_owned()));
             }
         };
-        let flushing = match self
-            .receipts
-            .mark_flushing(job.context.lease.holder_instance_id(), &versions, deadline)
-            .await
-        {
-            Ok(flushing) => flushing,
-            Err(error) => {
-                return incomplete_job(
-                    job,
-                    &format!("could not persist flushing transition: {error}"),
-                    None,
-                    Some("receipt store failed before publication".to_owned()),
-                );
+        let flushing = if versions.is_empty() {
+            Vec::new()
+        } else {
+            match self
+                .receipts
+                .mark_flushing(job.context.lease.holder_instance_id(), &versions, deadline)
+                .await
+            {
+                Ok(flushing) => flushing,
+                Err(error) => {
+                    return incomplete_job(
+                        job,
+                        &format!("could not persist flushing transition: {error}"),
+                        None,
+                        Some("receipt store failed before publication".to_owned()),
+                    );
+                }
             }
         };
-        let flushing_versions: Vec<_> = flushing
+        let mut flushing_versions: Vec<_> = flushing
             .iter()
             .map(|record| ReceiptVersion::new(record.receipt_id, record.revision))
             .collect();
+        flushing_versions.extend(recovered_flushing);
         let publication = self.publish_job(job).await;
         match publication {
             Ok(outcome) => {
@@ -636,13 +781,17 @@ impl BufferManager {
                         observation: Some(outcome.file_observation),
                         incomplete: None,
                         poison: None,
+                        outcome: DeliveryOutcome::Published,
                     },
-                    Err(error) => incomplete_job(
-                        job,
-                        &format!("Delta committed but receipt transaction failed: {error}"),
-                        Some(outcome.publication),
-                        Some("durable Delta publication is missing SQL receipt completion".to_owned()),
-                    ),
+                    Err(error) => JobResult {
+                        outcome: DeliveryOutcome::PublishedUnrecorded,
+                        ..incomplete_job(
+                            job,
+                            &format!("Delta committed but receipt transaction failed: {error}"),
+                            Some(outcome.publication),
+                            Some("durable Delta publication is missing SQL receipt completion".to_owned()),
+                        )
+                    },
                 }
             }
             Err(error) => {
@@ -655,10 +804,16 @@ impl BufferManager {
                     | SinkErrorKind::PublicationUnknown
                     | SinkErrorKind::Permanent => Some(format!("publication failed: {}", error.message())),
                 };
+                let outcome = if incomplete.is_none() && receipt_failure.is_none() {
+                    DeliveryOutcome::Failed
+                } else {
+                    DeliveryOutcome::Unknown
+                };
                 JobResult {
                     observation: None,
                     incomplete: incomplete.or(receipt_failure),
                     poison,
+                    outcome,
                 }
             }
         }
@@ -745,7 +900,12 @@ impl BufferManager {
         }
     }
 
-    fn complete_job(self: &Arc<Self>, table_id: Uuid, job: FlushJob, result: JobResult) {
+    fn complete_job(self: &Arc<Self>, table_id: Uuid, mut job: FlushJob, result: JobResult) {
+        for entry in &mut job.entries {
+            if let Some(completion) = entry.completion.take() {
+                let _ = completion.send(result.outcome);
+            }
+        }
         let lock = self.state.lock();
         let Ok(mut state) = lock else {
             return;
@@ -1152,7 +1312,7 @@ fn same_fence(left: &TableLease, right: &TableLease) -> bool {
         && left.fencing_token() == right.fencing_token()
 }
 
-fn receipt_deadline(lease: &TableLease, duration: Duration) -> BufferResult<UnixMillis> {
+pub(crate) fn receipt_deadline(lease: &TableLease, duration: Duration) -> BufferResult<UnixMillis> {
     let now = now_unix_millis()?;
     if !lease.is_active_at(now) {
         return Err(BufferError::new(
@@ -1171,7 +1331,7 @@ fn receipt_deadline(lease: &TableLease, duration: Duration) -> BufferResult<Unix
         .map_err(|cause| BufferError::new(BufferErrorKind::InvalidConfiguration, cause.to_string()))
 }
 
-fn now_unix_millis() -> BufferResult<UnixMillis> {
+pub(crate) fn now_unix_millis() -> BufferResult<UnixMillis> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| {
@@ -1200,6 +1360,7 @@ fn incomplete_job(
         observation: None,
         incomplete: Some(incomplete(job, reason.to_owned(), durable_publication)),
         poison,
+        outcome: DeliveryOutcome::Unknown,
     }
 }
 

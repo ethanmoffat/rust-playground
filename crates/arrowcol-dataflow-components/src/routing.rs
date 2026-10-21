@@ -1,16 +1,23 @@
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arrow_deltalake::delta::{PublicationFence, PublicationFenceContext, PublicationFenceError};
 use arrowcol_flight::{RuntimeError, RuntimeResult};
-use arrowcol_protocol::{CollectorInstanceId, ErrorCode, FencingToken, ImplementationPool, LeaseId, TableIdentity};
+use arrowcol_protocol::{
+    CollectorInstanceId, ErrorCode, FencingToken, ImplementationPool, LeaseId, TableIdentity, UnixMillis,
+};
 use arrowcol_routing::{LeaseKey, LeaseState, RoutingLease, RoutingStore};
 use async_trait::async_trait;
 use tonic::Code;
 
 use crate::config::now_unix_millis;
 use crate::envelope::ArrowcolBatchEnvelope;
+
+/// How long an authoritative lease observed before staging is reused.
+pub(crate) const LEASE_VIEW_TTL: Duration = Duration::from_secs(1);
+const MAX_CACHED_LEASES: usize = 1_024;
 
 /// Resolves authoritative table ownership before a Flight stream is admitted.
 #[async_trait]
@@ -82,6 +89,193 @@ impl LeaseEvidence {
             holder_instance_id: envelope.holder_instance_id,
             fencing_token: envelope.fencing_token,
         }
+    }
+}
+
+/// Identity of the collector process lifetime that is exporting a batch.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExportingProcess<'a> {
+    /// Process-lifetime identifier ([`crate::process_instance_id`]).
+    pub(crate) instance_id: CollectorInstanceId,
+    /// Stable deployment key recorded by this process's receiver, when known.
+    pub(crate) instance_key: Option<&'a str>,
+}
+
+/// Decision binding one decoded batch to the authoritative lease before staging.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LeaseBinding {
+    /// The envelope already carries the current lease, held by this process.
+    Current,
+    /// Overwrite the envelope's lease evidence with the current lease held by this process.
+    Rebind {
+        /// Current lease lineage.
+        lease_id: LeaseId,
+        /// This process.
+        holder_instance_id: CollectorInstanceId,
+        /// Current fencing epoch.
+        fencing_token: FencingToken,
+    },
+    /// This process cannot publish the batch yet; the durable buffer must retry it.
+    Defer(&'static str),
+}
+
+impl LeaseBinding {
+    pub(crate) fn apply(self, envelope: &mut ArrowcolBatchEnvelope) {
+        if let Self::Rebind {
+            lease_id,
+            holder_instance_id,
+            fencing_token,
+        } = self
+        {
+            envelope.lease_id = lease_id;
+            envelope.holder_instance_id = holder_instance_id;
+            envelope.fencing_token = fencing_token;
+        }
+    }
+}
+
+/// Decides whether this process may publish a batch under the current lease.
+///
+/// Only the current holder publishes. A batch whose envelope already matches
+/// the current lease keeps it, including while that lease drains. Otherwise
+/// the batch is rebound to the current lease when that lease is active and
+/// valid, held by this process, and the batch was admitted either by this
+/// process (an older lease) or by a predecessor with this process's instance
+/// key (a crash replay). Everything else is deferred, never refused
+/// permanently, so the durable buffer keeps the batch and retries it.
+pub(crate) fn lease_binding(
+    envelope: &ArrowcolBatchEnvelope,
+    current: Option<&RoutingLease>,
+    process: ExportingProcess<'_>,
+    now: UnixMillis,
+) -> LeaseBinding {
+    let Some(lease) = current else {
+        return LeaseBinding::Defer("authoritative routing lease is absent; retrying until this collector holds it");
+    };
+    if lease.holder_instance_id != process.instance_id {
+        return LeaseBinding::Defer(
+            "authoritative routing lease is held by another collector; retrying until this collector holds it",
+        );
+    }
+    if envelope.lease_id == lease.lease_id
+        && envelope.holder_instance_id == lease.holder_instance_id
+        && envelope.fencing_token == lease.fencing_epoch
+    {
+        return LeaseBinding::Current;
+    }
+    if !lease.is_routable_at(now) {
+        return LeaseBinding::Defer(
+            "authoritative routing lease held by this collector is not active; retrying before rebinding",
+        );
+    }
+    let admitted_here = envelope.holder_instance_id == process.instance_id;
+    let same_deployment = process.instance_key.is_some_and(|key| key == envelope.instance_key);
+    if !admitted_here && !same_deployment {
+        return LeaseBinding::Defer(
+            "batch was admitted by a collector with a different or unknown instance key; its routing lease cannot be rebound",
+        );
+    }
+    LeaseBinding::Rebind {
+        lease_id: lease.lease_id,
+        holder_instance_id: lease.holder_instance_id,
+        fencing_token: lease.fencing_epoch,
+    }
+}
+
+struct CachedLease {
+    lease: Option<RoutingLease>,
+    loaded_at: Instant,
+}
+
+/// Binds batches to authoritative leases with a brief per-table view cache.
+///
+/// Reusing a view for up to [`LEASE_VIEW_TTL`] keeps routing reads off the
+/// per-batch path. A stale decision is safe: the commit-boundary
+/// [`RoutingPublicationFence`] re-reads the authoritative lease before any
+/// Delta version becomes visible, so a stale binding fails transiently and
+/// the durable buffer retries with a refreshed view.
+pub(crate) struct LeaseBinder {
+    store: Arc<dyn RoutingStore>,
+    ttl: Duration,
+    cache: Mutex<HashMap<TableIdentity, CachedLease>>,
+}
+
+impl LeaseBinder {
+    pub(crate) fn new(store: Arc<dyn RoutingStore>, ttl: Duration) -> Self {
+        Self {
+            store,
+            ttl,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_ttl(&mut self, ttl: Duration) {
+        self.ttl = ttl;
+    }
+
+    pub(crate) async fn bind(
+        &self,
+        envelope: &ArrowcolBatchEnvelope,
+        process: ExportingProcess<'_>,
+    ) -> Result<LeaseBinding, String> {
+        let now = now_unix_millis()?;
+        if let Some(binding) = self.cached_binding(envelope, process, now) {
+            return Ok(binding);
+        }
+        let view = self
+            .store
+            .load_view(now)
+            .await
+            .map_err(|error| format!("authoritative routing lease could not be loaded: {error}"))?;
+        let lease = view
+            .leases
+            .get(&LeaseKey::new(ImplementationPool::Dataflow, envelope.table.clone()))
+            .cloned();
+        let binding = lease_binding(envelope, lease.as_ref(), process, now_unix_millis()?);
+        self.remember(envelope.table.clone(), lease);
+        Ok(binding)
+    }
+
+    /// Decides from a fresh cached lease unless the envelope proves the entry outdated.
+    fn cached_binding(
+        &self,
+        envelope: &ArrowcolBatchEnvelope,
+        process: ExportingProcess<'_>,
+        now: UnixMillis,
+    ) -> Option<LeaseBinding> {
+        let cache = self.cache.lock().ok()?;
+        let cached = cache.get(&envelope.table)?;
+        // Absent or expired leases, and envelopes newer than the cached epoch,
+        // always trigger a reload instead of a decision from the cache.
+        let lease = cached.lease.as_ref()?;
+        if cached.loaded_at.elapsed() >= self.ttl
+            || envelope.fencing_token > lease.fencing_epoch
+            || !lease.is_valid_at(now)
+        {
+            return None;
+        }
+        Some(lease_binding(envelope, Some(lease), process, now))
+    }
+
+    fn remember(&self, table: TableIdentity, lease: Option<RoutingLease>) {
+        let Ok(mut cache) = self.cache.lock() else {
+            return;
+        };
+        if cache.len() >= MAX_CACHED_LEASES {
+            let ttl = self.ttl;
+            cache.retain(|_, entry| entry.loaded_at.elapsed() < ttl);
+            if cache.len() >= MAX_CACHED_LEASES {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            table,
+            CachedLease {
+                lease,
+                loaded_at: Instant::now(),
+            },
+        );
     }
 }
 
@@ -358,5 +552,80 @@ mod tests {
             error.kind(),
             arrow_deltalake::delta::PublicationFenceErrorKind::StaleOwnership
         );
+    }
+
+    /// Scenario: The lease held by this process is draining, expired, or absent when batches are bound.
+    /// Guarantees: Batches already carrying a draining lease keep publishing so the drain can finish,
+    /// no batch is rebound onto a draining or expired lease, and an absent lease defers the batch.
+    #[test]
+    fn binding_respects_lease_state() {
+        let process = CollectorInstanceId::new();
+        let identity = ExportingProcess {
+            instance_id: process,
+            instance_key: Some("collector"),
+        };
+        let draining = RoutingLease {
+            key: LeaseKey::new(ImplementationPool::Dataflow, table()),
+            lease_id: LeaseId::new(),
+            holder_instance_id: process,
+            fencing_epoch: FencingToken::new(3).expect("fence"),
+            lease_version: 3,
+            state: LeaseState::Draining,
+            issued_at_unix_ms: time(1_000),
+            renewed_at_unix_ms: time(5_000),
+            expires_at_unix_ms: time(20_000),
+            drain_started_at_unix_ms: Some(time(5_000)),
+        };
+        let active = RoutingLease {
+            state: LeaseState::Active,
+            drain_started_at_unix_ms: None,
+            ..draining.clone()
+        };
+        let current = ArrowcolBatchEnvelope {
+            table: table(),
+            source_schema_version: arrowcol_catalog::SchemaVersion::FIRST,
+            target_schema_version: arrowcol_catalog::SchemaVersion::FIRST,
+            lease_id: draining.lease_id,
+            holder_instance_id: process,
+            fencing_token: draining.fencing_epoch,
+            instance_key: "collector".to_owned(),
+        };
+        let older = ArrowcolBatchEnvelope {
+            lease_id: LeaseId::new(),
+            fencing_token: FencingToken::new(2).expect("fence"),
+            ..current.clone()
+        };
+
+        assert_eq!(
+            lease_binding(&current, Some(&draining), identity, time(10_000)),
+            LeaseBinding::Current
+        );
+        assert!(matches!(
+            lease_binding(&older, Some(&draining), identity, time(10_000)),
+            LeaseBinding::Defer(_)
+        ));
+        let rebind = lease_binding(&older, Some(&active), identity, time(10_000));
+        assert_eq!(
+            rebind,
+            LeaseBinding::Rebind {
+                lease_id: active.lease_id,
+                holder_instance_id: process,
+                fencing_token: active.fencing_epoch,
+            }
+        );
+        let mut rebound = older.clone();
+        rebind.apply(&mut rebound);
+        assert_eq!(
+            LeaseEvidence::from_envelope(&rebound),
+            LeaseEvidence::from_envelope(&current)
+        );
+        assert!(matches!(
+            lease_binding(&older, Some(&active), identity, time(20_000)),
+            LeaseBinding::Defer(_)
+        ));
+        assert!(matches!(
+            lease_binding(&current, None, identity, time(10_000)),
+            LeaseBinding::Defer(_)
+        ));
     }
 }

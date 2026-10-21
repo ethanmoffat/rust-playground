@@ -603,6 +603,8 @@ impl BackgroundService for RouterControlLoop {
                         self.metrics.lease_event("drain_started", report.drains_started);
                         self.metrics
                             .lease_event("transfer_completed", report.transfers_completed);
+                        self.metrics
+                            .lease_event("succession_completed", report.successions_completed);
                         self.metrics.lease_event("cas_conflict", report.conflicts);
                         if let Some(view) = self.routing.cached_view().await {
                             self.metrics.update_cache_gauges(&view);

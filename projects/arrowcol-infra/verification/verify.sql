@@ -70,7 +70,7 @@ IF EXISTS (
 )
     THROW 52010, 'One or more expected Arrowcol tables are missing.', 1;
 
-IF (SELECT COUNT_BIG(*) FROM [arrowcol].[schema_migrations]) <> 8
+IF (SELECT COUNT_BIG(*) FROM [arrowcol].[schema_migrations]) <> 9
     THROW 52011, 'Unexpected Arrowcol migration count.', 1;
 
 IF EXISTS (
@@ -132,6 +132,7 @@ VALUES
     (N'IX_delivery_receipts_expiry_active', 1, 6),
     (N'IX_delivery_receipts_table_schema_queue', 0, 8),
     (N'IX_receipt_events_receipt_history', 0, 5),
+    (N'UX_receipt_events_revision', 1, 0),
     (N'IX_routing_collectors_pool_ready', 0, 6),
     (N'IX_routing_collectors_instance_key', 0, 4),
     (N'IX_routing_pressure_latest_fresh', 0, 8),
@@ -230,6 +231,20 @@ IF NOT EXISTS (
 )
     THROW 52023, 'Receipt events must have an enabled append-only trigger.', 1;
 
+IF COL_LENGTH(N'arrowcol.collector_instances', N'durable_recovery_window_ms') IS NULL
+   OR COL_LENGTH(N'arrowcol.receipt_events', N'previous_owner_instance_id') IS NULL
+   OR OBJECT_ID(N'arrowcol.CK_collector_instances_recovery_window', N'C') IS NULL
+   OR OBJECT_ID(N'arrowcol.CK_receipt_events_adoption', N'C') IS NULL
+   OR NOT EXISTS (
+       SELECT 1
+       FROM sys.indexes
+       WHERE [object_id] = OBJECT_ID(N'arrowcol.receipt_events')
+         AND [name] = N'UX_receipt_events_revision'
+         AND [is_unique] = 1
+         AND [has_filter] = 1
+   )
+    THROW 52024, 'Durable receipt recovery windows or adoption event constraints are missing.', 1;
+
 SELECT TOP (0)
     [receipt_id],
     [state],
@@ -239,14 +254,22 @@ WHERE [owner_instance_id] = NEWID()
   AND [state] IN ('accepted', 'buffered', 'flushing');
 
 SELECT TOP (0)
-    [receipt_id],
-    [owner_instance_id],
-    [revision],
-    [state]
-FROM [arrowcol].[delivery_receipts] WITH (INDEX([IX_delivery_receipts_expiry_active]))
-WHERE [receipt_lease_deadline_utc] <= SYSUTCDATETIME()
-  AND [state] IN ('accepted', 'buffered', 'flushing')
-ORDER BY [receipt_lease_deadline_utc], [receipt_id];
+    receipt.[receipt_id],
+    receipt.[owner_instance_id],
+    receipt.[revision],
+    receipt.[state]
+FROM [arrowcol].[delivery_receipts] AS receipt WITH (INDEX([IX_delivery_receipts_expiry_active]))
+WHERE receipt.[receipt_lease_deadline_utc] <= SYSUTCDATETIME()
+  AND receipt.[state] IN ('accepted', 'buffered', 'flushing')
+  AND NOT EXISTS (
+      SELECT 1
+      FROM [arrowcol].[collector_instances] AS durable_owner
+      WHERE durable_owner.[instance_id] = receipt.[owner_instance_id]
+        AND durable_owner.[durable_recovery_window_ms] IS NOT NULL
+        AND durable_owner.[lease_expires_at_utc] >
+            DATEADD(millisecond, -durable_owner.[durable_recovery_window_ms], SYSUTCDATETIME())
+  )
+ORDER BY receipt.[receipt_lease_deadline_utc], receipt.[receipt_id];
 
 IF USER_ID(N'arrowcol_app') IS NULL OR USER_ID(N'arrowcol_migrator') IS NULL
     THROW 52019, 'Arrowcol database users are missing.', 1;

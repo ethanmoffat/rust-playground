@@ -4,19 +4,23 @@
 
 [Architecture index](README.md)
 
-**Direct has a client-managed at-least-once path. DFE currently does not.**
+**Direct has a client-managed at-least-once path. By default DFE does not.**
 Retain the source until verified publication; tolerate duplicate rows.
+The diagram shows the default in-memory paths. With
+[native Quiver](#native-quiver-disk-persistence), both collectors fsync each
+batch to local disk before acknowledging it and replay it after a crash.
 
 | Contract | Direct | DFE |
 | --- | --- | --- |
-| Arbitrary Arrow / exact catalog admission | Yes | Yes, `arrowcol.flight@1.0` envelope |
-| Flight completion | Receipt per non-empty RecordBatch | `best_effort_admission`, no receipt |
+| Arbitrary Arrow / exact catalog admission | Yes | Yes, `arrowcol.flight@1.1` envelope |
+| Flight completion | Receipt per non-empty RecordBatch | `best_effort_admission`, no receipt; `durable_admission` with native Quiver |
 | SQL delivery receipt / HTTP polling | Yes | No |
 | Source purge signal | HTTP `published` + `purge_allowed: true` only | None |
-| At-least-once | Source retention + polling + retry/reconciliation | Not claimed |
+| At-least-once | Source retention + polling + retry/reconciliation | Not claimed by default; from the local Quiver WAL with native Quiver |
+| Native Quiver payload persistence | Optional: batch fsynced before the receipt; replayed under the original receipt | Optional: `durable_buffer` fsync before completion; replayed after restart |
 | Downstream outcome | SQL receipt/publication state | Later internal Ack/Nack, pressure, metrics |
 | Routing / commit fencing | Yes | Yes |
-| Exactly-once / payload deduplication / native arbitrary-Arrow Quiver | No | No |
+| Exactly-once / payload deduplication | No | No |
 
 ## Direct happy path
 
@@ -31,8 +35,9 @@ Validate metadata, identity, lease, exact received schema
   -> client HTTP polls, verifies published + purge_allowed, then purges source
 ```
 
-`delivery_guarantee: "durable_receipt"` describes durable **metadata**, not
-durable pending payload storage. A completed Flight stream is not publication.
+`delivery_guarantee: "durable_receipt"` describes durable **metadata**. Pending
+payloads are durable only with native Quiver, which adds the
+`durable_payload_storage` capability. A completed Flight stream is not publication.
 The client owns source retention and retry until publication is confirmed.
 
 ## Direct sad paths
@@ -141,8 +146,41 @@ DFE `/v1/capabilities` explicitly reports `delivery_guarantee: "best_effort"`,
 HTTP receipt/purge contract. Use direct delivery when the client needs the
 implemented receipt-based at-least-once path.
 
-Native Quiver for fixed OTAP slots does not persist this arbitrary-Arrow
-representation; both pools reject unsupported persistence configuration.
+## Native Quiver disk persistence
+
+Quiver is the OpenTelemetry Arrow write-ahead log and segment store. Each
+bundle can carry opaque, bounded metadata. Arrowcol stores its representation,
+table, schema, and lease identity there, so Quiver persists arbitrary Arrow, not
+only fixed OTAP slots. Quiver is off by default.
+
+```text
+Direct (buffer.native_quiver.enabled)
+  validate -> SQL accepted receipt -> Quiver WAL fsync -> PutResult (receipt ID)
+  -> consumer reads the bundle from disk -> buffered -> publishing -> published
+  -> Quiver bundle released only after the receipt is published
+
+DFE (receiver native_quiver: true + processor:durable_buffer)
+  validate -> envelope -> durable_buffer WAL fsync -> internal Ack
+  -> stream completes: durable_admission (no receipt)
+  -> durable_buffer replays from disk -> fenced Delta commit -> bundle released
+```
+
+After `kill -9`, the restarted process reopens the same Quiver directory:
+
+- **Routing.** It hands the dead predecessor's table leases to the live
+  collector registered with the same `instance_key`.
+- **Direct.** The new process is a newer generation. It adopts the
+  predecessor's receipts and publishes the persisted batches under their
+  original receipt IDs. Reconciliation leaves those receipts alone during the
+  owner lease plus `recovery_window_ms`.
+- **DFE.** Replayed envelopes are rebound to the lease this process now holds.
+  If the lease is not yet held, the batch is NACKed transiently and stays on
+  disk.
+
+Recovery is at least once. A batch whose Delta commit landed just before the
+crash can be published again. Delta `txn` markers are not used yet. Clients still
+purge only on `published` + `purge_allowed`. The loadtest's
+`--quiver --crash-after` run demonstrates and validates this path.
 
 Sources: [direct ingest](../../../projects/arrowcol-rust/src/ingest.rs),
 [receipt reconciliation](../../../crates/arrowcol-receipts/src/sql_server.rs),

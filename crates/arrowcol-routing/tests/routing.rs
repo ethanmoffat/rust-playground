@@ -6,8 +6,9 @@ use arrowcol_protocol::{
     TableName, UnixMillis,
 };
 use arrowcol_routing::{
-    CollectorRegistration, CollectorState, LeaseClaim, LeaseKey, MemoryRoutingStore, RichPressureSnapshot, RouteSource,
-    RoutingEngine, RoutingErrorKind, RoutingPolicy, RoutingStore, SubsystemState, TablePressure, rank_collectors,
+    CollectorRegistration, CollectorState, LeaseCas, LeaseClaim, LeaseKey, LeaseState, LeaseSuccession,
+    MemoryRoutingStore, RebalanceReport, RichPressureSnapshot, RouteSource, RoutingEngine, RoutingErrorKind,
+    RoutingLease, RoutingPolicy, RoutingStore, SubsystemState, TablePressure, rank_collectors,
 };
 
 fn millis(value: u64) -> UnixMillis {
@@ -631,4 +632,566 @@ fn pressure_validation_rejects_duplicate_tables_and_future_observations() {
         panic!("far-future observation must fail");
     };
     assert_eq!(future_error.kind(), RoutingErrorKind::InvalidSnapshot);
+}
+
+/// Instance key reused by a crashed collector and its restarted process.
+const RESTARTED_KEY: &str = "loadtest-direct-1";
+/// Production-like lease duration that outlives the crashed registration.
+const LONG_LEASE_TTL_MS: u64 = 86_400_000;
+
+fn keyed_registration(
+    instance_id: CollectorInstanceId,
+    instance_key: &str,
+    port: u16,
+    started_at: u64,
+    lease_expires_at: u64,
+) -> CollectorRegistration {
+    CollectorRegistration {
+        instance_key: instance_key.to_owned(),
+        heartbeat_at_unix_ms: millis(started_at),
+        lease_expires_at_unix_ms: millis(lease_expires_at),
+        ..registration(instance_id, port, started_at)
+    }
+}
+
+async fn register_with_pressure(store: &MemoryRoutingStore, registration: CollectorRegistration, observed_at: u64) {
+    let instance_id = registration.instance_id;
+    store
+        .register_collector(&registration)
+        .await
+        .unwrap_or_else(|error| panic!("register collector: {error}"));
+    store
+        .publish_pressure(&snapshot(instance_id, observed_at, 1_000, 0))
+        .await
+        .unwrap_or_else(|error| panic!("publish collector pressure: {error}"));
+}
+
+fn long_lease_engine(store: &Arc<MemoryRoutingStore>) -> RoutingEngine {
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(store);
+    let policy = RoutingPolicy {
+        lease_ttl_ms: LONG_LEASE_TTL_MS,
+        ..RoutingPolicy::default()
+    };
+    RoutingEngine::new(engine_store, policy).unwrap_or_else(|error| panic!("create engine: {error}"))
+}
+
+/// A holder that crashed after claiming a lease, its same-key restart, and a
+/// healthy collector deployed under a different instance key.
+struct CrashedHolder {
+    store: Arc<MemoryRoutingStore>,
+    crashed: CollectorInstanceId,
+    restart: CollectorInstanceId,
+    stranger: CollectorInstanceId,
+    lease: RoutingLease,
+}
+
+impl CrashedHolder {
+    /// The holder claims at 100_001 and its registration expires at 200_000;
+    /// the restart and the stranger publish fresh pressure at 250_000.
+    async fn new(lease_ttl_ms: u64) -> Self {
+        let store = Arc::new(MemoryRoutingStore::default());
+        let crashed = CollectorInstanceId::new();
+        let restart = CollectorInstanceId::new();
+        let stranger = CollectorInstanceId::new();
+        register_with_pressure(
+            &store,
+            keyed_registration(crashed, RESTARTED_KEY, 5001, 20_000, 200_000),
+            99_000,
+        )
+        .await;
+        let lease = store
+            .claim_lease(&LeaseClaim {
+                key: LeaseKey::new(ImplementationPool::Direct, table()),
+                candidate_instance_id: crashed,
+                now_unix_ms: millis(100_001),
+                expires_at_unix_ms: millis(100_001 + lease_ttl_ms),
+                minimum_snapshot_at_unix_ms: millis(99_000),
+            })
+            .await
+            .unwrap_or_else(|error| panic!("claim crashed holder lease: {error}"));
+        register_with_pressure(
+            &store,
+            keyed_registration(restart, RESTARTED_KEY, 5003, 250_000, 400_000),
+            250_000,
+        )
+        .await;
+        register_with_pressure(
+            &store,
+            keyed_registration(stranger, "loadtest-direct-2", 5002, 20_000, 400_000),
+            250_000,
+        )
+        .await;
+        Self {
+            store,
+            crashed,
+            restart,
+            stranger,
+            lease,
+        }
+    }
+
+    fn succession(&self, successor: CollectorInstanceId, now: u64) -> LeaseSuccession {
+        LeaseSuccession {
+            key: self.lease.key.clone(),
+            expected_version: self.lease.lease_version,
+            predecessor_instance_id: self.crashed,
+            successor_instance_id: successor,
+            now_unix_ms: millis(now),
+            expires_at_unix_ms: millis(now + LONG_LEASE_TTL_MS),
+            minimum_snapshot_at_unix_ms: millis(now - RoutingPolicy::default().pressure.max_snapshot_age_ms),
+        }
+    }
+
+    async fn stored_lease(&self) -> RoutingLease {
+        self.store
+            .load_view(millis(250_000))
+            .await
+            .unwrap_or_else(|error| panic!("load view: {error}"))
+            .leases
+            .get(&self.lease.key)
+            .cloned()
+            .unwrap_or_else(|| panic!("fixture lease disappeared"))
+    }
+
+    async fn assert_rejected(&self, request: &LeaseSuccession, kind: RoutingErrorKind) {
+        let before = self.stored_lease().await;
+        let Err(error) = self.store.transfer_to_successor(request).await else {
+            panic!("succession must be rejected");
+        };
+        assert_eq!(error.kind(), kind);
+        assert_eq!(self.stored_lease().await, before);
+    }
+}
+
+/// Scenario: a SIGKILLed holder's registration expired while its 24-hour lease
+/// is valid, and its restart registered under the same instance key.
+/// Guarantees: the restart receives a new active lease ID with the next epoch
+/// and version, and replaying the consumed request conflicts.
+#[tokio::test]
+async fn succession_hands_crashed_holder_lease_to_same_key_restart() {
+    let fixture = CrashedHolder::new(LONG_LEASE_TTL_MS).await;
+    let request = fixture.succession(fixture.restart, 250_001);
+    let succeeded = fixture
+        .store
+        .transfer_to_successor(&request)
+        .await
+        .unwrap_or_else(|error| panic!("succession: {error}"));
+
+    assert_eq!(succeeded.key, fixture.lease.key);
+    assert_eq!(succeeded.holder_instance_id, fixture.restart);
+    assert_ne!(succeeded.lease_id, fixture.lease.lease_id);
+    assert_eq!(succeeded.fencing_epoch.get(), fixture.lease.fencing_epoch.get() + 1);
+    assert_eq!(succeeded.lease_version, fixture.lease.lease_version + 1);
+    assert_eq!(succeeded.state, LeaseState::Active);
+    assert_eq!(succeeded.issued_at_unix_ms, millis(250_001));
+    assert_eq!(succeeded.renewed_at_unix_ms, millis(250_001));
+    assert_eq!(succeeded.expires_at_unix_ms, request.expires_at_unix_ms);
+    assert_eq!(succeeded.drain_started_at_unix_ms, None);
+    assert_eq!(fixture.stored_lease().await, succeeded);
+
+    let Err(replayed) = fixture.store.transfer_to_successor(&request).await else {
+        panic!("a consumed succession version must not apply twice");
+    };
+    assert_eq!(replayed.kind(), RoutingErrorKind::Conflict);
+    assert_eq!(fixture.stored_lease().await, succeeded);
+}
+
+/// Scenario: the holder's registration is still live and ready when a router
+/// proposes succession to a same-key process.
+/// Guarantees: succession conflicts and the lease is unchanged; a live holder
+/// keeps ownership until it expires or reports a terminal state.
+#[tokio::test]
+async fn succession_rejects_predecessor_with_live_registration() {
+    let fixture = CrashedHolder::new(LONG_LEASE_TTL_MS).await;
+    fixture
+        .store
+        .heartbeat_collector(fixture.crashed, millis(249_000), millis(300_000))
+        .await
+        .unwrap_or_else(|error| panic!("extend holder registration: {error}"));
+
+    fixture
+        .assert_rejected(
+            &fixture.succession(fixture.restart, 250_001),
+            RoutingErrorKind::Conflict,
+        )
+        .await;
+}
+
+/// Scenario: the holder's registration is unexpired, but its shutdown recorded
+/// the terminal failed state before the same-key restart registered.
+/// Guarantees: a terminal predecessor counts as dead, so the restart inherits
+/// the lease without waiting for registration expiry.
+#[tokio::test]
+async fn succession_accepts_failed_predecessor_before_registration_expiry() {
+    let fixture = CrashedHolder::new(LONG_LEASE_TTL_MS).await;
+    fixture
+        .store
+        .heartbeat_collector(fixture.crashed, millis(249_000), millis(300_000))
+        .await
+        .unwrap_or_else(|error| panic!("extend holder registration: {error}"));
+    fixture
+        .store
+        .set_collector_state(fixture.crashed, CollectorState::Failed, millis(249_500))
+        .await
+        .unwrap_or_else(|error| panic!("record failed shutdown: {error}"));
+
+    let succeeded = fixture
+        .store
+        .transfer_to_successor(&fixture.succession(fixture.restart, 250_001))
+        .await
+        .unwrap_or_else(|error| panic!("succession from failed holder: {error}"));
+    assert_eq!(succeeded.holder_instance_id, fixture.restart);
+    assert_eq!(succeeded.fencing_epoch.get(), fixture.lease.fencing_epoch.get() + 1);
+}
+
+/// Scenario: the holder crashed, but the proposed successor is a healthy
+/// collector deployed under a different instance key.
+/// Guarantees: succession conflicts and the lease is unchanged because only a
+/// same-key restart replays the predecessor's durable backlog.
+#[tokio::test]
+async fn succession_rejects_successor_with_different_instance_key() {
+    let fixture = CrashedHolder::new(LONG_LEASE_TTL_MS).await;
+    fixture
+        .assert_rejected(
+            &fixture.succession(fixture.stranger, 250_001),
+            RoutingErrorKind::Conflict,
+        )
+        .await;
+}
+
+/// Scenario: the same-key restart's pressure is stale, and later it reports
+/// draining.
+/// Guarantees: succession applies the normal candidate checks and conflicts
+/// without changing the lease.
+#[tokio::test]
+async fn succession_rejects_restart_without_fresh_ready_pressure() {
+    let fixture = CrashedHolder::new(LONG_LEASE_TTL_MS).await;
+    fixture
+        .assert_rejected(
+            &fixture.succession(fixture.restart, 270_000),
+            RoutingErrorKind::Conflict,
+        )
+        .await;
+
+    fixture
+        .store
+        .set_collector_state(fixture.restart, CollectorState::Draining, millis(250_000))
+        .await
+        .unwrap_or_else(|error| panic!("drain restart: {error}"));
+    fixture
+        .assert_rejected(
+            &fixture.succession(fixture.restart, 250_001),
+            RoutingErrorKind::Conflict,
+        )
+        .await;
+}
+
+/// Scenario: a router proposes succession with a stale lease version, or names
+/// a dead same-key process that is not the current holder.
+/// Guarantees: compare-and-set evidence must match exactly, so both conflict
+/// and the lease is unchanged.
+#[tokio::test]
+async fn succession_rejects_stale_version_or_non_holder_predecessor() {
+    let fixture = CrashedHolder::new(LONG_LEASE_TTL_MS).await;
+    let mut stale = fixture.succession(fixture.restart, 250_001);
+    stale.expected_version += 1;
+    fixture.assert_rejected(&stale, RoutingErrorKind::Conflict).await;
+
+    let ghost = CollectorInstanceId::new();
+    register_with_pressure(
+        &fixture.store,
+        keyed_registration(ghost, RESTARTED_KEY, 5004, 20_000, 200_000),
+        99_500,
+    )
+    .await;
+    let mut non_holder = fixture.succession(fixture.restart, 250_001);
+    non_holder.predecessor_instance_id = ghost;
+    fixture.assert_rejected(&non_holder, RoutingErrorKind::Conflict).await;
+}
+
+/// Scenario: the crashed holder's lease expired before succession was
+/// attempted.
+/// Guarantees: succession conflicts, and the expired lease is reassigned only
+/// through the normal claim path.
+#[tokio::test]
+async fn succession_rejects_expired_lease() {
+    let fixture = CrashedHolder::new(100_000).await;
+    let request = fixture.succession(fixture.restart, 250_001);
+    fixture.assert_rejected(&request, RoutingErrorKind::Conflict).await;
+
+    let claimed = fixture
+        .store
+        .claim_lease(&LeaseClaim {
+            key: request.key.clone(),
+            candidate_instance_id: fixture.restart,
+            now_unix_ms: request.now_unix_ms,
+            expires_at_unix_ms: request.expires_at_unix_ms,
+            minimum_snapshot_at_unix_ms: request.minimum_snapshot_at_unix_ms,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("claim expired lease: {error}"));
+    assert_eq!(claimed.holder_instance_id, fixture.restart);
+}
+
+/// Scenario: a hard-pressure drain started before the holder crashed, so its
+/// draining lease can never receive a post-drain proof.
+/// Guarantees: the same-key restart takes over the draining lease as active
+/// with a new lease ID, the next epoch and version, and no drain metadata.
+#[tokio::test]
+async fn succession_takes_over_draining_lease() {
+    let fixture = CrashedHolder::new(LONG_LEASE_TTL_MS).await;
+    let draining = fixture
+        .store
+        .begin_lease_drain(&LeaseCas {
+            key: fixture.lease.key.clone(),
+            expected_version: fixture.lease.lease_version,
+            now_unix_ms: millis(100_002),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("begin drain: {error}"));
+    assert_eq!(draining.state, LeaseState::Draining);
+
+    let mut request = fixture.succession(fixture.restart, 250_001);
+    request.expected_version = draining.lease_version;
+    let succeeded = fixture
+        .store
+        .transfer_to_successor(&request)
+        .await
+        .unwrap_or_else(|error| panic!("succession from draining lease: {error}"));
+    assert_eq!(succeeded.holder_instance_id, fixture.restart);
+    assert_eq!(succeeded.state, LeaseState::Active);
+    assert_eq!(succeeded.drain_started_at_unix_ms, None);
+    assert_ne!(succeeded.lease_id, draining.lease_id);
+    assert_eq!(succeeded.fencing_epoch.get(), draining.fencing_epoch.get() + 1);
+    assert_eq!(succeeded.lease_version, draining.lease_version + 1);
+    assert_eq!(fixture.stored_lease().await, succeeded);
+}
+
+/// Scenario: a caller proposes self-succession or an empty new lease window.
+/// Guarantees: both requests fail validation as invalid configuration before
+/// any lease mutation.
+#[tokio::test]
+async fn succession_rejects_self_succession_and_empty_lease_window() {
+    let fixture = CrashedHolder::new(LONG_LEASE_TTL_MS).await;
+    let self_succession = fixture.succession(fixture.crashed, 250_001);
+    assert_eq!(
+        self_succession.validate().map_err(|error| error.kind()),
+        Err(RoutingErrorKind::InvalidConfiguration)
+    );
+    fixture
+        .assert_rejected(&self_succession, RoutingErrorKind::InvalidConfiguration)
+        .await;
+
+    let mut empty_window = fixture.succession(fixture.restart, 250_001);
+    empty_window.expires_at_unix_ms = empty_window.now_unix_ms;
+    assert_eq!(
+        empty_window.validate().map_err(|error| error.kind()),
+        Err(RoutingErrorKind::InvalidConfiguration)
+    );
+    fixture
+        .assert_rejected(&empty_window, RoutingErrorKind::InvalidConfiguration)
+        .await;
+}
+
+/// Scenario: a SIGKILLed holder's registration expired with a valid 24-hour
+/// lease while its same-key restart and a different-key collector are both
+/// eligible.
+/// Guarantees: one rebalance pass hands the lease to the restart without a
+/// drain, and new streams route there from the cache without store access.
+#[tokio::test]
+async fn rebalance_hands_crashed_holder_lease_to_same_key_restart() {
+    let fixture = CrashedHolder::new(LONG_LEASE_TTL_MS).await;
+    let engine = long_lease_engine(&fixture.store);
+    engine
+        .refresh(millis(250_001))
+        .await
+        .unwrap_or_else(|error| panic!("refresh: {error}"));
+    let Err(stranded) = engine.route_ingest(&metadata(), millis(250_001)).await else {
+        panic!("a crashed holder must not receive new streams");
+    };
+    assert_eq!(stranded.kind(), RoutingErrorKind::LeaseHolderUnavailable);
+
+    let report = engine
+        .rebalance(millis(250_002))
+        .await
+        .unwrap_or_else(|error| panic!("rebalance: {error}"));
+    assert_eq!(
+        report,
+        RebalanceReport {
+            successions_completed: 1,
+            ..RebalanceReport::default()
+        }
+    );
+
+    let before_route = fixture.store.operation_counts();
+    let routed = engine
+        .route_ingest(&metadata(), millis(250_003))
+        .await
+        .unwrap_or_else(|error| panic!("route after succession: {error}"));
+    assert_eq!(fixture.store.operation_counts(), before_route);
+    assert_eq!(routed.source, RouteSource::CachedLease);
+    assert_eq!(routed.instance_id, fixture.restart);
+    assert_eq!(routed.flight_endpoint.port(), 5003);
+    let lease = routed
+        .lease
+        .unwrap_or_else(|| panic!("succession route must carry a lease"));
+    assert_eq!(lease, fixture.stored_lease().await);
+    assert_ne!(lease.lease_id, fixture.lease.lease_id);
+    assert_eq!(lease.fencing_epoch.get(), fixture.lease.fencing_epoch.get() + 1);
+}
+
+/// Scenario: hard pressure started a drain, then the holder crashed before
+/// publishing a post-drain snapshot and restarted under the same key.
+/// Guarantees: rebalance hands the draining lease to the restart instead of
+/// waiting for a drain proof, and new streams route to the restart.
+#[tokio::test]
+async fn rebalance_hands_crashed_draining_lease_to_same_key_restart() {
+    let store = Arc::new(MemoryRoutingStore::default());
+    let crashed = CollectorInstanceId::new();
+    let restart = CollectorInstanceId::new();
+    let stranger = CollectorInstanceId::new();
+    register_with_pressure(
+        &store,
+        keyed_registration(crashed, RESTARTED_KEY, 5001, 20_000, 200_000),
+        99_000,
+    )
+    .await;
+    let engine = long_lease_engine(&store);
+    engine
+        .refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("refresh: {error}"));
+    let assigned = engine
+        .route_ingest(&metadata(), millis(100_001))
+        .await
+        .unwrap_or_else(|error| panic!("initial assignment: {error}"));
+    assert_eq!(assigned.instance_id, crashed);
+    register_with_pressure(
+        &store,
+        keyed_registration(stranger, "loadtest-direct-2", 5002, 20_000, 400_000),
+        100_002,
+    )
+    .await;
+    store
+        .publish_pressure(&snapshot(crashed, 100_003, 9_900, 1))
+        .await
+        .unwrap_or_else(|error| panic!("publish hard pressure: {error}"));
+    let drain = engine
+        .rebalance(millis(100_004))
+        .await
+        .unwrap_or_else(|error| panic!("start drain: {error}"));
+    assert_eq!(
+        drain,
+        RebalanceReport {
+            drains_started: 1,
+            ..RebalanceReport::default()
+        }
+    );
+
+    register_with_pressure(
+        &store,
+        keyed_registration(restart, RESTARTED_KEY, 5003, 250_000, 400_000),
+        250_000,
+    )
+    .await;
+    store
+        .publish_pressure(&snapshot(stranger, 250_000, 1_000, 0))
+        .await
+        .unwrap_or_else(|error| panic!("refresh stranger pressure: {error}"));
+    let report = engine
+        .rebalance(millis(250_001))
+        .await
+        .unwrap_or_else(|error| panic!("rebalance after crash: {error}"));
+    assert_eq!(
+        report,
+        RebalanceReport {
+            successions_completed: 1,
+            ..RebalanceReport::default()
+        }
+    );
+
+    let routed = engine
+        .route_ingest(&metadata(), millis(250_002))
+        .await
+        .unwrap_or_else(|error| panic!("route after succession: {error}"));
+    assert_eq!(routed.instance_id, restart);
+    let initial = assigned
+        .lease
+        .unwrap_or_else(|| panic!("initial route must carry a lease"));
+    let lease = routed
+        .lease
+        .unwrap_or_else(|| panic!("succession route must carry a lease"));
+    assert_eq!(lease.state, LeaseState::Active);
+    assert_eq!(lease.drain_started_at_unix_ms, None);
+    assert_ne!(lease.lease_id, initial.lease_id);
+    assert_eq!(lease.fencing_epoch.get(), initial.fencing_epoch.get() + 1);
+    assert_eq!(lease.lease_version, initial.lease_version + 2);
+}
+
+/// Scenario: a crashed holder has no same-key restart, only a healthy
+/// collector deployed under a different instance key.
+/// Guarantees: rebalance never attempts succession or transfer without a drain
+/// proof, so the lease stays draining with its original holder.
+#[tokio::test]
+async fn rebalance_never_moves_crashed_lease_to_different_key_without_drain_proof() {
+    let store = Arc::new(MemoryRoutingStore::default());
+    let crashed = CollectorInstanceId::new();
+    let stranger = CollectorInstanceId::new();
+    register_with_pressure(
+        &store,
+        keyed_registration(crashed, RESTARTED_KEY, 5001, 20_000, 200_000),
+        99_000,
+    )
+    .await;
+    let engine = long_lease_engine(&store);
+    engine
+        .refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("refresh: {error}"));
+    let assigned = engine
+        .route_ingest(&metadata(), millis(100_001))
+        .await
+        .unwrap_or_else(|error| panic!("initial assignment: {error}"));
+    assert_eq!(assigned.instance_id, crashed);
+    register_with_pressure(
+        &store,
+        keyed_registration(stranger, "loadtest-direct-2", 5002, 20_000, 400_000),
+        250_000,
+    )
+    .await;
+
+    let first = engine
+        .rebalance(millis(250_001))
+        .await
+        .unwrap_or_else(|error| panic!("first rebalance: {error}"));
+    assert_eq!(
+        first,
+        RebalanceReport {
+            drains_started: 1,
+            ..RebalanceReport::default()
+        }
+    );
+    let second = engine
+        .rebalance(millis(250_002))
+        .await
+        .unwrap_or_else(|error| panic!("second rebalance: {error}"));
+    assert_eq!(second, RebalanceReport::default());
+
+    let Err(draining) = engine.route_ingest(&metadata(), millis(250_003)).await else {
+        panic!("a draining lease must reject new streams");
+    };
+    assert_eq!(draining.kind(), RoutingErrorKind::LeaseDraining);
+    let counts = store.operation_counts();
+    assert_eq!(counts.succession, 0);
+    assert_eq!(counts.transfer, 0);
+    let view = store
+        .load_view(millis(250_003))
+        .await
+        .unwrap_or_else(|error| panic!("load view: {error}"));
+    let lease = view
+        .leases
+        .get(&LeaseKey::new(ImplementationPool::Direct, table()))
+        .unwrap_or_else(|| panic!("crashed holder lease disappeared"));
+    assert_eq!(lease.holder_instance_id, crashed);
+    assert_eq!(lease.state, LeaseState::Draining);
 }

@@ -2,7 +2,8 @@
 //!
 //! The request path reads an immutable cached view. SQL is consulted only when
 //! a lease is absent or expired, while the background control loop refreshes
-//! registrations, snapshots, and leases and performs fenced drain transfers.
+//! registrations, snapshots, and leases, performs fenced drain transfers, and
+//! hands crashed holders' leases to their same-instance-key restart.
 
 #![forbid(unsafe_code)]
 
@@ -23,4 +24,4 @@ pub use model::{
 };
 pub use selection::{collector_is_eligible, rank_collectors};
 pub use sql_server::{SqlServerRoutingConfig, SqlServerRoutingStore};
-pub use store::{LeaseCas, LeaseClaim, LeaseTransfer, RoutingStore};
+pub use store::{LeaseCas, LeaseClaim, LeaseSuccession, LeaseTransfer, RoutingStore};

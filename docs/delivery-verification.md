@@ -42,12 +42,15 @@ Generated evidence is local and gitignored.
 - **One-owner hot-table limit:** routing assigns one owner for each
   pool/table. Additional replicas distribute different tables but do not
   concurrently write one hot table inside the same pool.
-- **DFE best effort:** successful Flight completion confirms bounded DFE
-  admission only. It provides no SQL receipt, polling, purge signal, or
-  at-least-once guarantee.
-- **Arbitrary-Arrow Quiver gap:** native Quiver persistence is explicitly
-  unsupported for `arrowcol.flight@1.0` and direct arbitrary-Arrow receipt
-  state. Configuration fails instead of claiming lossy durability.
+- **DFE best effort by default:** without native Quiver, successful Flight
+  completion confirms bounded DFE admission only. It provides no SQL receipt,
+  polling, purge signal, or at-least-once guarantee.
+- **Native Quiver is local-disk durability:** with native Quiver, both pools
+  fsync each `arrowcol.flight@1.1` or Direct receipt batch to a local Quiver WAL
+  before acknowledging it. They replay it after a crash at least once, without
+  deduplication. Losing the disk loses the pending batches.
+  `loadtest:e2e` kills both collectors mid-load and validates every
+  acknowledged row.
 - **Publication status:** local image builds and smoke tests use `:dev`. No
   GHCR image is published until the GitHub publication workflow runs and
   verifies its remote manifests.

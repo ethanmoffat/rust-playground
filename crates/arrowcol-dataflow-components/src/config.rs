@@ -12,8 +12,6 @@ use arrowcol_protocol::{PositiveMeasurement, UnixMillis};
 use arrowcol_routing::{MemoryRoutingStore, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
 use serde::Deserialize;
 
-use crate::QUIVER_UNSUPPORTED_GAP;
-
 fn default_connect_timeout() -> Duration {
     Duration::from_secs(15)
 }
@@ -412,7 +410,14 @@ pub struct FlightReceiverConfig {
     /// Flight resource limits.
     #[serde(default)]
     pub limits: RuntimeLimitsConfig,
-    /// Requests native durable-buffer persistence. Currently rejected fail-closed.
+    /// Enables durable admission through native Quiver persistence.
+    ///
+    /// The topology must route this receiver into a `processor:durable_buffer`
+    /// (ideally configured with `wal_flush_interval: 0s`). A Flight `DoPut`
+    /// then completes with `durable_admission` only after the durable buffer
+    /// acknowledged every batch of the stream; a rejection or
+    /// `limits.admission_timeout` fails the stream with a retryable error.
+    /// When `false`, completion stays `best_effort_admission`.
     #[serde(default)]
     pub native_quiver: bool,
 }
@@ -424,9 +429,6 @@ impl FlightReceiverConfig {
             || self.listening_addr == self.admin_listening_addr
         {
             return Err("Flight and admin listeners must use distinct nonzero ports".to_owned());
-        }
-        if self.native_quiver {
-            return Err(QUIVER_UNSUPPORTED_GAP.to_owned());
         }
         self.catalog.validate()?;
         self.routing.validate()?;

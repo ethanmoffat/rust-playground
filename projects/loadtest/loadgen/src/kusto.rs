@@ -552,7 +552,12 @@ impl LiveSync {
                     }
                 }
                 let final_sync = tokio::time::timeout(arguments.drain_timeout.get(), async {
-                    settle_dataflow(&arguments.dataflow_admin_endpoints, arguments.drain_timeout.get()).await?;
+                    settle_dataflow(
+                        &arguments.dataflow_admin_endpoints,
+                        arguments.drain_timeout.get(),
+                        arguments.quiver,
+                    )
+                    .await?;
                     mirror
                         .sync_roots(&arguments.direct_root, &arguments.dataflow_root, &active, true)
                         .await
@@ -582,12 +587,14 @@ impl LiveSync {
     }
 }
 
-pub(crate) async fn settle_dataflow(endpoints: &[String], timeout: Duration) -> Result<()> {
+pub(crate) async fn settle_dataflow(endpoints: &[String], timeout: Duration, quiver: bool) -> Result<()> {
     ensure!(!endpoints.is_empty(), "Dataflow publication endpoints are missing");
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let deadline = Instant::now() + timeout;
+    let mut replay = ReplayQuiescence::default();
     loop {
         let mut settled = true;
+        let mut replay_counters = Vec::new();
         for endpoint in endpoints {
             let response = client
                 .get(format!("{}/metrics", endpoint.trim_end_matches('/')))
@@ -595,6 +602,18 @@ pub(crate) async fn settle_dataflow(endpoints: &[String], timeout: Duration) -> 
                 .await?;
             let text = response.error_for_status()?.text().await?;
             settled &= publication_idle(&text)?;
+            if quiver {
+                settled &= metric_value(&text, "arrowcol_dataflow_durable_backlog_batches")? == 0;
+                for name in [
+                    "arrowcol_dataflow_replayed_batches_total",
+                    "arrowcol_dataflow_replay_deferred_total",
+                ] {
+                    replay_counters.push(metric_value(&text, name)?);
+                }
+            }
+        }
+        if quiver {
+            settled = replay.observe(settled, replay_counters, Instant::now());
         }
         if settled {
             return Ok(());
@@ -614,14 +633,40 @@ fn publication_idle(metrics: &str) -> Result<bool> {
         "arrowcol_dfe_buffered_batches",
         "arrowcol_delta_pending_commits",
     ] {
-        let value = metrics
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{name} ")))
-            .with_context(|| format!("missing publication metric {name}"))?
-            .parse::<u64>()?;
-        idle &= value == 0;
+        idle &= metric_value(metrics, name)? == 0;
     }
     Ok(idle)
+}
+
+fn metric_value(metrics: &str, name: &str) -> Result<u64> {
+    Ok(metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .with_context(|| format!("missing publication metric {name}"))?
+        .parse::<u64>()?)
+}
+
+/// How long Quiver replay counters must stay unchanged before durable Dataflow output is frozen.
+const REPLAY_QUIET_PERIOD: Duration = Duration::from_secs(5);
+
+/// Batches replayed from a predecessor's Quiver WAL bypass the in-memory publication gauges, so a
+/// durable run additionally waits until replay activity stops before snapshots are captured.
+#[derive(Default)]
+struct ReplayQuiescence {
+    last: Option<Vec<u64>>,
+    quiet_since: Option<Instant>,
+}
+
+impl ReplayQuiescence {
+    fn observe(&mut self, idle: bool, counters: Vec<u64>, now: Instant) -> bool {
+        let unchanged = self.last.as_ref() == Some(&counters);
+        self.last = Some(counters);
+        if !idle || !unchanged {
+            self.quiet_since = None;
+            return false;
+        }
+        now.duration_since(*self.quiet_since.get_or_insert(now)) >= REPLAY_QUIET_PERIOD
+    }
 }
 
 fn captured_inventory(snapshot: &SnapshotSummary) -> SnapshotInventory {
@@ -976,6 +1021,30 @@ mod tests {
         )?);
         assert!(publication_idle("").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn durable_settle_waits_for_quiver_replay_to_stop() {
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let mut replay = ReplayQuiescence::default();
+        assert!(
+            !replay.observe(true, vec![1, 0], at(0)),
+            "first observation has no baseline"
+        );
+        assert!(!replay.observe(true, vec![1, 0], at(1)));
+        assert!(
+            !replay.observe(true, vec![2, 0], at(5)),
+            "a replay restarts the quiet period"
+        );
+        assert!(!replay.observe(true, vec![2, 0], at(6)));
+        assert!(
+            !replay.observe(false, vec![2, 0], at(12)),
+            "in-memory work restarts the quiet period"
+        );
+        assert!(!replay.observe(true, vec![2, 0], at(13)));
+        assert!(!replay.observe(true, vec![2, 0], at(17)));
+        assert!(replay.observe(true, vec![2, 0], at(18)));
     }
 
     #[test]

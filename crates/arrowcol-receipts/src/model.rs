@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use arrowcol_catalog::{SchemaVersion, ValidatedIncomingSchema};
 use arrowcol_protocol::{
     CollectorInstanceId, DeltaPublicationResult, ErrorStatus, ImplementationPool, LeaseId, Measurement,
@@ -6,6 +8,11 @@ use arrowcol_protocol::{
 use uuid::Uuid;
 
 use crate::{ReceiptError, ReceiptErrorKind, ReceiptResult};
+
+/// Largest durable recovery window an owner may register: one day.
+///
+/// Matches the `CK_collector_instances_recovery_window` SQL constraint.
+pub const MAX_DURABLE_RECOVERY_WINDOW_MS: u64 = 86_400_000;
 
 /// Immutable delivery metadata admitted only after catalog schema validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,10 +31,43 @@ impl ValidatedDelivery {
     ///
     /// # Errors
     ///
-    /// Returns an invalid-configuration error when a count exceeds the shared
-    /// SQL/wire measurement range.
+    /// Returns an invalid-configuration error for zero batches or when a count
+    /// exceeds the shared SQL/wire measurement range.
     pub fn new(
         validation: &ValidatedIncomingSchema,
+        rows: u64,
+        batches: u64,
+        arrow_memory_bytes: u64,
+    ) -> ReceiptResult<Self> {
+        let registered = validation.registered();
+        Self::recovered(
+            registered.table_id(),
+            registered.identity().clone(),
+            registered.version(),
+            registered.fingerprint(),
+            rows,
+            batches,
+            arrow_memory_bytes,
+        )
+    }
+
+    /// Rebuilds a delivery whose schema was validated before the batch was
+    /// persisted to the collector's local durable buffer.
+    ///
+    /// Use this only for crash replay of batches that were admitted through
+    /// [`Self::new`]; persist the values returned by this type's getters.
+    /// Receipt creation still requires the table, schema version, and
+    /// fingerprint to be registered and to match the caller's table lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-configuration error for zero batches or counts outside
+    /// the shared SQL/wire measurement range (same rules as `new`).
+    pub fn recovered(
+        table_id: Uuid,
+        table: TableIdentity,
+        schema_version: SchemaVersion,
+        schema_fingerprint: arrowcol_protocol::SchemaFingerprint,
         rows: u64,
         batches: u64,
         arrow_memory_bytes: u64,
@@ -38,12 +78,11 @@ impl ValidatedDelivery {
                 "validated delivery must contain at least one record batch",
             ));
         }
-        let registered = validation.registered();
         Ok(Self {
-            table_id: registered.table_id(),
-            table: registered.identity().clone(),
-            schema_version: registered.version(),
-            schema_fingerprint: registered.fingerprint(),
+            table_id,
+            table,
+            schema_version,
+            schema_fingerprint,
             rows: measurement(rows, "row count")?,
             batches: measurement(batches, "batch count")?,
             arrow_memory_bytes: measurement(arrow_memory_bytes, "Arrow memory byte count")?,
@@ -310,6 +349,17 @@ pub struct OwnerRegistration {
     pub started_at_unix_ms: UnixMillis,
     /// Exclusive owner lease deadline.
     pub lease_deadline_unix_ms: UnixMillis,
+    /// Optional durable-buffer recovery window in milliseconds.
+    ///
+    /// `Some(window)` declares that the owner persists accepted batches and
+    /// their receipt identities locally. Expiry reconciliation then skips the
+    /// owner's active receipts while its owner lease is unexpired and for
+    /// `window` milliseconds after that lease expires, so durable backlog may
+    /// outlive receipt deadlines and a restarted same-key successor can adopt
+    /// it with [`crate::ReceiptStore::adopt_receipts`]. `None` keeps
+    /// receipt-deadline reconciliation. At most
+    /// [`MAX_DURABLE_RECOVERY_WINDOW_MS`].
+    pub durable_recovery_window_ms: Option<u64>,
 }
 
 /// Request to acquire a new monotonically fenced table lease.
@@ -354,6 +404,153 @@ pub struct ReconciliationReport {
     pub reconciled: Vec<ReceiptRecord>,
     /// True when the caller's limit was filled and more work may remain.
     pub limit_reached: bool,
+}
+
+/// Last known identity of one receipt that a successor asks to adopt.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AdoptionCandidate {
+    /// Server-generated receipt identifier.
+    pub receipt_id: ReceiptId,
+    /// Owner expected to hold the receipt: a failed or stopped same-key
+    /// predecessor, or the successor itself when rebinding to a newer lease.
+    pub expected_owner: CollectorInstanceId,
+    /// Expected active state: accepted, buffered, or publishing (SQL `flushing`).
+    pub expected_state: ReceiptState,
+    /// Expected revision, which must agree with the state (0, 1, or 2).
+    pub expected_revision: u64,
+}
+
+impl AdoptionCandidate {
+    /// Creates an optimistic adoption expectation.
+    #[must_use]
+    pub const fn new(
+        receipt_id: ReceiptId,
+        expected_owner: CollectorInstanceId,
+        expected_state: ReceiptState,
+        expected_revision: u64,
+    ) -> Self {
+        Self {
+            receipt_id,
+            expected_owner,
+            expected_state,
+            expected_revision,
+        }
+    }
+
+    /// Expects the current owner, state, and revision of a durable record.
+    #[must_use]
+    pub fn from_record(record: &ReceiptRecord) -> Self {
+        Self::new(
+            record.receipt_id,
+            record.owner_instance_id,
+            record.state,
+            record.revision,
+        )
+    }
+
+    /// Returns whether `record` still has the expected owner, state, and revision.
+    #[must_use]
+    pub fn matches(&self, record: &ReceiptRecord) -> bool {
+        record.receipt_id == self.receipt_id
+            && record.owner_instance_id == self.expected_owner
+            && record.state == self.expected_state
+            && record.revision == self.expected_revision
+    }
+}
+
+/// Request to rebind recovered active receipts to a successor's table lease.
+///
+/// See [`crate::ReceiptStore::adopt_receipts`] for the adoption rules.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptAdoption {
+    /// Registered successor that becomes the receipt owner.
+    pub successor: CollectorInstanceId,
+    /// Successor's current SQL table lease for the candidates' table.
+    pub lease: TableLease,
+    /// New exclusive receipt deadline, bounded by the owner and table leases.
+    pub lease_deadline: UnixMillis,
+    /// Adoption time recorded as the receipt heartbeat and update time.
+    pub adopted_at: UnixMillis,
+    /// Receipts to adopt, each with its optimistic expectation.
+    pub receipts: Vec<AdoptionCandidate>,
+}
+
+impl ReceiptAdoption {
+    /// Validates store-independent request invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns fenced when the lease is not held by the successor. Returns
+    /// invalid configuration when the deadline does not follow `adopted_at`
+    /// or outlives the table lease, or when a candidate is duplicated or does
+    /// not expect accepted/0, buffered/1, or publishing/2.
+    pub fn validate(&self) -> ReceiptResult<()> {
+        if self.lease.holder_instance_id() != self.successor {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::Fenced,
+                "adoption lease is not held by the successor owner",
+            ));
+        }
+        if self.lease_deadline <= self.adopted_at {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::InvalidConfiguration,
+                "receipt adoption deadline must follow the adoption time",
+            ));
+        }
+        if self.lease_deadline > self.lease.expires_at_unix_ms() {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::InvalidConfiguration,
+                "receipt lease cannot outlive its table lease",
+            ));
+        }
+        let mut seen = HashSet::with_capacity(self.receipts.len());
+        for candidate in &self.receipts {
+            if active_revision(candidate.expected_state) != Some(candidate.expected_revision) {
+                return Err(ReceiptError::new(
+                    ReceiptErrorKind::InvalidConfiguration,
+                    format!(
+                        "adoption candidate {} must expect accepted/0, buffered/1, or publishing/2",
+                        candidate.receipt_id
+                    ),
+                ));
+            }
+            if !seen.insert(candidate.receipt_id) {
+                return Err(ReceiptError::new(
+                    ReceiptErrorKind::InvalidConfiguration,
+                    format!("adoption candidate {} is duplicated", candidate.receipt_id),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Candidate left unchanged by an adoption request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RejectedAdoption {
+    /// Candidate receipt identifier.
+    pub receipt_id: ReceiptId,
+    /// Current durable record, or `None` when the receipt does not exist.
+    pub current: Option<ReceiptRecord>,
+}
+
+/// Outcome of one atomic adoption request.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReceiptAdoptionReport {
+    /// Receipts now owned by the successor, in request order.
+    pub adopted: Vec<ReceiptRecord>,
+    /// Candidates whose expectation, lease, or owner lineage did not hold, in
+    /// request order.
+    pub rejected: Vec<RejectedAdoption>,
+}
+
+const fn active_revision(state: ReceiptState) -> Option<u64> {
+    match state {
+        ReceiptState::Accepted => Some(0),
+        ReceiptState::Buffered => Some(1),
+        ReceiptState::Publishing => Some(2),
+        ReceiptState::Published | ReceiptState::Failed | ReceiptState::PublicationUnknown => None,
+    }
 }
 
 fn transition(

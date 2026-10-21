@@ -12,9 +12,10 @@ use tiberius::{IsolationLevel, Row, ToSql};
 use uuid::Uuid;
 
 use crate::{
-    FailureDisposition, OwnerDrain, OwnerRegistration, PublicationBatch, ReceiptError, ReceiptErrorKind,
-    ReceiptFailure, ReceiptRecord, ReceiptResult, ReceiptStore, ReceiptVersion, ReconciliationReport,
-    TableLeaseRequest, ValidatedDelivery,
+    FailureDisposition, MAX_DURABLE_RECOVERY_WINDOW_MS, OwnerDrain, OwnerRegistration, PublicationBatch,
+    ReceiptAdoption, ReceiptAdoptionReport, ReceiptError, ReceiptErrorKind, ReceiptFailure, ReceiptRecord,
+    ReceiptResult, ReceiptStore, ReceiptVersion, ReconciliationReport, RejectedAdoption, TableLeaseRequest,
+    ValidatedDelivery,
 };
 
 const RECEIPT_COLUMNS: &str = "\
@@ -152,17 +153,23 @@ impl SqlServerReceiptConfig {
 }
 
 /// SQL Server-backed receipt store over the Arrowcol application database.
+///
+/// Transactions chosen as deadlock victims (SQL error 1205) are rolled back by
+/// the server and retried a few times before the error is surfaced. Every
+/// operation runs at most one transaction, so a retry never repeats committed
+/// work.
 #[derive(Clone)]
 pub struct SqlServerReceiptStore {
-    config: SqlServerReceiptConfig,
-    pool: Option<SqlPool>,
+    inner: RawSqlReceiptStore,
 }
 
 impl SqlServerReceiptStore {
     /// Creates a receipt store.
     #[must_use]
     pub const fn new(config: SqlServerReceiptConfig) -> Self {
-        Self { config, pool: None }
+        Self {
+            inner: RawSqlReceiptStore { config, pool: None },
+        }
     }
 
     /// Uses a shared pool with the same credentials, TLS policy, and timeouts.
@@ -175,16 +182,149 @@ impl SqlServerReceiptStore {
     ///
     /// Rejects a pool whose connection configuration differs from this store.
     pub fn with_pool(mut self, pool: SqlPool) -> ReceiptResult<Self> {
-        if !pool.matches_config(&self.config.connection_config()) {
+        if !pool.matches_config(&self.inner.config.connection_config()) {
             return Err(ReceiptError::new(
                 ReceiptErrorKind::InvalidConfiguration,
                 "SQL Server pool configuration does not match store configuration",
             ));
         }
-        self.pool = Some(pool);
+        self.inner.pool = Some(pool);
         Ok(self)
     }
+}
 
+const DEADLOCK_ATTEMPTS: u32 = 6;
+
+async fn retry_deadlock<T, F, Fut>(mut operation: F) -> ReceiptResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ReceiptResult<T>>,
+{
+    let mut attempt = 1;
+    loop {
+        match operation().await {
+            Err(error) if attempt < DEADLOCK_ATTEMPTS && is_deadlock_victim(&error) => {
+                tokio::time::sleep(Duration::from_millis(25 * u64::from(attempt))).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+fn is_deadlock_victim(error: &ReceiptError) -> bool {
+    error.kind() == ReceiptErrorKind::Database && error.to_string().contains("deadlock victim")
+}
+
+#[async_trait]
+impl ReceiptStore for SqlServerReceiptStore {
+    async fn register_owner(&self, registration: OwnerRegistration) -> ReceiptResult<()> {
+        retry_deadlock(|| self.inner.register_owner(registration.clone())).await
+    }
+
+    async fn heartbeat_owner(&self, owner: CollectorInstanceId, lease_deadline: UnixMillis) -> ReceiptResult<()> {
+        retry_deadlock(|| self.inner.heartbeat_owner(owner, lease_deadline)).await
+    }
+
+    async fn start_owner_drain(&self, owner: CollectorInstanceId) -> ReceiptResult<OwnerDrain> {
+        retry_deadlock(|| self.inner.start_owner_drain(owner)).await
+    }
+
+    async fn finish_owner_drain(&self, owner: CollectorInstanceId, stopped_at: UnixMillis) -> ReceiptResult<()> {
+        retry_deadlock(|| self.inner.finish_owner_drain(owner, stopped_at)).await
+    }
+
+    async fn acquire_table_lease(&self, request: TableLeaseRequest) -> ReceiptResult<TableLease> {
+        retry_deadlock(|| self.inner.acquire_table_lease(request.clone())).await
+    }
+
+    async fn renew_table_lease(&self, lease: &TableLease, expires_at: UnixMillis) -> ReceiptResult<TableLease> {
+        retry_deadlock(|| self.inner.renew_table_lease(lease, expires_at)).await
+    }
+
+    async fn release_table_lease(&self, lease: &TableLease, released_at: UnixMillis) -> ReceiptResult<()> {
+        retry_deadlock(|| self.inner.release_table_lease(lease, released_at)).await
+    }
+
+    async fn create_flight_batch(
+        &self,
+        owner: CollectorInstanceId,
+        lease: &TableLease,
+        lease_deadline: UnixMillis,
+        deliveries: &[ValidatedDelivery],
+    ) -> ReceiptResult<Vec<ReceiptRecord>> {
+        retry_deadlock(|| self.inner.create_flight_batch(owner, lease, lease_deadline, deliveries)).await
+    }
+
+    async fn mark_buffered(
+        &self,
+        owner: CollectorInstanceId,
+        receipts: &[ReceiptVersion],
+        lease_deadline: UnixMillis,
+    ) -> ReceiptResult<Vec<ReceiptRecord>> {
+        retry_deadlock(|| self.inner.mark_buffered(owner, receipts, lease_deadline)).await
+    }
+
+    async fn mark_flushing(
+        &self,
+        owner: CollectorInstanceId,
+        receipts: &[ReceiptVersion],
+        lease_deadline: UnixMillis,
+    ) -> ReceiptResult<Vec<ReceiptRecord>> {
+        retry_deadlock(|| self.inner.mark_flushing(owner, receipts, lease_deadline)).await
+    }
+
+    async fn heartbeat_receipts(
+        &self,
+        owner: CollectorInstanceId,
+        receipts: &[ReceiptVersion],
+        lease_deadline: UnixMillis,
+    ) -> ReceiptResult<()> {
+        retry_deadlock(|| self.inner.heartbeat_receipts(owner, receipts, lease_deadline)).await
+    }
+
+    async fn publish_commit(
+        &self,
+        owner: CollectorInstanceId,
+        batch: &PublicationBatch,
+    ) -> ReceiptResult<Vec<ReceiptRecord>> {
+        retry_deadlock(|| self.inner.publish_commit(owner, batch)).await
+    }
+
+    async fn fail_batch(
+        &self,
+        owner: CollectorInstanceId,
+        receipts: &[ReceiptVersion],
+        failure: &ReceiptFailure,
+        failed_at: UnixMillis,
+    ) -> ReceiptResult<Vec<ReceiptRecord>> {
+        retry_deadlock(|| self.inner.fail_batch(owner, receipts, failure, failed_at)).await
+    }
+
+    async fn receipt(&self, receipt_id: ReceiptId) -> ReceiptResult<Option<ReceiptRecord>> {
+        retry_deadlock(|| self.inner.receipt(receipt_id)).await
+    }
+
+    async fn receipts(&self, receipt_ids: &[ReceiptId]) -> ReceiptResult<Vec<Option<ReceiptRecord>>> {
+        retry_deadlock(|| self.inner.receipts(receipt_ids)).await
+    }
+
+    async fn reconcile_expired(&self, now: UnixMillis, limit: usize) -> ReceiptResult<ReconciliationReport> {
+        retry_deadlock(|| self.inner.reconcile_expired(now, limit)).await
+    }
+
+    async fn adopt_receipts(&self, request: &ReceiptAdoption) -> ReceiptResult<ReceiptAdoptionReport> {
+        retry_deadlock(|| self.inner.adopt_receipts(request)).await
+    }
+}
+
+#[derive(Clone)]
+struct RawSqlReceiptStore {
+    config: SqlServerReceiptConfig,
+    pool: Option<SqlPool>,
+}
+
+impl RawSqlReceiptStore {
     async fn connect(&self) -> ReceiptResult<SqlConnection> {
         match &self.pool {
             Some(pool) => pool.acquire().await,
@@ -208,7 +348,7 @@ impl SqlServerReceiptStore {
 }
 
 #[async_trait]
-impl ReceiptStore for SqlServerReceiptStore {
+impl ReceiptStore for RawSqlReceiptStore {
     async fn register_owner(&self, registration: OwnerRegistration) -> ReceiptResult<()> {
         if registration.generation == 0 || registration.instance_key.is_empty() || registration.instance_key.len() > 200
         {
@@ -231,6 +371,10 @@ impl ReceiptStore for SqlServerReceiptStore {
                 "owner lease deadline must be later than registration",
             ));
         }
+        let recovery_window = registration
+            .durable_recovery_window_ms
+            .map(recovery_window_i32)
+            .transpose()?;
         let instance = registration.instance_id.as_uuid();
         let mut client = self.connect().await?;
         let result: ReceiptResult<_> = async {
@@ -298,8 +442,8 @@ impl ReceiptStore for SqlServerReceiptStore {
                     .execute(
                         "INSERT INTO arrowcol.collector_instances ( \
                         instance_id, instance_key, generation, state, host_name, build_version, \
-                        started_at_utc, heartbeat_at_utc, lease_expires_at_utc \
-                     ) VALUES (@P1, @P2, @P3, 'active', @P4, @P5, @P6, @P6, @P7);",
+                        started_at_utc, heartbeat_at_utc, lease_expires_at_utc, durable_recovery_window_ms \
+                     ) VALUES (@P1, @P2, @P3, 'active', @P4, @P5, @P6, @P6, @P7, @P8);",
                         &[
                             &instance,
                             &registration.instance_key,
@@ -308,6 +452,7 @@ impl ReceiptStore for SqlServerReceiptStore {
                             &registration.build_version,
                             &started,
                             &deadline,
+                            &recovery_window,
                         ],
                     )
                     .await
@@ -1203,13 +1348,17 @@ impl ReceiptStore for SqlServerReceiptStore {
             let result = async {
                 let rows = client
                     .query(
-                        "SELECT TOP (@P1) receipt_id, owner_instance_id, revision, state \
-                     FROM arrowcol.delivery_receipts WITH ( \
+                        format!(
+                            "SELECT TOP (@P1) r.receipt_id, r.owner_instance_id, r.revision, r.state \
+                     FROM arrowcol.delivery_receipts AS r WITH ( \
                          INDEX(IX_delivery_receipts_expiry_active), UPDLOCK, READPAST, ROWLOCK \
                      ) \
-                     WHERE receipt_lease_deadline_utc <= @P2 \
-                       AND state IN ('accepted', 'buffered', 'flushing') \
-                     ORDER BY receipt_lease_deadline_utc, receipt_id;",
+                     WHERE r.receipt_lease_deadline_utc <= @P2 \
+                       AND r.state IN ('accepted', 'buffered', 'flushing') \
+                       AND {} \
+                     ORDER BY r.receipt_lease_deadline_utc, r.receipt_id;",
+                            outside_durable_recovery_window("r", "@P2")
+                        ),
                         &[&limit_i32, &now],
                     )
                     .await
@@ -1218,6 +1367,19 @@ impl ReceiptStore for SqlServerReceiptStore {
                     .await
                     .map_err(|cause| database_error("read expired receipts", cause))?;
                 let mut ids = Vec::with_capacity(rows.len());
+                let reconcile = format!(
+                    "UPDATE r \
+                     SET state = @P6, revision = r.revision + 1, updated_at_utc = @P4, \
+                         heartbeat_at_utc = @P4, failure_disposition = @P7, \
+                         error_code = @P8, error_message = @P9, \
+                         retry_after_ms = NULL \
+                     OUTPUT INSERTED.receipt_id \
+                     FROM arrowcol.delivery_receipts AS r \
+                     WHERE r.receipt_id = @P1 AND r.owner_instance_id = @P2 AND r.revision = @P3 \
+                       AND r.state = @P5 AND r.receipt_lease_deadline_utc <= @P4 \
+                       AND {};",
+                    outside_durable_recovery_window("r", "@P4")
+                );
                 for row in rows {
                     let id = required_uuid(&row, "receipt_id")?;
                     let owner = required_uuid(&row, "owner_instance_id")?;
@@ -1242,14 +1404,7 @@ impl ReceiptStore for SqlServerReceiptStore {
                     };
                     let updated = client
                         .query(
-                            "UPDATE arrowcol.delivery_receipts \
-                         SET state = @P6, revision = revision + 1, updated_at_utc = @P4, \
-                             heartbeat_at_utc = @P4, failure_disposition = @P7, \
-                             error_code = @P8, error_message = @P9, \
-                             retry_after_ms = NULL \
-                         OUTPUT INSERTED.receipt_id \
-                         WHERE receipt_id = @P1 AND owner_instance_id = @P2 AND revision = @P3 \
-                           AND state = @P5 AND receipt_lease_deadline_utc <= @P4;",
+                            reconcile.as_str(),
                             &[
                                 &id,
                                 &owner,
@@ -1296,6 +1451,164 @@ impl ReceiptStore for SqlServerReceiptStore {
         if let Err(error) = client.finish().await {
             tracing::warn!(
                 operation = "reconcile_expired",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn adopt_receipts(&self, request: &ReceiptAdoption) -> ReceiptResult<ReceiptAdoptionReport> {
+        self.mutation_bound(request.receipts.len())?;
+        request.validate()?;
+        if request.receipts.is_empty() {
+            return Ok(ReceiptAdoptionReport::default());
+        }
+        let successor = request.successor.as_uuid();
+        let lease_uuid = request.lease.lease_id().as_uuid();
+        let epoch = i64::try_from(request.lease.fencing_token().get()).map_err(|_| {
+            ReceiptError::new(
+                ReceiptErrorKind::InvalidConfiguration,
+                "fencing epoch exceeds SQL bigint",
+            )
+        })?;
+        let deadline = datetime(request.lease_deadline)?;
+        let adopted_at = datetime(request.adopted_at)?;
+        let pool = request.lease.implementation_pool().to_string();
+        let table = request.lease.table();
+        let catalog = table.catalog().to_string();
+        let schema = table.schema().to_string();
+        let table_name = table.table().to_string();
+        let mut client = self.connect().await?;
+        let result: ReceiptResult<_> = async {
+            client
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|cause| database_error("begin receipt adoption", cause))?;
+            let result = async {
+                let authority = client
+                    .query(
+                        "SELECT l.lease_id \
+                     FROM arrowcol.table_leases AS l WITH (UPDLOCK, HOLDLOCK) \
+                     INNER JOIN arrowcol.collector_instances AS i WITH (UPDLOCK, HOLDLOCK) \
+                       ON i.instance_id = l.holder_instance_id \
+                     INNER JOIN arrowcol.catalog_tables AS t ON t.table_id = l.table_id \
+                     WHERE l.lease_id = @P1 AND l.holder_instance_id = @P2 AND l.fencing_epoch = @P3 \
+                       AND l.released_at_utc IS NULL AND l.expires_at_utc > SYSUTCDATETIME() \
+                       AND @P4 <= l.expires_at_utc \
+                       AND i.state = 'active' AND i.stopped_at_utc IS NULL \
+                       AND i.lease_expires_at_utc > SYSUTCDATETIME() AND @P4 <= i.lease_expires_at_utc \
+                       AND t.catalog_name = @P5 AND t.schema_name = @P6 AND t.table_name = @P7;",
+                        &[
+                            &lease_uuid,
+                            &successor,
+                            &epoch,
+                            &deadline,
+                            &catalog,
+                            &schema,
+                            &table_name,
+                        ],
+                    )
+                    .await
+                    .map_err(|cause| database_error("lock receipt adoption lease", cause))?
+                    .into_row()
+                    .await
+                    .map_err(|cause| database_error("read receipt adoption lease", cause))?;
+                if authority.is_none() {
+                    return Err(ReceiptError::new(
+                        ReceiptErrorKind::Fenced,
+                        "successor owner or table lease is not active for the adoption deadline",
+                    ));
+                }
+                let mut adopted_ids = Vec::with_capacity(request.receipts.len());
+                let mut rejected_ids = Vec::new();
+                for candidate in &request.receipts {
+                    let id = candidate.receipt_id.as_uuid();
+                    let expected_owner = candidate.expected_owner.as_uuid();
+                    let state = active_state_name(candidate.expected_state)?;
+                    let revision = revision_i64(candidate.expected_revision)?;
+                    let row = client
+                        .query(
+                            "UPDATE r \
+                         SET owner_instance_id = @P2, lease_id = @P6, fencing_epoch = @P7, \
+                             receipt_lease_deadline_utc = @P8, heartbeat_at_utc = @P9, updated_at_utc = @P9 \
+                         OUTPUT DELETED.fencing_epoch AS previous_fencing_epoch \
+                         FROM arrowcol.delivery_receipts AS r \
+                         INNER JOIN arrowcol.collector_instances AS predecessor \
+                           ON predecessor.instance_id = r.owner_instance_id \
+                         INNER JOIN arrowcol.collector_instances AS successor ON successor.instance_id = @P2 \
+                         INNER JOIN arrowcol.table_leases AS l \
+                           ON l.table_id = r.table_id AND l.fencing_epoch = @P7 \
+                          AND l.lease_id = @P6 AND l.holder_instance_id = @P2 \
+                         WHERE r.receipt_id = @P1 AND r.owner_instance_id = @P3 \
+                           AND r.state = @P4 AND r.revision = @P5 \
+                           AND r.state IN ('accepted', 'buffered', 'flushing') \
+                           AND r.implementation_pool = @P10 AND r.created_at_utc <= @P9 \
+                           AND successor.state = 'active' AND successor.stopped_at_utc IS NULL \
+                           AND successor.lease_expires_at_utc > SYSUTCDATETIME() \
+                           AND @P8 <= successor.lease_expires_at_utc \
+                           AND l.released_at_utc IS NULL AND l.expires_at_utc > SYSUTCDATETIME() \
+                           AND @P8 <= l.expires_at_utc \
+                           AND ( \
+                               r.owner_instance_id = @P2 \
+                               OR ( \
+                                   predecessor.instance_key = successor.instance_key \
+                                   AND predecessor.generation < successor.generation \
+                                   AND (predecessor.state = 'failed' OR predecessor.stopped_at_utc IS NOT NULL) \
+                               ) \
+                           );",
+                            &[
+                                &id,
+                                &successor,
+                                &expected_owner,
+                                &state,
+                                &revision,
+                                &lease_uuid,
+                                &epoch,
+                                &deadline,
+                                &adopted_at,
+                                &pool,
+                            ],
+                        )
+                        .await
+                        .map_err(|cause| database_error("adopt delivery receipt", cause))?
+                        .into_row()
+                        .await
+                        .map_err(|cause| database_error("read adopted receipt", cause))?;
+                    let Some(row) = row else {
+                        rejected_ids.push(candidate.receipt_id);
+                        continue;
+                    };
+                    let previous_epoch = required_i64(&row, "previous_fencing_epoch")?;
+                    let detail = if expected_owner == successor {
+                        format!("owner rebound receipt from fencing epoch {previous_epoch} to {epoch}")
+                    } else {
+                        format!(
+                            "successor generation adopted receipt from a failed or stopped predecessor; \
+                             fencing epoch {previous_epoch} to {epoch}"
+                        )
+                    };
+                    insert_adoption_event(&mut client, id, revision, state, successor, expected_owner, &detail).await?;
+                    adopted_ids.push(candidate.receipt_id);
+                }
+                let adopted = receipts_with_client(&mut client, &adopted_ids).await?;
+                let current = receipts_optional_with_client(&mut client, &rejected_ids).await?;
+                let rejected = rejected_ids
+                    .into_iter()
+                    .zip(current)
+                    .map(|(receipt_id, current)| RejectedAdoption { receipt_id, current })
+                    .collect();
+                Ok(ReceiptAdoptionReport { adopted, rejected })
+            }
+            .await;
+            finish_transaction(&mut client, result, "adopt receipt batch").await
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "adopt_receipts",
                 error = %error,
                 "SQL Server session cleanup failed after confirmed success; discarding connection"
             );
@@ -1391,6 +1704,73 @@ async fn insert_event(
         .await
         .map_err(|cause| database_error("append receipt event", cause))?;
     Ok(())
+}
+
+async fn insert_adoption_event(
+    client: &mut SqlClient,
+    receipt_id: Uuid,
+    revision: i64,
+    state: &str,
+    successor: Uuid,
+    previous_owner: Uuid,
+    detail: &str,
+) -> ReceiptResult<()> {
+    client
+        .execute(
+            "INSERT INTO arrowcol.receipt_events ( \
+                receipt_id, revision, from_state, to_state, actor_instance_id, previous_owner_instance_id, \
+                event_detail \
+             ) VALUES (@P1, @P2, @P3, 'adopted', @P4, @P5, @P6);",
+            &[&receipt_id, &revision, &state, &successor, &previous_owner, &detail],
+        )
+        .await
+        .map_err(|cause| database_error("append receipt adoption event", cause))?;
+    Ok(())
+}
+
+/// SQL predicate excluding receipts whose owner is a live or recently failed
+/// durable-buffer owner from expiry reconciliation.
+///
+/// It is `lease_expires_at_utc + window > now`, rearranged to subtract the
+/// bounded window from `now` so a far-future owner lease cannot overflow
+/// `datetime2`.
+fn outside_durable_recovery_window(receipt: &str, now: &str) -> String {
+    format!(
+        "NOT EXISTS ( \
+             SELECT 1 FROM arrowcol.collector_instances AS durable_owner \
+             WHERE durable_owner.instance_id = {receipt}.owner_instance_id \
+               AND durable_owner.durable_recovery_window_ms IS NOT NULL \
+               AND durable_owner.lease_expires_at_utc > \
+                   DATEADD(millisecond, -durable_owner.durable_recovery_window_ms, {now}) \
+         )"
+    )
+}
+
+fn recovery_window_i32(window: u64) -> ReceiptResult<i32> {
+    if window > MAX_DURABLE_RECOVERY_WINDOW_MS {
+        return Err(ReceiptError::new(
+            ReceiptErrorKind::InvalidConfiguration,
+            format!("durable recovery window must be at most {MAX_DURABLE_RECOVERY_WINDOW_MS} ms"),
+        ));
+    }
+    i32::try_from(window).map_err(|_| {
+        ReceiptError::new(
+            ReceiptErrorKind::InvalidConfiguration,
+            "durable recovery window exceeds SQL int",
+        )
+    })
+}
+
+fn active_state_name(state: ReceiptState) -> ReceiptResult<&'static str> {
+    match state {
+        ReceiptState::Accepted => Ok("accepted"),
+        ReceiptState::Buffered => Ok("buffered"),
+        ReceiptState::Publishing => Ok("flushing"),
+        ReceiptState::Published | ReceiptState::Failed | ReceiptState::PublicationUnknown => Err(ReceiptError::new(
+            ReceiptErrorKind::InvalidConfiguration,
+            "only accepted, buffered, or publishing receipts can be adopted",
+        )),
+    }
 }
 
 async fn owner_drain_counts(client: &mut SqlClient, owner: CollectorInstanceId) -> ReceiptResult<OwnerDrain> {
@@ -1894,8 +2274,8 @@ mod pooling_tests {
         )?;
         let bounded = config.clone().with_batch_limits(1, 2)?;
         let store = SqlServerReceiptStore::new(bounded).with_pool(pool.clone())?;
-        assert!(store.clone().pool.is_some());
-        assert!(SqlServerReceiptStore::new(config.clone()).pool.is_none());
+        assert!(store.clone().inner.pool.is_some());
+        assert!(SqlServerReceiptStore::new(config.clone()).inner.pool.is_none());
 
         for field in 0..8 {
             let mut mismatch = config.clone();
@@ -1919,7 +2299,182 @@ mod pooling_tests {
         }
         assert_eq!(pool.stats().created, 0);
         pool.close();
-        assert_eq!(store.clone().pool.as_ref().map(|pool| pool.stats().max_size), Some(0));
+        assert_eq!(
+            store.clone().inner.pool.as_ref().map(|pool| pool.stats().max_size),
+            Some(0)
+        );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod adoption_validation_tests {
+    use super::*;
+    use crate::AdoptionCandidate;
+
+    /// Scenario: an oversized or malformed adoption request, an empty
+    /// adoption, and an out-of-range durable recovery window reach a store
+    /// whose SQL Server endpoint is unreachable.
+    /// Guarantees: request bounds and validation fail with request-too-large,
+    /// fenced, or invalid-configuration errors before any connection attempt
+    /// (which would surface as a database error), and an empty adoption is a
+    /// no-op that never connects.
+    #[tokio::test]
+    async fn adoption_and_recovery_window_bounds_fail_before_connecting() -> anyhow::Result<()> {
+        let config = SqlServerReceiptConfig::new("127.0.0.1", 9, "arrowcol", "bounds-user", "bounds-secret")
+            .with_timeouts(Duration::from_millis(250), Duration::from_millis(250))
+            .with_batch_limits(1, 1)?;
+        let store = SqlServerReceiptStore::new(config);
+        let successor = CollectorInstanceId::new();
+        let table = TableIdentity::new(
+            CatalogName::new("telemetry")?,
+            SchemaName::new("receipts")?,
+            TableName::new("bounds")?,
+        );
+        let lease = TableLease::new(
+            LeaseId::new(),
+            table,
+            successor,
+            ImplementationPool::Direct,
+            FencingToken::new(2)?,
+            UnixMillis::new(1_000)?,
+            UnixMillis::new(10_000)?,
+        )?;
+        let candidate = |state, revision| AdoptionCandidate::new(ReceiptId::new(), successor, state, revision);
+        let request = ReceiptAdoption {
+            successor,
+            lease: lease.clone(),
+            lease_deadline: UnixMillis::new(9_000)?,
+            adopted_at: UnixMillis::new(2_000)?,
+            receipts: Vec::new(),
+        };
+        assert_eq!(store.adopt_receipts(&request).await?, ReceiptAdoptionReport::default());
+
+        let cases = [
+            (
+                ReceiptAdoption {
+                    receipts: vec![
+                        candidate(ReceiptState::Accepted, 0),
+                        candidate(ReceiptState::Buffered, 1),
+                    ],
+                    ..request.clone()
+                },
+                ReceiptErrorKind::RequestTooLarge,
+            ),
+            (
+                ReceiptAdoption {
+                    successor: CollectorInstanceId::new(),
+                    receipts: vec![candidate(ReceiptState::Accepted, 0)],
+                    ..request.clone()
+                },
+                ReceiptErrorKind::Fenced,
+            ),
+            (
+                ReceiptAdoption {
+                    receipts: vec![candidate(ReceiptState::Published, 3)],
+                    ..request.clone()
+                },
+                ReceiptErrorKind::InvalidConfiguration,
+            ),
+            (
+                ReceiptAdoption {
+                    lease_deadline: UnixMillis::new(10_001)?,
+                    receipts: vec![candidate(ReceiptState::Publishing, 2)],
+                    ..request
+                },
+                ReceiptErrorKind::InvalidConfiguration,
+            ),
+        ];
+        for (request, expected) in cases {
+            let Err(error) = store.adopt_receipts(&request).await else {
+                anyhow::bail!("invalid adoption request was accepted");
+            };
+            assert_eq!(error.kind(), expected, "{error}");
+        }
+
+        let started = UnixMillis::new(1_000)?;
+        for window in [MAX_DURABLE_RECOVERY_WINDOW_MS + 1, u64::MAX] {
+            let Err(error) = store
+                .register_owner(OwnerRegistration {
+                    instance_id: successor,
+                    instance_key: "bounds".to_owned(),
+                    generation: 1,
+                    host_name: None,
+                    build_version: None,
+                    started_at_unix_ms: started,
+                    lease_deadline_unix_ms: UnixMillis::new(5_000)?,
+                    durable_recovery_window_ms: Some(window),
+                })
+                .await
+            else {
+                anyhow::bail!("out-of-range recovery window was accepted");
+            };
+            assert_eq!(error.kind(), ReceiptErrorKind::InvalidConfiguration, "{error}");
+        }
+        assert_eq!(recovery_window_i32(MAX_DURABLE_RECOVERY_WINDOW_MS)?, 86_400_000);
+        assert_eq!(recovery_window_i32(0)?, 0);
+        Ok(())
+    }
+
+    /// Scenario: the expiry reconciliation predicate is rendered for the
+    /// receipt alias and timestamp parameter used by its SELECT and UPDATE.
+    /// Guarantees: both statements exclude receipts of owners with a durable
+    /// recovery window whose lease plus window is still in the future, using
+    /// the overflow-safe `lease_expires > now - window` form.
+    #[test]
+    fn recovery_window_predicate_targets_the_requested_alias_and_instant() {
+        let predicate = outside_durable_recovery_window("r", "@P4");
+        assert!(predicate.starts_with("NOT EXISTS ("));
+        assert!(predicate.contains("durable_owner.instance_id = r.owner_instance_id"));
+        assert!(predicate.contains("durable_owner.durable_recovery_window_ms IS NOT NULL"));
+        assert!(predicate.contains("DATEADD(millisecond, -durable_owner.durable_recovery_window_ms, @P4)"));
+    }
+}
+
+#[cfg(test)]
+mod deadlock_tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    /// Scenario: SQL Server picks a receipt transaction as a deadlock victim
+    /// twice in a row, as happens when a restarted collector adopts receipts
+    /// while its heartbeat and flushes contend for the same rows.
+    /// Guarantees: The store retries the rolled-back transaction until it
+    /// commits instead of surfacing a transient lock conflict that would fail
+    /// the collector closed.
+    #[tokio::test]
+    async fn deadlock_victims_are_retried_until_they_commit() -> anyhow::Result<()> {
+        let attempts = AtomicU32::new(0);
+        let value = retry_deadlock(|| async {
+            if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                Err(database_error(
+                    "heartbeat receipt owner",
+                    "Transaction (Process ID 85) was deadlocked on lock resources with another process \
+                     and has been chosen as the deadlock victim. Rerun the transaction.",
+                ))
+            } else {
+                Ok(7)
+            }
+        })
+        .await?;
+        assert_eq!(value, 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
+    /// Scenario: A receipt operation fails for a reason other than a deadlock.
+    /// Guarantees: The error surfaces after one attempt; only transactions the
+    /// server rolled back as deadlock victims are retried.
+    #[tokio::test]
+    async fn other_failures_are_not_retried() {
+        let attempts = AtomicU32::new(0);
+        let result: ReceiptResult<()> = retry_deadlock(|| async {
+            let _ = attempts.fetch_add(1, Ordering::SeqCst);
+            Err(ReceiptError::new(ReceiptErrorKind::Fenced, "table lease is invalid"))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }

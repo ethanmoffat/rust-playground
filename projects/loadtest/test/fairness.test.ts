@@ -5,7 +5,9 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import YAML from 'yaml';
-import { benchmarkComposeFiles, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs } from '../src/runtime-config.js';
+import {
+  benchmarkComposeFiles, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs, dataflowConfigFile,
+} from '../src/runtime-config.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const direct = YAML.parse(readFileSync(path.join(root, 'projects/loadtest/config/direct.yaml.tmpl'), 'utf8'));
@@ -118,7 +120,41 @@ test('runtime Compose override mounts generated DFE policy without changing CPUs
     target: '/etc/arrowcol-dataflow-rust/config.yaml', read_only: true,
     bind: { create_host_path: false },
   }]);
+  assert.deepEqual(JSON.parse(buildBenchmarkComposeOverride(directory, { quiver: true })).services['dataflow-1'].volumes[1], {
+    type: 'bind', source: `${directory}/dataflow-state-1/quiver`, target: '/quiver', bind: { create_host_path: false },
+  }, '--quiver adds only a writable Dataflow Quiver mount; Direct uses its existing /state mount');
   assert.deepEqual(benchmarkComposeFiles('compose.yaml', {}), ['--file', 'compose.yaml']);
   assert.deepEqual(benchmarkComposeFiles('compose.yaml', { LOADTEST_COMPOSE_OVERRIDE_FILE: 'runtime.json' }),
     ['--file', 'compose.yaml', '--file', 'runtime.json']);
+});
+
+test('--quiver persists both collectors to Quiver with fsync before acknowledgement and unchanged budgets', () => {
+  const directSource = readFileSync(path.join(root, 'projects/loadtest/config/direct.yaml.tmpl'), 'utf8');
+  const baselineSource = readFileSync(path.join(root, dataflowConfigFile(false)), 'utf8');
+  const quiverSource = readFileSync(path.join(root, dataflowConfigFile(true)), 'utf8');
+  const identity = { instanceKey: 'loadtest-direct-1', advertisedEndpoint: '10.89.0.21:50051', generation: 3 };
+  const baseline = buildBenchmarkRuntimeConfigs(directSource, baselineSource, identity);
+  const quiver = buildBenchmarkRuntimeConfigs(directSource, quiverSource, identity, { quiver: true });
+  const builtDirect = YAML.parse(quiver.directYaml);
+  const builtNodes = YAML.parse(quiver.dataflowYaml).groups.arrowcol.pipelines.ingest.nodes;
+  assert.deepEqual(builtDirect.buffer.native_quiver, {
+    enabled: true, directory: '/state/quiver', capacity_bytes: 4294967296, wal_flush_interval_ms: 0,
+  });
+  assert.equal(builtNodes.flight.config.native_quiver, true);
+  assert.equal(builtNodes.durable.type, 'processor:durable_buffer');
+  for (const [key, value] of Object.entries({
+    path: '/quiver', retention_size_cap: '4GiB', wal_flush_interval: '0s', size_cap_policy: 'backpressure',
+  })) assert.equal(builtNodes.durable.config[key], value, key);
+  assert.equal(builtNodes.durable.config.max_age, undefined, 'age eviction would drop acknowledged batches');
+  const baselineDirect = YAML.parse(baseline.directYaml);
+  const baselineNodes = YAML.parse(baseline.dataflowYaml).groups.arrowcol.pipelines.ingest.nodes;
+  assert.deepEqual({ ...builtDirect, buffer: { ...builtDirect.buffer, native_quiver: undefined } },
+    { ...baselineDirect, buffer: { ...baselineDirect.buffer, native_quiver: undefined } }, 'only Direct Quiver settings change');
+  for (const node of ['flight', 'delta']) {
+    assert.deepEqual({ ...builtNodes[node].config, native_quiver: undefined },
+      { ...baselineNodes[node].config, native_quiver: undefined }, `${node} policies match the baseline`);
+  }
+  assert.throws(() => buildBenchmarkRuntimeConfigs(directSource, baselineSource, identity, { quiver: true }),
+    /requires the Dataflow native Quiver topology/u);
+  assert.throws(() => buildBenchmarkRuntimeConfigs(directSource, quiverSource, identity), /requires --quiver/u);
 });

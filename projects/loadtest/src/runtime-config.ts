@@ -8,16 +8,36 @@ export const benchmarkBufferBudget = Object.freeze({
   max_arrow_memory_per_flush: 33554432,
 });
 
+/** Native Quiver placement for `--quiver`; directories are container paths on writable bind mounts. */
+export const benchmarkQuiver = Object.freeze({
+  directDirectory: '/state/quiver',
+  dataflowDirectory: '/quiver',
+  dataflowHostDirectory: 'dataflow-state-1/quiver',
+  directHostDirectory: 'direct-state-1/quiver',
+  capacityBytes: 4294967296,
+});
+
+/** Workspace-relative Dataflow configuration: `--quiver` selects the durable-buffer topology. */
+export function dataflowConfigFile(quiver: boolean): string {
+  return `projects/arrowcol-dataflow-rust/${quiver ? 'config.quiver.yaml' : 'config.yaml'}`;
+}
+
 interface DirectIdentity {
   instanceKey: string;
   advertisedEndpoint: string;
   generation: number;
 }
 
+export interface BenchmarkRuntimeOptions {
+  /** Persist every batch to native Quiver (fsync before acknowledgement) before publishing it. */
+  quiver?: boolean;
+}
+
 export function buildBenchmarkRuntimeConfigs(
   directSource: string,
   dataflowSource: string,
   identity?: DirectIdentity,
+  options: BenchmarkRuntimeOptions = {},
 ): { directYaml: string; dataflowYaml: string } {
   if (identity) {
     if (!Number.isSafeInteger(identity.generation) || identity.generation <= 0) throw new Error('Invalid direct generation');
@@ -43,10 +63,32 @@ export function buildBenchmarkRuntimeConfigs(
     buffered_rows_limit: benchmarkBufferBudget.global_capacity.rows,
     buffered_batches_limit: benchmarkBufferBudget.global_capacity.batches,
   });
+  const durable = Object.values(nodes as Record<string, { type?: string; config?: Record<string, unknown> }>)
+    .filter((node) => node.type === 'processor:durable_buffer');
+  if (options.quiver) {
+    if (durable.length !== 1 || nodes.flight.config.native_quiver !== true) {
+      throw new Error('--quiver requires the Dataflow native Quiver topology (config.quiver.yaml)');
+    }
+    durable[0].config = {
+      ...durable[0].config,
+      path: benchmarkQuiver.dataflowDirectory,
+      retention_size_cap: `${benchmarkQuiver.capacityBytes / 1073741824}GiB`,
+      wal_flush_interval: '0s',
+    };
+    direct.buffer.native_quiver = {
+      ...direct.buffer.native_quiver,
+      enabled: true,
+      directory: benchmarkQuiver.directDirectory,
+      capacity_bytes: benchmarkQuiver.capacityBytes,
+      wal_flush_interval_ms: 0,
+    };
+  } else if (durable.length > 0 || nodes.flight.config.native_quiver === true || direct.buffer.native_quiver?.enabled) {
+    throw new Error('Native Quiver configuration requires --quiver');
+  }
   return { directYaml: YAML.stringify(direct), dataflowYaml: YAML.stringify(dataflow) };
 }
 
-export function buildBenchmarkComposeOverride(hostDirectory: string): string {
+export function buildBenchmarkComposeOverride(hostDirectory: string, options: BenchmarkRuntimeOptions = {}): string {
   return JSON.stringify({
     services: {
       'dataflow-1': {
@@ -56,7 +98,12 @@ export function buildBenchmarkComposeOverride(hostDirectory: string): string {
           target: '/etc/arrowcol-dataflow-rust/config.yaml',
           read_only: true,
           bind: { create_host_path: false },
-        }],
+        }, ...(options.quiver ? [{
+          type: 'bind',
+          source: path.join(hostDirectory, benchmarkQuiver.dataflowHostDirectory),
+          target: benchmarkQuiver.dataflowDirectory,
+          bind: { create_host_path: false },
+        }] : [])],
       },
     },
   }, null, 2);

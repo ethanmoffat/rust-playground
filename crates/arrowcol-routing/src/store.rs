@@ -2,7 +2,8 @@ use arrowcol_protocol::{CollectorInstanceId, UnixMillis};
 use async_trait::async_trait;
 
 use crate::{
-    CollectorRegistration, CollectorState, LeaseKey, RichPressureSnapshot, RoutingLease, RoutingResult, RoutingView,
+    CollectorRegistration, CollectorState, LeaseKey, RichPressureSnapshot, RoutingError, RoutingErrorKind,
+    RoutingLease, RoutingResult, RoutingView,
 };
 
 /// Request to create or observe an active lease.
@@ -48,6 +49,53 @@ pub struct LeaseTransfer {
     pub minimum_snapshot_at_unix_ms: UnixMillis,
 }
 
+/// Compare-and-set request to hand a crashed holder's lease directly to the
+/// restarted process registered under the same instance key.
+///
+/// No drain proof is required: the successor owns the predecessor's durable
+/// buffer volume and replays its persisted backlog.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseSuccession {
+    /// Ownership key.
+    pub key: LeaseKey,
+    /// Expected active or draining version.
+    pub expected_version: u64,
+    /// Current holder whose registration expired or reached a terminal state.
+    pub predecessor_instance_id: CollectorInstanceId,
+    /// Live process lifetime registered under the predecessor's instance key.
+    pub successor_instance_id: CollectorInstanceId,
+    /// New lease issue time.
+    pub now_unix_ms: UnixMillis,
+    /// New exclusive expiry.
+    pub expires_at_unix_ms: UnixMillis,
+    /// Oldest pressure timestamp acceptable for the successor.
+    pub minimum_snapshot_at_unix_ms: UnixMillis,
+}
+
+impl LeaseSuccession {
+    /// Validates request bounds before any persistence access.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid configuration when the new lease window is empty or the
+    /// predecessor and successor are the same process lifetime.
+    pub fn validate(&self) -> RoutingResult<()> {
+        if self.expires_at_unix_ms <= self.now_unix_ms {
+            return Err(RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "routing lease expiry must be later than issuance",
+            ));
+        }
+        if self.predecessor_instance_id == self.successor_instance_id {
+            return Err(RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "routing lease successor must be a different process lifetime",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Persistence contract shared by router replicas.
 #[async_trait]
 pub trait RoutingStore: Send + Sync {
@@ -91,4 +139,17 @@ pub trait RoutingStore: Send + Sync {
 
     /// Atomically transfers a draining lease with a greater fencing epoch.
     async fn transfer_drained_lease(&self, request: &LeaseTransfer) -> RoutingResult<RoutingLease>;
+
+    /// Atomically transfers a valid active or draining lease from a dead
+    /// holder to its same-instance-key successor without a drain proof.
+    ///
+    /// The predecessor must still hold the expected lease version, and its
+    /// registration must have expired or reached the stopped or failed state.
+    /// The successor must be a different, live, ready process lifetime in the
+    /// lease's pool with the predecessor's instance key and fresh accepting
+    /// pressure. Success issues a new active lease ID with the next fencing
+    /// epoch and lease version. Invalid request bounds return
+    /// [`RoutingErrorKind::InvalidConfiguration`]; any unmet persisted
+    /// precondition returns [`RoutingErrorKind::Conflict`] without mutation.
+    async fn transfer_to_successor(&self, request: &LeaseSuccession) -> RoutingResult<RoutingLease>;
 }

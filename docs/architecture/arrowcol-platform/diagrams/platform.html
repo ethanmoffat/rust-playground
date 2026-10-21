@@ -43,7 +43,7 @@
   <div class="canvas" tabindex="0" role="region" aria-label="Platform diagram; scroll horizontally on small screens">
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 720" role="img" aria-labelledby="diagram-title diagram-description">
       <title id="diagram-title">Arrowcol control plane and collector paths</title>
-      <desc id="diagram-description">SQL Server and Hive coordinate the catalog. Immutable artifacts generate client SDKs. The client sends Flight through a trusted TLS edge and Pingora router to a direct or DFE table owner. Direct buffers Arrow in memory and creates SQL receipt metadata; the client polls through the router and purges only after published status. DFE offers best-effort admission and internal Ack/Nack. Each pool writes its own fenced Delta root. Purple dashed lines denote control and schemas; blue lines carry Flight payload; green denotes direct publication and orange denotes best-effort DFE.</desc>
+      <desc id="diagram-description">SQL Server and Hive coordinate the catalog. Immutable artifacts generate client SDKs. The client sends Flight through a trusted TLS edge and Pingora router to a direct or DFE table owner. Direct buffers Arrow in memory and creates SQL receipt metadata; the client polls through the router and purges only after published status. DFE offers best-effort admission and internal Ack/Nack. With opt-in native Quiver, both collectors persist pending batches to local disk before acknowledging them and replay them after a crash. Each pool writes its own fenced Delta root. Purple dashed lines denote control and schemas; blue lines carry Flight payload; green denotes direct publication and orange denotes best-effort DFE.</desc>
       <defs>
         <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r=".7" fill="#23354c"/></pattern>
         <marker id="blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#79d6fa"/></marker>
@@ -107,7 +107,7 @@
       <use href="#buffer" x="820" y="260" width="58" height="58" class="icon" stroke="#80e2b6"/>
       <text x="849" y="345" class="label">Direct collector</text>
       <text x="849" y="371" class="small">Bounded Arrow memory</text>
-      <text x="849" y="394" class="tiny">SQL receipt metadata, not durable payload</text>
+      <text x="849" y="394" class="tiny">SQL receipts; payload on disk only with Quiver</text>
       <path d="M984 322H1022" stroke="#80e2b6" stroke-width="3" marker-end="url(#green)"/>
       <rect x="1022" y="264" width="186" height="116" rx="16" fill="#173a35" stroke="#80e2b6"/>
       <image href="../../loadtest/assets/delta-lake.svg" x="1039" y="287" width="152" height="33"/>
@@ -123,7 +123,7 @@
       <use href="#pipeline" x="820" y="503" width="58" height="58" class="icon" stroke="#f3bd75"/>
       <text x="849" y="590" class="label">DFE collector</text>
       <text x="849" y="616" class="small">Bounded pdata channels</text>
-      <text x="849" y="639" class="tiny">Best-effort admission; no client receipt</text>
+      <text x="849" y="639" class="tiny">Best-effort, or Quiver durable, admission</text>
       <path d="M984 572H1022" stroke="#f3bd75" stroke-width="3" marker-end="url(#orange)"/>
       <rect x="1022" y="514" width="186" height="116" rx="16" fill="#3a3025" stroke="#f3bd75"/>
       <image href="../../loadtest/assets/delta-lake.svg" x="1039" y="537" width="152" height="33"/>
@@ -132,10 +132,10 @@
       <rect x="254" y="584" width="402" height="76" rx="12" fill="#14263b" stroke="#415d7d"/>
       <text x="455" y="612" class="small">SQL holds identities, versions, leases, and receipts.</text>
       <text x="455" y="637" class="small">Ingest Arrow payloads never go into SQL.</text>
-      <text x="620" y="696" class="tiny">Solid: payload / publication &middot; Dashed: schema / control / polling &middot; No exactly-once or arbitrary-Arrow Quiver in either pool</text>
+      <text x="620" y="696" class="tiny">Solid: payload / publication &middot; Dashed: schema / control / polling &middot; No exactly-once in either pool; native Quiver is opt-in</text>
     </svg>
   </div>
-  <div class="note"><strong>Direct receipt ACK is not purge permission.</strong><span class="warning">DFE completion is best-effort admission, not a durability guarantee.</span></div>
+  <div class="note"><strong>Direct receipt ACK is not purge permission.</strong><span class="warning">Without native Quiver, DFE completion is best-effort admission, not a durability guarantee.</span></div>
   <footer><span>Arrowcol architecture &middot; locally rendered SVG + product assets</span><span><a href="../README.md">Index</a> &middot; <a href="../routing.md">Routing</a> &middot; <a href="../delivery-guarantees.md">Delivery contract</a> &middot; <a href="../../loadtest/assets/README.md">Icon sources</a></span></footer>
 </main>
 </body>

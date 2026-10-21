@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use arrowcol_buffer::{BufferManager, PublicationSink};
+use arrowcol_buffer::{BufferManager, PublicationSink, QuiverStage, StageLeases};
 use arrowcol_catalog::{
     CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, HiveMetastore, HiveMetastoreConfig, Metastore,
     SqlServerCatalogStore, SqlServerConfig as CatalogSqlConfig,
@@ -177,7 +177,27 @@ pub async fn run(config: CollectorConfig) -> Result<RunOutcome> {
         metrics.clone(),
     ));
     let buffer = BufferManager::new(config.buffer.buffer_config()?, Arc::clone(&receipt_store), sink)?;
-    let status = Arc::new(CollectorStatus::new(
+    let quiver = match config.buffer.native_quiver.stage_config()? {
+        Some(stage_config) => {
+            let stage_leases: Arc<dyn StageLeases> = Arc::<TableLeaseManager>::clone(&leases);
+            let stage = QuiverStage::open(
+                stage_config,
+                Arc::clone(&buffer),
+                Arc::clone(&receipt_store),
+                stage_leases,
+                instance_id,
+                Duration::from_millis(config.buffer.receipt_lease_duration_ms),
+            )
+            .await
+            .context("open Quiver durable stage")?;
+            metrics
+                .register_quiver(Arc::clone(&stage))
+                .context("register Quiver metrics")?;
+            Some(stage)
+        }
+        None => None,
+    };
+    let mut collector_status = CollectorStatus::new(
         &config,
         instance_id,
         drain.clone(),
@@ -185,12 +205,16 @@ pub async fn run(config: CollectorConfig) -> Result<RunOutcome> {
         Arc::clone(&leases),
         Arc::clone(&activity),
         metrics.clone(),
-    )?);
+    )?;
+    if let Some(stage) = &quiver {
+        collector_status = collector_status.with_quiver(Arc::clone(stage));
+    }
+    let status = Arc::new(collector_status);
     status.set_dependencies_ready(true);
     status.set_delta_writable(true);
 
     let (authenticator, trusted_identity) = build_auth(&config, Arc::clone(&routing_store), instance_id)?;
-    let admission: Arc<dyn BatchAdmission> = Arc::new(DirectAdmission::new(
+    let mut direct_admission = DirectAdmission::new(
         Arc::clone(&catalog_store),
         Arc::clone(&receipt_store),
         Arc::clone(&buffer),
@@ -199,7 +223,11 @@ pub async fn run(config: CollectorConfig) -> Result<RunOutcome> {
         instance_id,
         Duration::from_millis(config.receipts.receipt_lease_duration_ms),
         Duration::from_millis(config.receipts.admission_timeout_ms),
-    ));
+    );
+    if let Some(stage) = &quiver {
+        direct_admission = direct_admission.with_quiver(Arc::clone(stage));
+    }
+    let admission: Arc<dyn BatchAdmission> = Arc::new(direct_admission);
     let pressure_hooks: Arc<dyn PressureHooks> = Arc::new(metrics.clone());
     let ddl: Arc<dyn FlightSqlDdlHandler> = Arc::new(catalog_control);
     let flight = ArrowColFlightService::new(
@@ -250,6 +278,12 @@ pub async fn run(config: CollectorConfig) -> Result<RunOutcome> {
     )
     .await?;
 
+    if let Some(stage) = &quiver {
+        // The receipt owner is registered now, so persisted batches (including
+        // a crashed predecessor's) can be adopted and published.
+        stage.start();
+    }
+
     let server_cancel = CancellationToken::new();
     let mut flight_task = spawn_flight_server(flight_builder, flight_listener, flight, server_cancel.clone());
     let mut admin_task = tokio::spawn(serve_admin(admin_listener, admin_state, server_cancel.clone()));
@@ -292,6 +326,7 @@ pub async fn run(config: CollectorConfig) -> Result<RunOutcome> {
         &receipt_store,
         &drain,
         &buffer,
+        quiver.as_ref(),
         &leases,
         &metrics,
     )
@@ -332,6 +367,7 @@ async fn shutdown(
     receipts: &Arc<dyn ReceiptStore>,
     drain: &DrainController,
     buffer: &Arc<BufferManager>,
+    quiver: Option<&Arc<QuiverStage>>,
     leases: &Arc<TableLeaseManager>,
     metrics: &CollectorMetrics,
 ) -> Result<RunOutcome> {
@@ -368,6 +404,17 @@ async fn shutdown(
     }
 
     leases.start_delta_draining().await;
+    if let Some(stage) = quiver
+        && !drain_quiver(
+            stage,
+            buffer,
+            Duration::from_millis(config.shutdown.publication_drain_timeout_ms),
+        )
+        .await
+    {
+        error!("Quiver backlog did not drain; persisted batches remain on disk for the next generation");
+        incomplete = incomplete.saturating_add(1);
+    }
     let buffer_report = tokio::time::timeout(
         Duration::from_millis(config.shutdown.publication_drain_timeout_ms),
         buffer.shutdown(),
@@ -422,6 +469,26 @@ async fn shutdown(
     } else {
         Ok(RunOutcome::IncompleteDrain { incomplete })
     }
+}
+
+/// Publishes every persisted batch before the buffer stops, flushing buffered
+/// groups immediately instead of waiting for their age trigger. Returns whether
+/// the Quiver backlog drained before the timeout; the stage is stopped either way.
+async fn drain_quiver(stage: &Arc<QuiverStage>, buffer: &Arc<BufferManager>, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let drained = loop {
+        if let Err(error) = buffer.drain().await {
+            warn!(%error, "explicit buffer drain failed while draining Quiver");
+        }
+        if stage.drain(Duration::from_millis(250)).await {
+            break true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break false;
+        }
+    };
+    stage.shutdown().await;
+    drained
 }
 
 fn build_auth(

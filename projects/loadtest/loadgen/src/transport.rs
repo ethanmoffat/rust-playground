@@ -52,6 +52,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub enum FlightAcknowledgement {
     DurableReceipt(ReceiptId),
     BestEffortAdmission,
+    DurableAdmission,
 }
 
 /// One queried receipt status.
@@ -236,6 +237,16 @@ impl FlightTransport {
                             .is_some()
                     {
                         bail!("dataflow Flight acknowledgement contract was inconsistent");
+                    }
+                }
+                PutResultMetadata::DurableAdmission { delivery_guarantee, .. } => {
+                    if pool != ImplementationPool::Dataflow
+                        || delivery_guarantee != DeliveryGuarantee::DurableAdmission
+                        || acknowledgement
+                            .replace(FlightAcknowledgement::DurableAdmission)
+                            .is_some()
+                    {
+                        bail!("dataflow durable admission contract was inconsistent");
                     }
                 }
             }

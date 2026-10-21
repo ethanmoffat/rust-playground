@@ -18,23 +18,51 @@ fn unknown_fields_are_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn with_quiver(settings: &str) -> anyhow::Result<String> {
+    Ok(String::from_utf8(include_bytes!("../config.yaml").to_vec())?.replace(
+        "  native_quiver:\n    enabled: false\n    directory: null\n    capacity_bytes: null",
+        &format!("  native_quiver:\n{settings}"),
+    ))
+}
+
+/// Scenario: Native Quiver is enabled with a directory and a 1 GiB disk budget.
+/// Guarantees: The config validates, exposes the durable-stage settings with
+/// fsync-per-acknowledgement defaults, and registers a receipt recovery window.
 #[test]
-fn native_quiver_is_rejected_with_typed_capability_error() -> anyhow::Result<()> {
-    let yaml = String::from_utf8(include_bytes!("../config.yaml").to_vec())?
-        .replace(
-            "  native_quiver:\n    enabled: false\n    directory: null\n    capacity_bytes: null",
-            "  native_quiver:\n    enabled: true\n    directory: projects/arrowcol-rust/.data/quiver\n    capacity_bytes: 1048576",
-        );
-    let Err(error) = CollectorConfig::from_yaml(yaml.as_bytes()) else {
-        anyhow::bail!("unsupported Quiver configuration was accepted");
-    };
-    assert!(matches!(
-        error,
-        ConfigError::UnsupportedCapability {
-            capability: "native_quiver_generic_arrow",
-            ..
-        }
-    ));
+fn native_quiver_enables_durable_stage() -> anyhow::Result<()> {
+    let yaml = with_quiver(
+        "    enabled: true\n    directory: projects/arrowcol-rust/.data/quiver\n    capacity_bytes: 1073741824",
+    )?;
+    let config = CollectorConfig::from_yaml(yaml.as_bytes())?;
+    let stage = config
+        .buffer
+        .native_quiver
+        .stage_config()?
+        .ok_or_else(|| anyhow::anyhow!("enabled Quiver produced no stage settings"))?;
+    assert_eq!(stage.capacity_bytes, 1_073_741_824);
+    assert!(stage.wal_flush_interval.is_zero());
+    assert_eq!(config.buffer.native_quiver.recovery_window_ms(), Some(600_000));
+    Ok(())
+}
+
+/// Scenario: Native Quiver is enabled without a directory, with a disk budget
+/// below Quiver's minimum, or with an out-of-range recovery window.
+/// Guarantees: Each misconfiguration is rejected at validation time rather than
+/// failing after the collector starts accepting data.
+#[test]
+fn invalid_native_quiver_settings_are_rejected() -> anyhow::Result<()> {
+    for settings in [
+        "    enabled: true\n    directory: null\n    capacity_bytes: 1073741824",
+        "    enabled: true\n    directory: projects/arrowcol-rust/.data/quiver\n    capacity_bytes: 1048576",
+        "    enabled: true\n    directory: projects/arrowcol-rust/.data/quiver\n    capacity_bytes: 1073741824\n    recovery_window_ms: 0",
+        "    enabled: false\n    directory: projects/arrowcol-rust/.data/quiver\n    capacity_bytes: null",
+    ] {
+        let yaml = with_quiver(settings)?;
+        let Err(error) = CollectorConfig::from_yaml(yaml.as_bytes()) else {
+            anyhow::bail!("invalid Quiver settings were accepted: {settings}");
+        };
+        assert!(matches!(error, ConfigError::Invalid(_)), "{error}");
+    }
     Ok(())
 }
 

@@ -28,6 +28,8 @@ pub const VALIDATION_FILE: &str = "validation.json";
 pub enum AckOutcome {
     DurableReceipt,
     BestEffortAdmission,
+    /// Dataflow persisted the batch to its Quiver durable buffer before completing.
+    DurableAdmission,
     Error,
 }
 
@@ -203,10 +205,20 @@ pub fn run_metadata(run_id: &str, arguments: &RunArgs, schema_contract_sha256: &
             "batch_rows": arguments.batch_rows,
             "seed": arguments.seed,
             "max_attempts": arguments.max_attempts,
+            "retry_window_seconds": arguments.retry_window.map(|window| window.get().as_secs()),
+            "quiver": arguments.quiver,
             "scheduler": "single global atomic ordinal; seed-rotated equal round-robin across all 13 tables",
             "paired_semantics": "one encoded logical RecordBatch is reused concurrently for direct and dataflow",
-            "direct_delivery": "server-generated receipt polled to a terminal state",
-            "dataflow_delivery": "best-effort admission; no durable receipt claim"
+            "direct_delivery": if arguments.quiver {
+                "server-generated receipt; batch persisted to Quiver before acknowledgement; receipt polled to a terminal state"
+            } else {
+                "server-generated receipt polled to a terminal state"
+            },
+            "dataflow_delivery": if arguments.quiver {
+                "durable admission: Quiver WAL fsync before completion; replayed after a crash (at least once); no receipt"
+            } else {
+                "best-effort admission; no durable receipt claim"
+            }
         }
     })
 }
