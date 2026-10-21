@@ -24,13 +24,14 @@ const args = [
   '--file', path.join(workspace, 'projects/loadtest/compose.yaml'),
   '--file', overrideFile,
 ];
-args.push('--profile', 'benchmark', 'config', '--quiet');
+args.push('--profile', 'benchmark', '--profile', 'ui-gate', 'config', '--quiet');
 const result = spawnSync('docker', args, {
   cwd: workspace,
   env: {
     ...process.env,
     LOADTEST_UID: String(process.getuid?.() ?? 10001),
     LOADTEST_GID: String(process.getgid?.() ?? 10001),
+    LOADTEST_WORKSPACE: workspace,
     ONELAKE_HOST_PATH: state,
     LOADTEST_SCRATCH_HOST_PATH: path.join(workspace, 'projects/loadtest/.temp'),
     LOADTEST_BIN_HOST_PATH: path.join(workspace, 'target/debug'),

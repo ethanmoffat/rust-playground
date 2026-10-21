@@ -7,7 +7,8 @@
     "arrowcol-dataflow-rust",
     "arrowcol-router-rust",
     "arrowcol-infra",
-    "arrowcol-sdk-gen"
+    "arrowcol-sdk-gen",
+    "kusto-explorer"
   ],
   "targets": {
     "format": {
@@ -60,7 +61,8 @@
           "projects": [
             "arrowcol-rust",
             "arrowcol-dataflow-rust",
-            "arrowcol-router-rust"
+            "arrowcol-router-rust",
+            "kusto-explorer"
           ],
           "target": "image"
         }
@@ -95,7 +97,7 @@
         "build"
       ],
       "options": {
-        "command": "npx --no-install tsx projects/loadtest/src/main.ts --warmup 5s --measure 30s --validate",
+        "command": "npx --no-install tsx projects/loadtest/src/main.ts --warmup 5s --measure 30s --batch-rows 1024 --validate",
         "forwardAllArgs": false
       }
     },

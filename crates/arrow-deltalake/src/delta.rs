@@ -55,6 +55,26 @@ mod io_tests {
         )?)
     }
 
+    /// Scenario: a concurrent subprocess inherits the writer's descriptor before exec.
+    /// Guarantees: the last owner releases its lock even while a duplicate descriptor remains open.
+    #[cfg(unix)]
+    #[test]
+    fn writer_lock_is_released_before_inherited_descriptor_closes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let table = DeltaTable::open(directory.path())?;
+        let inherited = table._lock.0.try_clone()?;
+        let shared = Arc::clone(&table);
+        drop(table);
+        assert!(DeltaTable::open(directory.path()).is_err());
+        drop(shared);
+        let reopened = DeltaTable::open(directory.path())?;
+        drop(inherited);
+        assert!(DeltaTable::open(directory.path()).is_err());
+        drop(reopened);
+        DeltaTable::open(directory.path())?;
+        Ok(())
+    }
+
     #[derive(Default)]
     struct RecordingFence(Mutex<Vec<(u64, u64)>>);
 
@@ -576,11 +596,22 @@ pub struct DeltaTable {
     root: PathBuf,
     url: Url,
     engine: LocalEngine,
-    _lock: File,
+    _lock: WriterLock,
     commit_lock: Mutex<()>,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
     reuse_snapshots: bool,
     publication_fence: Option<Arc<dyn PublicationFence>>,
+}
+
+/// Exclusive local writer ownership, released when its owner drops.
+struct WriterLock(File);
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        // A concurrently spawned child briefly shares this lock until it executes;
+        // closing alone would keep ownership. Close still releases it on failure.
+        let _ = FileExt::unlock(&self.0);
+    }
 }
 
 type LogFingerprints = BTreeMap<u64, LogFingerprint>;
@@ -714,6 +745,7 @@ impl DeltaTable {
             .open(root.join(WRITER_LOCK))?;
         lock.try_lock_exclusive()
             .with_context(|| format!("Delta table already has a writer: {}", root.display()))?;
+        let lock = WriterLock(lock);
         let url = Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table path"))?;
         let engine = DefaultEngineBuilder::new(store)
             .with_task_executor(shared_executor()?)

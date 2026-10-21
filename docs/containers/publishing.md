@@ -1,6 +1,6 @@
 # Container publishing
 
-The repository publishes the devcontainer, four production Rust runtime
+The repository publishes the devcontainer, five production Rust runtime
 images, and the retained `hello-world` sample image to GHCR through Nx targets.
 Run local publication from the source-built devcontainer so the pinned
 toolchain, Docker Buildx support, GitHub CLI state, and repository scripts match
@@ -23,6 +23,7 @@ manifests.
 | `arrowcol-rust` | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-rust` | `npx --no-install nx run arrowcol-rust:image-smoke` |
 | `arrowcol-dataflow-rust` | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust` | `npx --no-install nx run arrowcol-dataflow-rust:image-smoke` |
 | `arrowcol-router-rust` | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-router-rust` | `npx --no-install nx run arrowcol-router-rust:image-smoke` |
+| `kusto-explorer` | `ghcr.io/mdrakiburrahman/rust-playground/kusto-explorer` | `npx --no-install nx run kusto-explorer:image-smoke` |
 
 Each smoke target builds or reuses the local `linux/amd64` `:dev` image and
 validates its embedded configuration and bounded startup/shutdown contract. It
@@ -85,6 +86,7 @@ The production runtime projects are:
 - `arrowcol-rust`
 - `arrowcol-dataflow-rust`
 - `arrowcol-router-rust`
+- `kusto-explorer`
 
 `hello-world` remains published as the repository sample. Every `publish`
 target resolves the current branch and full Git object ID, then pushes:
@@ -222,19 +224,19 @@ checks the `main` and `latest` manifests.
   Node/Nx inputs, the Docker executor, or registry tooling;
 - manual `workflow_dispatch`.
 
-The workflow discovers the five source-built publication targets from the Nx
+The workflow discovers the six source-built publication targets from the Nx
 graph, then builds and smoke-tests each matrix entry before authentication. It
 publishes branch and immutable SHA tags, adds `latest` on `main`, verifies the
 deterministic local publication manifest, and verifies every remote tag.
 Package visibility remains the explicit GitHub UI step described above.
 
-The five-target matrix contains the four production images listed above plus
+The six-target matrix contains the five production images listed above plus
 the retained `hello-world` sample image. The devcontainer is published by its
 separate workflow.
 
 ## Image metadata and attestations
 
-The four production runtime Dockerfiles set OCI title, description, source,
+The five production runtime Dockerfiles set OCI title, description, source,
 license, and revision labels. Local `:dev` builds use `revision=local`;
 publication targets pass the full Git SHA.
 

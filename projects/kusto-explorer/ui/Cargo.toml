@@ -1,0 +1,76 @@
+[package]
+name = "kusto-explorer-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Leptos browser UI for kusto-explorer"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
+kusto-explorer-api = { path = "../api" }
+leptos = { version = "0.8", features = ["csr"] }
+serde = { version = "1", features = ["derive"] }
+send_wrapper = "0.6"
+serde_json = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+  "AbortController",
+  "AbortSignal",
+  "AddEventListenerOptions",
+  "Blob",
+  "BlobPropertyBag",
+  "Clipboard",
+  "console",
+  "Crypto",
+  "CssStyleDeclaration",
+  "Document",
+  "DomRect",
+  "DomRectReadOnly",
+  "DomTokenList",
+  "Element",
+  "Event",
+  "EventTarget",
+  "File",
+  "FileList",
+  "FocusEvent",
+  "Headers",
+  "History",
+  "HtmlAnchorElement",
+  "HtmlDivElement",
+  "HtmlDocument",
+  "HtmlElement",
+  "HtmlInputElement",
+  "HtmlSelectElement",
+  "HtmlTextAreaElement",
+  "KeyboardEvent",
+  "Location",
+  "MediaQueryList",
+  "MediaQueryListEvent",
+  "MouseEvent",
+  "Navigator",
+  "Performance",
+  "PointerEvent",
+  "Request",
+  "RequestInit",
+  "ResizeObserver",
+  "ResizeObserverEntry",
+  "Response",
+  "ScrollIntoViewOptions",
+  "ScrollLogicalPosition",
+  "Storage",
+  "Url",
+  "WheelEvent",
+  "Window",
+] }
+
+[lints]
+workspace = true

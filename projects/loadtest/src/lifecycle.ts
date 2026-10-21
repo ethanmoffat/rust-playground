@@ -256,8 +256,12 @@ export async function resetBenchmark(workspace: string, docker: Docker): Promise
   const volumes = resources(docker, 'volume').filter(resource => {
     const project = resource.labels['com.docker.compose.project'];
     const volume = resource.labels['com.docker.compose.volume'];
-    return projects.has(project) && ['sqlserver-data', 'hive-warehouse'].includes(volume)
-      && resource.name === `${project}_${volume}`;
+    if (!projects.has(project) || !['sqlserver-data', 'hive-warehouse', 'kusto-data'].includes(volume)
+        || resource.name !== `${project}_${volume}`) return false;
+    if (volume === 'kusto-data' && resource.labels['io.arrowcol.loadtest.workspace'] !== workspace) {
+      throw new Error('Refusing to reset Kusto storage owned by another or unverifiable workspace');
+    }
+    return true;
   });
   const networks = resources(docker, 'network').filter(resource =>
     projects.has(resource.labels['com.docker.compose.project'])

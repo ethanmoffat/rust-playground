@@ -293,6 +293,8 @@ docker run --rm --platform linux/amd64 \
   pinned, editable otel-arrow submodule at `submodules/otel-arrow`.
 - `projects/loadtest/` - Two-service Compose demo and content-verified Delta
   E2E; generated telemetry lives in gitignored `onelake/`.
+- `projects/kusto-explorer/` - Rust (Axum + Leptos) browser KQL workbench,
+  wired into the loadtest against the local Kusto emulator.
 - `.devcontainer/` - Reproducible source-built and immutable prebuilt
   development environments.
 
@@ -327,6 +329,7 @@ available only after its manifest and public visibility have been verified:
 | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-rust` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | Direct Arrow Flight collector |
 | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | DFE-native Arrow Flight collector |
 | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-router-rust` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | Pingora Arrow Flight router |
+| `ghcr.io/mdrakiburrahman/rust-playground/kusto-explorer` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | Browser KQL workbench for Kusto clusters |
 | `ghcr.io/mdrakiburrahman/rust-playground/hello-world` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | Retained sample runtime image |
 
 Local image qualification uses `:dev` and does not publish:
@@ -336,6 +339,7 @@ npx --no-install nx run otelcol-rust:image-smoke
 npx --no-install nx run arrowcol-rust:image-smoke
 npx --no-install nx run arrowcol-dataflow-rust:image-smoke
 npx --no-install nx run arrowcol-router-rust:image-smoke
+npx --no-install nx run kusto-explorer:image-smoke
 ```
 
 No GHCR image is published merely by adding these targets, building locally,

@@ -202,6 +202,67 @@ services:
         ipv4_address: ${LOADTEST_DATAFLOW_1_IP:-10.89.0.31}
     stop_grace_period: 5m
 
+  kusto:
+    profiles: ["benchmark"]
+    image: mcr.microsoft.com/azuredataexplorer/kustainer-linux@sha256:51e2250da2faf292de903f871a073eb37d3f2641cf63381b183879d21ebb1013
+    mem_limit: ${KUSTO_MEMORY_LIMIT:-4g}
+    environment:
+      ACCEPT_EULA: "Y"
+    ports:
+      - "127.0.0.1:${KUSTO_PORT:-8080}:8080"
+    volumes:
+      - kusto-data:/kustodata
+      - type: bind
+        source: ${ONELAKE_HOST_PATH:?Run through Nx}/direct
+        target: /delta/direct
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ONELAKE_HOST_PATH:?Run through Nx}/dataflow
+        target: /delta/dataflow
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      default:
+        ipv4_address: ${LOADTEST_KUSTO_IP:-10.89.0.50}
+    stop_grace_period: ${STACK_STOP_SECONDS:-30}s
+
+  # Browser UI for the Kusto emulator. The server reaches Kusto by its Compose service name on this
+  # network; browsers only talk to kusto-explorer itself (same-origin /api), never to Kusto.
+  kusto-explorer:
+    profiles: ["benchmark"]
+    image: ghcr.io/mdrakiburrahman/rust-playground/kusto-explorer:dev
+    pull_policy: never
+    environment:
+      KUSTO_EXPLORER_CONNECTIONS: "Loadtest emulator=http://kusto:8080"
+      KUSTO_EXPLORER_DEFAULT_DATABASE: loadtest
+    ports:
+      - "127.0.0.1:${KUSTO_EXPLORER_PORT:-8090}:8080"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      default:
+        ipv4_address: ${LOADTEST_KUSTO_EXPLORER_IP:-10.89.0.51}
+    stop_grace_period: ${STACK_STOP_SECONDS:-30}s
+
+  # Headless browser for the `--validate` UI gate. It joins this network so the gate exercises the
+  # same Docker-internal path (http://kusto-explorer:8080 -> http://kusto:8080). The runner copies
+  # its own playwright-core into the container, so the image tag must match package-lock.json.
+  playwright:
+    profiles: ["ui-gate"]
+    image: mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27
+    user: pwuser
+    init: true
+    shm_size: 1gb
+    command: ["node", "/opt/playwright-core/cli.js", "run-server", "--port", "3000", "--host", "0.0.0.0"]
+    networks:
+      default:
+        ipv4_address: ${LOADTEST_PLAYWRIGHT_IP:-10.89.0.52}
+    stop_grace_period: 10s
+
   lgtm:
     profiles: ["benchmark"]
     image: grafana/otel-lgtm@sha256:57c04cbd8e7022f32bb84c4ac005d79baf8b08e2c5be44facf11f5f1f9944ba2
@@ -311,6 +372,7 @@ services:
       LOADTEST_DATAFLOW_ROOT: /delta/dataflow
       LOADTEST_DRAIN_TIMEOUT: ${LOADTEST_DRAIN_TIMEOUT:-2m}
       LOADTEST_REQUIRE_ALL_COLLECTORS: ${LOADTEST_REQUIRE_ALL_COLLECTORS:-true}
+      LOADTEST_KUSTO_ENDPOINT: http://${LOADTEST_KUSTO_IP:-10.89.0.50}:8080
     volumes:
       - type: bind
         source: ${ONELAKE_HOST_PATH:?Run through Nx}/results
@@ -353,6 +415,9 @@ secrets:
 volumes:
   sqlserver-data:
   hive-warehouse:
+  kusto-data:
+    labels:
+      io.arrowcol.loadtest.workspace: ${LOADTEST_WORKSPACE:?Run through Nx}
 
 networks:
   default:

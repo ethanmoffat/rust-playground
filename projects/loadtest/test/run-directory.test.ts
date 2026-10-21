@@ -35,9 +35,20 @@ function mockDocker(workspace: string): { commands: string[][]; docker: (args: s
     { id: 'unrelated', name: 'unrelated', labels: labelled('another-project') },
   ];
   const volumes: Resource[] = [
-    { id: `${BENCHMARK_PROJECT}_sqlserver-data`, name: `${BENCHMARK_PROJECT}_sqlserver-data`,
-      labels: { ...labelled(BENCHMARK_PROJECT), 'com.docker.compose.volume': 'sqlserver-data' } },
+    ...['sqlserver-data', 'hive-warehouse', 'kusto-data'].map(volume => ({
+      id: `${BENCHMARK_PROJECT}_${volume}`, name: `${BENCHMARK_PROJECT}_${volume}`,
+      labels: { ...labelled(BENCHMARK_PROJECT), 'com.docker.compose.volume': volume,
+        'io.arrowcol.loadtest.workspace': workspace },
+    })),
     { id: 'other-volume', name: 'other-volume', labels: labelled('another-project') },
+    { id: 'another-project_kusto-data', name: 'another-project_kusto-data',
+      labels: { ...labelled('another-project'), 'com.docker.compose.volume': 'kusto-data',
+        'io.arrowcol.loadtest.workspace': workspace } },
+    { id: `${BENCHMARK_PROJECT}_not-allowlisted`, name: `${BENCHMARK_PROJECT}_not-allowlisted`,
+      labels: { ...labelled(BENCHMARK_PROJECT), 'com.docker.compose.volume': 'not-allowlisted' } },
+    { id: 'wrong-name-kusto', name: 'wrong-name-kusto',
+      labels: { ...labelled(BENCHMARK_PROJECT), 'com.docker.compose.volume': 'kusto-data',
+        'io.arrowcol.loadtest.workspace': workspace } },
   ];
   const networks: Resource[] = [
     { id: 'network', name: `${BENCHMARK_PROJECT}_default`, labels: labelled(BENCHMARK_PROJECT),
@@ -74,7 +85,7 @@ test('Delta output has one fixed location', () => {
   ].join('\n'));
 });
 
-test('starting again removes old output and owned SQL resources without an identity flag', async t => {
+test('starting again removes old output and owned SQL, Hive and Kusto resources without an identity flag', async t => {
   const workspace = fixture(t);
   const latest = path.join(workspace, 'onelake/benchmark/latest');
   mkdirSync(latest, { recursive: true });
@@ -82,14 +93,42 @@ test('starting again removes old output and owned SQL resources without an ident
   const { docker, commands } = mockDocker(workspace);
   assert.equal(await resetBenchmark(workspace, docker), latest);
   assert(!existsSync(path.join(latest, 'old.json')));
-  assert(commands.some(args => args.join(' ') === `volume rm ${BENCHMARK_PROJECT}_sqlserver-data`));
+  for (const volume of ['sqlserver-data', 'hive-warehouse', 'kusto-data']) {
+    assert(commands.some(args => args.join(' ') === `volume rm ${BENCHMARK_PROJECT}_${volume}`));
+  }
   assert(commands.some(args => args.join(' ') === 'rm collector'));
   assert(commands.every(args => !args.includes('unrelated') || args.includes('inspect')));
   assert(commands.every(args => !args.includes('other-volume') || args.includes('inspect')));
+  for (const volume of ['another-project_kusto-data', `${BENCHMARK_PROJECT}_not-allowlisted`, 'wrong-name-kusto']) {
+    assert(commands.every(args => !args.includes(volume) || args.includes('inspect')));
+  }
   writeFileSync(path.join(latest, 'second.json'), '{}');
   assert.equal(await resetBenchmark(workspace, docker), latest);
   assert(!existsSync(path.join(latest, 'second.json')));
 });
+
+for (const owner of [undefined, '/another-workspace']) {
+  test(`Kusto storage with ${owner ? 'foreign' : 'missing'} workspace ownership is rejected even without containers`, async t => {
+    const workspace = fixture(t);
+    const latest = path.join(workspace, 'onelake/benchmark/latest');
+    mkdirSync(latest, { recursive: true });
+    writeFileSync(path.join(latest, 'keep.txt'), 'keep');
+    const { docker, commands } = mockDocker(workspace);
+    await assert.rejects(resetBenchmark(workspace, args => {
+      if (args[0] === 'ps') return '';
+      const text = docker(args);
+      if (args[0] === 'volume' && args[1] === 'inspect' && args.at(-1) === `${BENCHMARK_PROJECT}_kusto-data`) {
+        const resource = JSON.parse(text);
+        if (owner) resource.labels['io.arrowcol.loadtest.workspace'] = owner;
+        else delete resource.labels['io.arrowcol.loadtest.workspace'];
+        return JSON.stringify(resource);
+      }
+      return text;
+    }), /Kusto storage owned by another or unverifiable workspace/u);
+    assert(commands.every(args => args[0] !== 'stop' && !args.includes('rm')));
+    assert.equal(readFileSync(path.join(latest, 'keep.txt'), 'utf8'), 'keep');
+  });
+}
 
 test('legacy benchmark data is reset but unrelated directories survive', async t => {
   const workspace = fixture(t);

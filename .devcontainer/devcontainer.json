@@ -36,6 +36,14 @@
     "9444": {
       "label": "Portainer (loadtest; published on the Docker host, reached via WSL localhost)",
       "onAutoForward": "ignore"
+    },
+    "8080": {
+      "label": "Kusto emulator (loadtest; published on the Docker host, reached via WSL localhost)",
+      "onAutoForward": "ignore"
+    },
+    "8090": {
+      "label": "kusto-explorer UI (loadtest; published on the Docker host, reached via WSL localhost)",
+      "onAutoForward": "ignore"
     }
   },
   "customizations": {
@@ -52,8 +60,10 @@
           "**/node_modules/**": true,
           "**/target/**": true
         },
+        "remote.forwardOnOpen": false,
         "rust-analyzer.check.command": "clippy",
-        "terminal.integrated.defaultProfile.linux": "bash"
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "workbench.browser.enableRemoteProxy": false
       }
     }
   }

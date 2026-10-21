@@ -233,6 +233,19 @@ jobs:
             onelake/benchmark/latest/results/
           if-no-files-found: ignore
           retention-days: 7
+      - name: Preserve Kusto query and validation evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: loadtest-kusto-evidence
+          path: |
+            onelake/benchmark/latest/results/kusto-*.json
+            onelake/benchmark/latest/results/kusto-*.jsonl
+            onelake/benchmark/latest/results/kusto-explorer-*.png
+            onelake/benchmark/latest/results/kusto-explorer-browser.log
+            onelake/benchmark/latest/results/validation.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   verify:
     name: Verify in source devcontainer

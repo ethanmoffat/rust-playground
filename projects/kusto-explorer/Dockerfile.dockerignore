@@ -1,0 +1,24 @@
+# BuildKit uses this file instead of the root .dockerignore for projects/kusto-explorer/Dockerfile.
+# Keep the root entries in sync; the extra entries drop locally installed or generated browser build
+# state that the image installs and bundles itself.
+.git
+.github
+.devcontainer
+.nx
+dev
+docs
+node_modules
+target
+tools
+*.log
+.temp
+onelake
+**/.git
+**/.diagnostics
+**/.state
+**/.temp
+**/coverage
+**/secrets
+**/target
+**/node_modules
+**/dist
