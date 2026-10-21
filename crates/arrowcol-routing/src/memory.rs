@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::{
-    CollectorRecord, CollectorRegistration, CollectorState, LeaseCas, LeaseClaim, LeaseState, LeaseTransfer,
-    RichPressureSnapshot, RoutingError, RoutingErrorKind, RoutingLease, RoutingResult, RoutingStore, RoutingView,
+    CollectorRecord, CollectorRegistration, CollectorState, LeaseCas, LeaseClaim, LeaseState, LeaseSuccession,
+    LeaseTransfer, RichPressureSnapshot, RoutingError, RoutingErrorKind, RoutingLease, RoutingResult, RoutingStore,
+    RoutingView,
 };
 
 #[derive(Default)]
@@ -28,6 +29,8 @@ pub struct MemoryOperationCounts {
     pub begin_drain: u64,
     /// Transfer compare-and-set operations.
     pub transfer: u64,
+    /// Crash-succession compare-and-set operations.
+    pub succession: u64,
 }
 
 /// Deterministic in-memory implementation for unit and race tests.
@@ -39,6 +42,7 @@ pub struct MemoryRoutingStore {
     claim_lease: Arc<AtomicU64>,
     begin_drain: Arc<AtomicU64>,
     transfer: Arc<AtomicU64>,
+    succession: Arc<AtomicU64>,
 }
 
 impl Default for MemoryRoutingStore {
@@ -50,6 +54,7 @@ impl Default for MemoryRoutingStore {
             claim_lease: Arc::new(AtomicU64::new(0)),
             begin_drain: Arc::new(AtomicU64::new(0)),
             transfer: Arc::new(AtomicU64::new(0)),
+            succession: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -70,6 +75,7 @@ impl MemoryRoutingStore {
             claim_lease: self.claim_lease.load(Ordering::Relaxed),
             begin_drain: self.begin_drain.load(Ordering::Relaxed),
             transfer: self.transfer.load(Ordering::Relaxed),
+            succession: self.succession.load(Ordering::Relaxed),
         }
     }
 
@@ -306,6 +312,49 @@ impl RoutingStore for MemoryRoutingStore {
         existing.validate()?;
         Ok(existing.clone())
     }
+
+    async fn transfer_to_successor(&self, request: &LeaseSuccession) -> RoutingResult<RoutingLease> {
+        self.succession.fetch_add(1, Ordering::Relaxed);
+        self.ensure_available()?;
+        request.validate()?;
+        let mut state = self.state.lock().await;
+        let existing = state
+            .leases
+            .get(&request.key)
+            .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "routing lease was not found"))?;
+        if existing.lease_version != request.expected_version
+            || existing.holder_instance_id != request.predecessor_instance_id
+            || !existing.is_valid_at(request.now_unix_ms)
+        {
+            return Err(RoutingError::new(
+                RoutingErrorKind::Conflict,
+                "routing lease changed or expired before succession compare-and-set",
+            ));
+        }
+        validate_successor(&state, request)?;
+        let lease = RoutingLease {
+            key: request.key.clone(),
+            lease_id: LeaseId::new(),
+            holder_instance_id: request.successor_instance_id,
+            fencing_epoch: existing.fencing_epoch.next().map_err(|cause| {
+                RoutingError::new(
+                    RoutingErrorKind::CorruptState,
+                    format!("fencing epoch is exhausted: {cause}"),
+                )
+            })?,
+            lease_version: existing.lease_version.checked_add(1).ok_or_else(|| {
+                RoutingError::new(RoutingErrorKind::CorruptState, "routing lease version is exhausted")
+            })?,
+            state: LeaseState::Active,
+            issued_at_unix_ms: request.now_unix_ms,
+            renewed_at_unix_ms: request.now_unix_ms,
+            expires_at_unix_ms: request.expires_at_unix_ms,
+            drain_started_at_unix_ms: None,
+        };
+        lease.validate()?;
+        state.leases.insert(request.key.clone(), lease.clone());
+        Ok(lease)
+    }
 }
 
 impl MemoryRoutingStore {
@@ -333,16 +382,55 @@ fn validate_candidate(
             "selected collector registration was not found",
         )
     })?;
-    if collector.state != CollectorState::Ready
-        || collector.registration.implementation_pool != implementation_pool
-        || collector
-            .pressure
-            .as_ref()
-            .is_none_or(|pressure| pressure.observed_at_unix_ms < minimum_snapshot_at || !pressure.accepting_deliveries)
-    {
+    if !candidate_is_ready(collector, implementation_pool, minimum_snapshot_at) {
         return Err(RoutingError::new(
             RoutingErrorKind::PoolUnavailable,
             "selected collector is no longer ready with fresh accepting pressure",
+        ));
+    }
+    Ok(())
+}
+
+fn candidate_is_ready(
+    collector: &CollectorRecord,
+    implementation_pool: arrowcol_protocol::ImplementationPool,
+    minimum_snapshot_at: UnixMillis,
+) -> bool {
+    collector.state == CollectorState::Ready
+        && collector.registration.implementation_pool == implementation_pool
+        && collector.pressure.as_ref().is_some_and(|pressure| {
+            pressure.observed_at_unix_ms >= minimum_snapshot_at && pressure.accepting_deliveries
+        })
+}
+
+fn validate_successor(state: &MemoryState, request: &LeaseSuccession) -> RoutingResult<()> {
+    let implementation_pool = request.key.implementation_pool;
+    let now = request.now_unix_ms;
+    let predecessor = state
+        .collectors
+        .get(&request.predecessor_instance_id)
+        .filter(|predecessor| {
+            predecessor.registration.implementation_pool == implementation_pool && predecessor.is_terminated_at(now)
+        })
+        .ok_or_else(|| {
+            RoutingError::new(
+                RoutingErrorKind::Conflict,
+                "routing lease predecessor registration is missing or still live",
+            )
+        })?;
+    let is_same_key_restart = state
+        .collectors
+        .get(&request.successor_instance_id)
+        .is_some_and(|successor| {
+            successor.registration.instance_id != predecessor.registration.instance_id
+                && successor.registration.instance_key == predecessor.registration.instance_key
+                && successor.registration.lease_expires_at_unix_ms > now
+                && candidate_is_ready(successor, implementation_pool, request.minimum_snapshot_at_unix_ms)
+        });
+    if !is_same_key_restart {
+        return Err(RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "routing lease successor is not a live, ready restart with the predecessor's instance key",
         ));
     }
     Ok(())

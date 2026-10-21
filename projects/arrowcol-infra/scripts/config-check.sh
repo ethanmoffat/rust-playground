@@ -18,8 +18,8 @@ while IFS= read -r script; do
 done < <(find "$PROJECT_ROOT/scripts" "$PROJECT_ROOT/docker" -type f -name '*.sh' -print | sort)
 
 mapfile -t migrations < <(find "$PROJECT_ROOT/migrations" -maxdepth 1 -type f -name 'V*.sql' -print | sort)
-if [[ "${#migrations[@]}" -ne 8 ]]; then
-  echo "Expected exactly 8 versioned migrations, found ${#migrations[@]}" >&2
+if [[ "${#migrations[@]}" -ne 9 ]]; then
+  echo "Expected exactly 9 versioned migrations, found ${#migrations[@]}" >&2
   exit 1
 fi
 

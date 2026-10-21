@@ -10,12 +10,33 @@ test('durations accept whole-number units', () => {
   assert.throws(() => parseDuration('1.5m', 'd'), /must look like/u);
 });
 
-test('the normal command has no execution naming or fault modes', () => {
+test('the normal command has no execution naming or generic fault modes', () => {
   assert(!('runId' in parseBenchmarkOptions([])));
   assert(!/run-id|chaos|soak/u.test(benchmarkUsage));
   for (const option of ['--run-id', '--chaos', '--soak']) {
     assert.throws(() => parseBenchmarkOptions([option, 'value']), /Unknown option/u);
   }
+  const defaults = parseBenchmarkOptions([]);
+  assert.equal(defaults.quiver, false);
+  assert.equal(defaults.crashAfterSeconds, undefined);
+});
+
+test('--quiver enables disk persistence and --crash-after requires it', () => {
+  assert.equal(parseBenchmarkOptions(['--quiver']).quiver, true);
+  const crash = parseBenchmarkOptions(['--quiver', '--crash-after', '20s']);
+  assert.deepEqual([crash.quiver, crash.crashAfterSeconds], [true, 20]);
+  assert.equal(parseBenchmarkOptions(['--crash-after=1m', '--quiver']).crashAfterSeconds, 60);
+  assert.throws(() => parseBenchmarkOptions(['--crash-after', '20s']), /requires --quiver/u);
+  assert.throws(() => parseBenchmarkOptions(['--quiver', '--crash-after', '0s']), /must be positive/u);
+  assert.match(benchmarkUsage, /--quiver/u);
+});
+
+test('--crash-after must interrupt live load', () => {
+  const crash = parseBenchmarkOptions(['--quiver', '--warmup', '5s', '--measure', '60s', '--crash-after', '15s']);
+  assert.equal(crash.crashAfterSeconds, 15);
+  assert.throws(() => parseBenchmarkOptions(['--quiver', '--warmup', '5s', '--measure', '10s', '--crash-after', '15s']),
+    /shorter than --warmup \+ --measure/u);
+  assert.equal(parseBenchmarkOptions(['--quiver', '--crash-after', '1h']).crashAfterSeconds, 3600, 'continuous runs accept any delay');
 });
 
 test('defaults and overrides', () => {

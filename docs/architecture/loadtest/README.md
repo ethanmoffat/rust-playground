@@ -12,7 +12,8 @@ In paired mode, both collector pools receive the same logical batch:
 
 - the direct path polls each SQL-backed receipt until `published` or a
   structured terminal failure; and
-- the DFE path records only `best_effort_admission`.
+- the DFE path records only `best_effort_admission`, or `durable_admission`
+  when `--quiver` persists both pools to Quiver on local disk.
 
 The two pools write separate Delta roots. The independent validator compares
 schemas, rows, logical batch manifests, paired payload hashes, routing leases,
@@ -172,6 +173,10 @@ Run the complete OTEL plus Arrow qualification:
 ```bash
 npx --no-install nx run loadtest:e2e
 ```
+
+It runs the baseline, then `--quiver --crash-after 15s`. The second run sends
+`SIGKILL` to both collectors mid-load, restarts them on their Quiver
+directories, and requires every acknowledged row in Delta.
 
 Run the Arrow failure/recovery sequence directly:
 

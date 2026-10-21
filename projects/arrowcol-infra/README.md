@@ -125,10 +125,14 @@ The current migrations define:
   snapshots, and one CAS/fencing lease per implementation-pool/table key;
 - SQL Server-generated delivery receipts with optimistic accepted → buffered →
   flushing → published/failure transitions, owner/table-lease fencing,
-  heartbeat/expiry reconciliation, and covering hot-path indexes; and
+  heartbeat/expiry reconciliation, and covering hot-path indexes;
 - append-only ordered receipt events plus durable Delta version/file/row/byte
   observations. Duplicate metadata is intentionally stored as a new delivery;
-  there is no receipt idempotency or deduplication key.
+  there is no receipt idempotency or deduplication key; and
+- per-owner durable receipt recovery windows that keep a live or recently
+  failed durable-buffer owner's receipts out of expiry reconciliation, plus
+  append-only `adopted` receipt events recording a same-key successor's
+  ownership rebinding without changing receipt state or revision.
 
 All application timestamps are `datetime2(7)` columns explicitly named `_utc`.
 SQL stores only control metadata, byte counts, and fixed-size SHA-256 hashes.
@@ -143,8 +147,9 @@ the external delivery destination.
 2. SQL Server and Metastore health.
 3. Separate online databases and expected local principals.
 4. All application tables, trusted constraints, filtered/covering hot-path
-   indexes, migration checksums, UTC timestamp policy, and absence of payload
-   byte-storage types.
+   indexes (including the durable-owner-aware expiry scan), durable recovery
+   window and adoption-event columns, migration checksums, UTC timestamp
+   policy, and absence of payload byte-storage types.
 5. Hive core vendor tables and schema version `4.0.0`.
 6. `schematool -validate`/`-info`.
 7. A second database bootstrap, application migration, and Hive schema

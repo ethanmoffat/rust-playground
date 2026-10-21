@@ -310,6 +310,19 @@ pub struct CollectorRecord {
     pub pressure: Option<RichPressureSnapshot>,
 }
 
+impl CollectorRecord {
+    /// Returns whether this process lifetime has ended at an instant: its
+    /// registration lease expired or it reported a terminal stopped or failed
+    /// state.
+    ///
+    /// A terminated holder can never publish a post-drain pressure snapshot.
+    #[must_use]
+    pub fn is_terminated_at(&self, now: UnixMillis) -> bool {
+        now >= self.registration.lease_expires_at_unix_ms
+            || matches!(self.state, CollectorState::Stopped | CollectorState::Failed)
+    }
+}
+
 /// Unique routing ownership key.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LeaseKey {

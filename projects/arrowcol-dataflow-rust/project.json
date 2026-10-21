@@ -54,6 +54,15 @@
         "forwardAllArgs": true
       }
     },
+    "run-quiver": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build"],
+      "options": {
+        "command": "target/debug/arrowcol-dataflow-rust --num-cores 1 --config projects/arrowcol-dataflow-rust/config.quiver.yaml",
+        "forwardAllArgs": true
+      }
+    },
     "image": {
       "executor": "rust-playground-build:docker-build",
       "cache": false,

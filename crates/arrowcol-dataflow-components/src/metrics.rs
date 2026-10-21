@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::Duration;
 
 use arrowcol_catalog::SchemaVersion;
 use arrowcol_protocol::{
@@ -10,14 +11,16 @@ use arrowcol_protocol::{
 };
 use arrowcol_routing::{RichPressureSnapshot, RoutingStore, SubsystemState, TablePressure};
 use serde::Serialize;
+use tokio::sync::watch;
 
-use crate::QUIVER_UNSUPPORTED_GAP;
 use crate::config::now_unix_millis;
 
 static PROCESS_INSTANCE_ID: LazyLock<CollectorInstanceId> = LazyLock::new(CollectorInstanceId::new);
 static GLOBAL_METRICS: LazyLock<Arc<RuntimeMetrics>> =
     LazyLock::new(|| Arc::new(RuntimeMetrics::new(*PROCESS_INSTANCE_ID)));
 const MAX_TABLE_PRESSURE_ENTRIES: usize = 256;
+/// Durable-backlog utilization at which `quiver_state` reports `degraded`.
+const QUIVER_DEGRADED_BPS: u16 = 8_000;
 
 /// Returns the process-lifetime collector identifier shared by every DFE core.
 #[must_use]
@@ -25,10 +28,121 @@ pub fn process_instance_id() -> CollectorInstanceId {
     *PROCESS_INSTANCE_ID
 }
 
+/// Returns the stable deployment key (`registration.instance_key`) of this
+/// process's `receiver:arrow_flight`.
+///
+/// The receiver records the key when it is created. Unlike
+/// [`process_instance_id`], the key survives a restart, which lets the
+/// exporter recognize durable-buffer replays admitted by a crashed predecessor
+/// of the same deployment slot. Returns `None` until a receiver was created.
+#[must_use]
+pub fn process_instance_key() -> Option<String> {
+    GLOBAL_METRICS.instance_key().map(str::to_owned)
+}
+
 /// Returns process-wide Arrowcol component metrics.
 #[must_use]
 pub fn global_metrics() -> Arc<RuntimeMetrics> {
     Arc::clone(&GLOBAL_METRICS)
+}
+
+/// Delivery labels shared by capabilities, readiness, and Prometheus.
+#[derive(Clone, Copy)]
+struct DeliveryContract {
+    delivery_guarantee: &'static str,
+    completion_mode: &'static str,
+    at_least_once: bool,
+    help: &'static str,
+}
+
+impl DeliveryContract {
+    const BEST_EFFORT: Self = Self {
+        delivery_guarantee: "best_effort",
+        completion_mode: "best_effort_admission",
+        at_least_once: false,
+        help: "Admission is best-effort and has no receipt polling.",
+    };
+    const DURABLE_ADMISSION: Self = Self {
+        delivery_guarantee: "durable_admission",
+        completion_mode: "durable_admission",
+        at_least_once: true,
+        help: "Streams complete after durable-buffer persistence; delivery is at-least-once without receipt polling.",
+    };
+
+    const fn select(native_quiver: bool) -> Self {
+        if native_quiver {
+            Self::DURABLE_ADMISSION
+        } else {
+            Self::BEST_EFFORT
+        }
+    }
+}
+
+/// Signed durable-backlog counters for one table.
+///
+/// The receiver adds a batch when the durable buffer acknowledges it, and the
+/// exporter subtracts it once publication succeeds or fails permanently. The
+/// exporter can observe a release before the receiver processes the matching
+/// acknowledgement, so values may be transiently negative; reports clamp them
+/// at zero.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DurableBacklog {
+    batches: i128,
+    rows: i128,
+    bytes: i128,
+}
+
+impl DurableBacklog {
+    fn admit(&mut self, rows: u64, bytes: u64) {
+        self.adjust(1, i128::from(rows), i128::from(bytes));
+    }
+
+    fn release(&mut self, rows: u64, bytes: u64) {
+        self.adjust(-1, -i128::from(rows), -i128::from(bytes));
+    }
+
+    fn adjust(&mut self, batches: i128, rows: i128, bytes: i128) {
+        self.batches = self.batches.saturating_add(batches);
+        self.rows = self.rows.saturating_add(rows);
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.batches == 0 {
+            // A release measures the replayed batch, whose Arrow layout can differ from the admitted
+            // one by a few bytes (for example an elided all-valid null bitmap). Re-anchoring whenever
+            // the backlog is empty keeps such measurement differences from accumulating.
+            self.rows = 0;
+            self.bytes = 0;
+        }
+    }
+
+    fn totals(self) -> DurableTotals {
+        DurableTotals {
+            batches: clamp_backlog(self.batches),
+            rows: clamp_backlog(self.rows),
+            bytes: clamp_backlog(self.bytes),
+        }
+    }
+}
+
+/// Non-negative durable-backlog totals.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DurableTotals {
+    batches: u64,
+    rows: u64,
+    bytes: u64,
+}
+
+impl DurableTotals {
+    fn add(self, other: Self) -> Self {
+        Self {
+            batches: self.batches.saturating_add(other.batches),
+            rows: self.rows.saturating_add(other.rows),
+            bytes: self.bytes.saturating_add(other.bytes),
+        }
+    }
+}
+
+fn clamp_backlog(value: i128) -> u64 {
+    u64::try_from(value.max(0)).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -43,11 +157,14 @@ struct TableState {
     target_schema_version: Option<u64>,
     last_delta_version: Option<u64>,
     publication_failures: u64,
+    durable: DurableBacklog,
 }
 
 /// Atomic process-wide counters shared by receiver, exporter, admin, and registration.
 pub struct RuntimeMetrics {
     instance_id: CollectorInstanceId,
+    instance_key: OnceLock<String>,
+    native_quiver: OnceLock<bool>,
     accepting: AtomicBool,
     healthy: AtomicBool,
     catalog_ready: AtomicBool,
@@ -68,6 +185,12 @@ pub struct RuntimeMetrics {
     delta_rows: AtomicU64,
     delta_bytes: AtomicU64,
     delta_failures: AtomicU64,
+    durable_admitted_batches: AtomicU64,
+    durable_released_batches: AtomicU64,
+    durable_admission_failures: AtomicU64,
+    replayed_batches: AtomicU64,
+    rebound_batches: AtomicU64,
+    replay_deferred_batches: AtomicU64,
     max_concurrent_streams: AtomicU64,
     stream_permits: OnceLock<(usize, Arc<tokio::sync::Semaphore>)>,
     rss_limit_bytes: AtomicU64,
@@ -86,6 +209,8 @@ impl RuntimeMetrics {
     pub fn new(instance_id: CollectorInstanceId) -> Self {
         Self {
             instance_id,
+            instance_key: OnceLock::new(),
+            native_quiver: OnceLock::new(),
             accepting: AtomicBool::new(true),
             healthy: AtomicBool::new(true),
             catalog_ready: AtomicBool::new(false),
@@ -106,6 +231,12 @@ impl RuntimeMetrics {
             delta_rows: AtomicU64::new(0),
             delta_bytes: AtomicU64::new(0),
             delta_failures: AtomicU64::new(0),
+            durable_admitted_batches: AtomicU64::new(0),
+            durable_released_batches: AtomicU64::new(0),
+            durable_admission_failures: AtomicU64::new(0),
+            replayed_batches: AtomicU64::new(0),
+            rebound_batches: AtomicU64::new(0),
+            replay_deferred_batches: AtomicU64::new(0),
             max_concurrent_streams: AtomicU64::new(1),
             stream_permits: OnceLock::new(),
             rss_limit_bytes: AtomicU64::new(1),
@@ -117,6 +248,42 @@ impl RuntimeMetrics {
             tables: Mutex::new(BTreeMap::new()),
             pressure_publication: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Records the receiver's stable instance key and delivery mode once per process.
+    ///
+    /// Every pipeline core creates its own receiver from the same node
+    /// configuration, so repeated identical calls succeed while conflicting
+    /// values are rejected.
+    pub(crate) fn configure_admission(&self, instance_key: &str, native_quiver: bool) -> Result<(), String> {
+        if self.instance_key.get_or_init(|| instance_key.to_owned()) != instance_key {
+            return Err("conflicting process-wide collector instance keys".to_owned());
+        }
+        if *self.native_quiver.get_or_init(|| native_quiver) != native_quiver {
+            return Err("conflicting process-wide native Quiver settings".to_owned());
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn instance_id(&self) -> CollectorInstanceId {
+        self.instance_id
+    }
+
+    pub(crate) fn instance_key(&self) -> Option<&str> {
+        self.instance_key.get().map(String::as_str)
+    }
+
+    /// Returns whether the receiver enabled durable admission through a native
+    /// Quiver `processor:durable_buffer`.
+    #[must_use]
+    pub fn native_quiver_enabled(&self) -> bool {
+        self.native_quiver.get().copied().unwrap_or(false)
+    }
+
+    /// Returns the delivery guarantee label of the configured admission mode.
+    #[must_use]
+    pub fn delivery_guarantee(&self) -> &'static str {
+        DeliveryContract::select(self.native_quiver_enabled()).delivery_guarantee
     }
 
     pub(crate) fn stream_permits(&self, limit: usize) -> Result<Arc<tokio::sync::Semaphore>, String> {
@@ -301,6 +468,49 @@ impl RuntimeMetrics {
         }
     }
 
+    /// Adds one batch the durable buffer acknowledged to this process's durable backlog.
+    pub(crate) fn durable_backlog_admitted(&self, table: &TableIdentity, rows: u64, bytes: u64) {
+        self.durable_admitted_batches.fetch_add(1, Ordering::Relaxed);
+        self.update_table(table, |state| state.durable.admit(rows, bytes));
+    }
+
+    /// Removes one batch admitted by this process once it was published or permanently refused.
+    pub(crate) fn durable_backlog_released(&self, table: &TableIdentity, rows: u64, bytes: u64) {
+        self.durable_released_batches.fetch_add(1, Ordering::Relaxed);
+        self.update_table(table, |state| state.durable.release(rows, bytes));
+    }
+
+    pub(crate) fn durable_admission_failed(&self) {
+        self.durable_admission_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn replayed_batch(&self) {
+        self.replayed_batches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rebound_batch(&self) {
+        self.rebound_batches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn replay_deferred(&self) {
+        self.replay_deferred_batches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sums the clamped per-table durable backlog; zero while native Quiver is disabled.
+    fn durable_totals(&self) -> DurableTotals {
+        if !self.native_quiver_enabled() {
+            return DurableTotals::default();
+        }
+        self.tables.lock().map_or_else(
+            |_| DurableTotals::default(),
+            |tables| {
+                tables.values().fold(DurableTotals::default(), |total, state| {
+                    total.add(state.durable.totals())
+                })
+            },
+        )
+    }
+
     /// Returns current process health.
     #[must_use]
     pub fn healthy(&self) -> bool {
@@ -317,17 +527,24 @@ impl RuntimeMetrics {
     }
 
     /// Returns the dashboard capability document with explicit delivery semantics.
+    ///
+    /// With native Quiver enabled the stream completes only after the durable
+    /// buffer persisted every batch, so acknowledged data survives a crash and
+    /// is replayed (`at_least_once`; duplicates are possible after a retry or
+    /// a replay). Neither mode creates SQL receipts or supports receipt polling.
     #[must_use]
     pub fn capabilities(&self, max_request_bytes: u64) -> DashboardCapabilities {
+        let native_quiver = self.native_quiver_enabled();
+        let contract = DeliveryContract::select(native_quiver);
         DashboardCapabilities {
             protocol_version: ProtocolVersion::CURRENT,
             instance_id: self.instance_id,
             implementation_pool: ImplementationPool::Dataflow,
-            delivery_guarantee: "best_effort",
-            completion_mode: "best_effort_admission",
+            delivery_guarantee: contract.delivery_guarantee,
+            completion_mode: contract.completion_mode,
             receipt_polling: false,
             sql_delivery_receipts: false,
-            at_least_once: false,
+            at_least_once: contract.at_least_once,
             max_request_bytes,
             max_concurrent_streams: self.max_concurrent_streams.load(Ordering::Acquire),
             capabilities: [
@@ -342,8 +559,8 @@ impl RuntimeMetrics {
             flight_sql_control: true,
             dfe_backpressure: true,
             native_quiver: NativeQuiverCapability {
-                supported: false,
-                feature_gap: QUIVER_UNSUPPORTED_GAP,
+                supported: true,
+                enabled: native_quiver,
             },
         }
     }
@@ -368,16 +585,30 @@ impl RuntimeMetrics {
 
     /// Builds the bounded router pressure document and dashboard annotations.
     ///
+    /// Buffered bytes, rows, and batches cover Flight batches awaiting their
+    /// first DFE acknowledgement plus, with native Quiver enabled, the durable
+    /// backlog: batches the durable buffer acknowledged to this process's
+    /// receiver that the exporter has not yet published or permanently
+    /// refused. `quiver_state` and `quiver_pressure_bps` describe that backlog
+    /// against the configured `registration.buffered_*_limit` values, while
+    /// `dfe_state` and `dfe_pressure_bps` keep describing in-memory DFE work.
+    /// `oldest_buffer_age_ms` covers only in-memory DFE work.
+    ///
     /// # Errors
     ///
     /// Returns a clock or bounded-measurement error when a snapshot cannot be
     /// represented by the routing contract.
     pub fn pressure(&self) -> Result<DashboardPressure, String> {
         let now = now_unix_millis()?;
+        let native_quiver = self.native_quiver_enabled();
         let active = self.active_streams.load(Ordering::Acquire);
-        let buffered_bytes = self.buffered_bytes.load(Ordering::Acquire);
-        let buffered_rows = self.buffered_rows.load(Ordering::Acquire);
-        let buffered_batches = self.buffered_batches.load(Ordering::Acquire);
+        let dfe_bytes = self.buffered_bytes.load(Ordering::Acquire);
+        let dfe_rows = self.buffered_rows.load(Ordering::Acquire);
+        let dfe_batches = self.buffered_batches.load(Ordering::Acquire);
+        let backlog = self.durable_totals();
+        let buffered_bytes = dfe_bytes.saturating_add(backlog.bytes);
+        let buffered_rows = dfe_rows.saturating_add(backlog.rows);
+        let buffered_batches = dfe_batches.saturating_add(backlog.batches);
         let pending_commits = self.pending_commits.load(Ordering::Acquire);
         let max_streams = self.max_concurrent_streams.load(Ordering::Acquire).max(1);
         let rss_limit = self.rss_limit_bytes.load(Ordering::Acquire).max(1);
@@ -389,15 +620,42 @@ impl RuntimeMetrics {
         let commit_limit = self.max_pending_commits.load(Ordering::Acquire).max(1);
         let available = max_streams.saturating_sub(active.min(max_streams));
         let oldest_age = self.oldest_buffer_age(now.get());
-        let accepting = self.accepting.load(Ordering::Acquire)
+        let dfe_accepting = self.accepting.load(Ordering::Acquire)
             && actual_rss <= rss_limit
+            && dfe_bytes <= bytes_limit
+            && dfe_rows <= rows_limit
+            && dfe_batches <= batches_limit
+            && pending_commits <= commit_limit;
+        let accepting = dfe_accepting
             && buffered_bytes <= bytes_limit
             && buffered_rows <= rows_limit
-            && buffered_batches <= batches_limit
-            && pending_commits <= commit_limit;
-        let tables = self.table_pressure(now.get());
-        let dfe_pressure = ratio_bps(buffered_batches.min(batches_limit), batches_limit)?;
+            && buffered_batches <= batches_limit;
+        let tables = self.table_pressure(now.get(), native_quiver);
+        let dfe_pressure = ratio_bps(dfe_batches.min(batches_limit), batches_limit)?;
         let delta_pressure = ratio_bps(pending_commits.min(commit_limit), commit_limit)?;
+        let (quiver_pressure, quiver_state) = if native_quiver {
+            let pressure = [
+                ratio_bps(backlog.bytes, bytes_limit)?.get(),
+                ratio_bps(backlog.rows, rows_limit)?.get(),
+                ratio_bps(backlog.batches, batches_limit)?.get(),
+            ]
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+            let state = if backlog.bytes > bytes_limit || backlog.rows > rows_limit || backlog.batches > batches_limit {
+                SubsystemState::Blocked
+            } else if pressure >= QUIVER_DEGRADED_BPS {
+                SubsystemState::Degraded
+            } else {
+                SubsystemState::Ready
+            };
+            (BasisPoints::new(pressure).map_err(|error| error.to_string())?, state)
+        } else {
+            (
+                BasisPoints::new(0).map_err(|error| error.to_string())?,
+                SubsystemState::Disabled,
+            )
+        };
         let rich = RichPressureSnapshot {
             instance_id: self.instance_id,
             observed_at_unix_ms: now,
@@ -415,7 +673,7 @@ impl RuntimeMetrics {
             pending_commits: gauge(pending_commits, commit_limit)?,
             oldest_buffer_age_ms: measurement(oldest_age)?,
             delta_pressure_bps: delta_pressure,
-            quiver_pressure_bps: BasisPoints::new(0).map_err(|error| error.to_string())?,
+            quiver_pressure_bps: quiver_pressure,
             dfe_pressure_bps: dfe_pressure,
             delta_state: if pending_commits > commit_limit {
                 SubsystemState::Blocked
@@ -424,10 +682,10 @@ impl RuntimeMetrics {
             } else {
                 SubsystemState::Ready
             },
-            quiver_state: SubsystemState::Disabled,
-            dfe_state: if !accepting {
+            quiver_state,
+            dfe_state: if !dfe_accepting {
                 SubsystemState::Blocked
-            } else if buffered_batches > 0 {
+            } else if dfe_batches > 0 {
                 SubsystemState::Degraded
             } else {
                 SubsystemState::Ready
@@ -440,10 +698,20 @@ impl RuntimeMetrics {
             table_versions: self.table_versions(),
             actual_rss_bytes: actual_rss,
             dfe_channel_capacity: self.dfe_channel_capacity.load(Ordering::Acquire),
-            dfe_channel_occupancy: buffered_batches,
-            dfe_channel_occupancy_source: "ack_tracked_end_to_end",
-            native_quiver_buffered_bytes: None,
-            native_quiver_feature_gap: QUIVER_UNSUPPORTED_GAP,
+            dfe_channel_occupancy: dfe_batches,
+            dfe_channel_occupancy_source: if native_quiver {
+                "ack_tracked_until_durable_admission"
+            } else {
+                "ack_tracked_end_to_end"
+            },
+            native_quiver_enabled: native_quiver,
+            native_quiver_buffered_bytes: native_quiver.then_some(backlog.bytes),
+            native_quiver_buffered_rows: native_quiver.then_some(backlog.rows),
+            native_quiver_buffered_batches: native_quiver.then_some(backlog.batches),
+            native_quiver_backlog_source: native_quiver.then_some("durable_acks_minus_exporter_resolutions"),
+            replayed_batches: self.replayed_batches.load(Ordering::Acquire),
+            rebound_batches: self.rebound_batches.load(Ordering::Acquire),
+            replay_deferred_batches: self.replay_deferred_batches.load(Ordering::Acquire),
         })
     }
 
@@ -455,7 +723,7 @@ impl RuntimeMetrics {
             .map_or(0, |oldest| now_ms.saturating_sub(oldest))
     }
 
-    fn table_pressure(&self, now_ms: u64) -> Vec<TablePressure> {
+    fn table_pressure(&self, now_ms: u64, native_quiver: bool) -> Vec<TablePressure> {
         self.tables.lock().map_or_else(
             |_| Vec::new(),
             |tables| {
@@ -463,16 +731,23 @@ impl RuntimeMetrics {
                     .iter()
                     .take(MAX_TABLE_PRESSURE_ENTRIES)
                     .filter_map(|(table, state)| {
+                        let backlog = if native_quiver {
+                            state.durable.totals()
+                        } else {
+                            DurableTotals::default()
+                        };
+                        let buffered_batches = state.buffered_batches.saturating_add(backlog.batches);
                         let effective_active = state
                             .active_streams
-                            .saturating_add(state.buffered_batches)
+                            .saturating_add(buffered_batches)
                             .saturating_add(state.pending_commits);
                         Some(TablePressure {
                             table: table.clone(),
                             active_streams: Measurement::new(effective_active).ok()?,
-                            buffered_bytes: Measurement::new(state.buffered_bytes).ok()?,
-                            buffered_rows: Measurement::new(state.buffered_rows).ok()?,
-                            buffered_batches: Measurement::new(state.buffered_batches).ok()?,
+                            buffered_bytes: Measurement::new(state.buffered_bytes.saturating_add(backlog.bytes))
+                                .ok()?,
+                            buffered_rows: Measurement::new(state.buffered_rows.saturating_add(backlog.rows)).ok()?,
+                            buffered_batches: Measurement::new(buffered_batches).ok()?,
                             oldest_buffer_age_ms: Measurement::new(
                                 state
                                     .oldest_buffered_at_ms
@@ -558,11 +833,71 @@ impl RuntimeMetrics {
             let _ = writeln!(output, "# TYPE {name} gauge");
             let _ = writeln!(output, "{name} {value}");
         }
-        output
-            .push_str("# HELP arrowcol_delivery_guarantee_info Admission is best-effort and has no receipt polling.\n");
+        let backlog = self.durable_totals();
+        for (name, help, value) in [
+            (
+                "arrowcol_dataflow_durable_backlog_batches",
+                "Batches the durable buffer acknowledged to this process that are not yet published or permanently refused.",
+                backlog.batches,
+            ),
+            (
+                "arrowcol_dataflow_durable_backlog_rows",
+                "Rows in the durable backlog.",
+                backlog.rows,
+            ),
+            (
+                "arrowcol_dataflow_durable_backlog_bytes",
+                "Logical Arrow bytes in the durable backlog.",
+                backlog.bytes,
+            ),
+        ] {
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} gauge");
+            let _ = writeln!(output, "{name} {value}");
+        }
+        for (name, help, value) in [
+            (
+                "arrowcol_dataflow_durable_admitted_batches_total",
+                "Batches the durable buffer acknowledged to this process's receiver.",
+                self.durable_admitted_batches.load(Ordering::Acquire),
+            ),
+            (
+                "arrowcol_dataflow_durable_released_batches_total",
+                "Batches admitted by this process that the exporter published or permanently refused.",
+                self.durable_released_batches.load(Ordering::Acquire),
+            ),
+            (
+                "arrowcol_dataflow_durable_admission_failures_total",
+                "Flight streams failed because the durable buffer rejected a batch or did not acknowledge it in time.",
+                self.durable_admission_failures.load(Ordering::Acquire),
+            ),
+            (
+                "arrowcol_dataflow_replayed_batches_total",
+                "Export attempts for batches admitted by a predecessor process lifetime, including retries.",
+                self.replayed_batches.load(Ordering::Acquire),
+            ),
+            (
+                "arrowcol_dataflow_rebound_batches_total",
+                "Export attempts whose envelope lease was rebound to the current lease held by this process.",
+                self.rebound_batches.load(Ordering::Acquire),
+            ),
+            (
+                "arrowcol_dataflow_replay_deferred_total",
+                "Export attempts refused transiently because the batch could not be bound to a lease held by this process.",
+                self.replay_deferred_batches.load(Ordering::Acquire),
+            ),
+        ] {
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} counter");
+            let _ = writeln!(output, "{name} {value}");
+        }
+        let contract = DeliveryContract::select(self.native_quiver_enabled());
+        let _ = writeln!(output, "# HELP arrowcol_delivery_guarantee_info {}", contract.help);
         output.push_str("# TYPE arrowcol_delivery_guarantee_info gauge\n");
-        output.push_str(
-            "arrowcol_delivery_guarantee_info{delivery_guarantee=\"best_effort\",completion_mode=\"best_effort_admission\",receipt_polling=\"false\",at_least_once=\"false\"} 1\n",
+        let _ = writeln!(
+            output,
+            "arrowcol_delivery_guarantee_info{{delivery_guarantee=\"{}\",completion_mode=\"{}\",receipt_polling=\"false\",at_least_once=\"{}\"}} 1",
+            contract.delivery_guarantee, contract.completion_mode, contract.at_least_once,
         );
         output
     }
@@ -592,10 +927,14 @@ pub struct DashboardCapabilities {
 }
 
 /// Native durable-buffer capability.
+///
+/// `supported` is always true: this build persists `arrowcol.flight@1.1`
+/// through `processor:durable_buffer`. `enabled` reports whether the receiver
+/// was configured with `native_quiver: true`.
 #[derive(Clone, Debug, Serialize)]
 pub struct NativeQuiverCapability {
     supported: bool,
-    feature_gap: &'static str,
+    enabled: bool,
 }
 
 /// Rich pressure plus implementation-specific occupancy provenance.
@@ -609,8 +948,14 @@ pub struct DashboardPressure {
     dfe_channel_capacity: u64,
     dfe_channel_occupancy: u64,
     dfe_channel_occupancy_source: &'static str,
+    native_quiver_enabled: bool,
     native_quiver_buffered_bytes: Option<u64>,
-    native_quiver_feature_gap: &'static str,
+    native_quiver_buffered_rows: Option<u64>,
+    native_quiver_buffered_batches: Option<u64>,
+    native_quiver_backlog_source: Option<&'static str>,
+    replayed_batches: u64,
+    rebound_batches: u64,
+    replay_deferred_batches: u64,
 }
 
 /// Version lineage retained for one logical table.
@@ -629,9 +974,78 @@ struct PendingBatch {
     rows: u64,
     bytes: u64,
     enqueued_at_ms: u64,
+    durable: Option<Arc<DurableStream>>,
 }
 
-/// Correlates DFE Ack/Nack feedback with pressure accounting.
+/// Feedback counts for one durable-admission Flight stream.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DurableProgress {
+    /// Batches sent downstream with durable-admission feedback requested.
+    pub(crate) sent: u64,
+    /// Batches the durable buffer acknowledged after its WAL append.
+    pub(crate) acknowledged: u64,
+    /// Batches the durable buffer refused, or whose send failed or was cancelled.
+    pub(crate) rejected: u64,
+}
+
+impl DurableProgress {
+    /// Returns whether the stream's outcome is known: one rejection fails it,
+    /// and it succeeds once every sent batch was acknowledged.
+    pub(crate) const fn settled(self) -> bool {
+        self.rejected > 0 || self.acknowledged >= self.sent
+    }
+}
+
+/// Durable-admission progress for one Flight stream.
+///
+/// The stream lifecycle and each of its pending DFE entries share this state,
+/// so feedback for any correlation ID wakes the stream's completion. Entries
+/// release their reference when their feedback arrives, and an abandoned
+/// stream holds nothing else, so aborted streams leak no waiters.
+#[derive(Debug)]
+pub(crate) struct DurableStream {
+    progress: watch::Sender<DurableProgress>,
+}
+
+impl DurableStream {
+    pub(crate) fn new() -> Self {
+        Self {
+            progress: watch::Sender::new(DurableProgress::default()),
+        }
+    }
+
+    fn register(&self) {
+        self.progress
+            .send_modify(|progress| progress.sent = progress.sent.saturating_add(1));
+    }
+
+    fn record(&self, ack: bool) {
+        self.progress.send_modify(|progress| {
+            if ack {
+                progress.acknowledged = progress.acknowledged.saturating_add(1);
+            } else {
+                progress.rejected = progress.rejected.saturating_add(1);
+            }
+        });
+    }
+
+    /// Returns the current feedback counts.
+    pub(crate) fn progress(&self) -> DurableProgress {
+        *self.progress.borrow()
+    }
+
+    /// Waits until the stream is settled, or returns `None` after `timeout`.
+    pub(crate) async fn settled(&self, timeout: Duration) -> Option<DurableProgress> {
+        let mut progress = self.progress.subscribe();
+        let settled = tokio::time::timeout(timeout, progress.wait_for(|progress| progress.settled())).await;
+        match settled {
+            Ok(Ok(progress)) => Some(*progress),
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+}
+
+/// Correlates DFE Ack/Nack feedback with pressure accounting and durable admission.
 pub(crate) struct PendingTracker {
     metrics: Arc<RuntimeMetrics>,
     next_id: AtomicU64,
@@ -647,6 +1061,7 @@ impl PendingTracker {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn insert(
         &self,
         table: TableIdentity,
@@ -655,12 +1070,29 @@ impl PendingTracker {
         source: SchemaVersion,
         target: SchemaVersion,
     ) -> Result<u64, String> {
+        self.insert_for_stream(table, rows, bytes, source, target, None)
+    }
+
+    /// Registers one outbound batch. With a durable stream, its feedback also
+    /// settles the stream and an ACK moves the batch into the durable backlog.
+    pub(crate) fn insert_for_stream(
+        &self,
+        table: TableIdentity,
+        rows: u64,
+        bytes: u64,
+        source: SchemaVersion,
+        target: SchemaVersion,
+        durable: Option<Arc<DurableStream>>,
+    ) -> Result<u64, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if id == u64::MAX {
             return Err("DFE message correlation ID exhausted".to_owned());
         }
         let now = now_unix_millis()?.get();
         self.metrics.batch_buffered(&table, rows, bytes, source, target, now);
+        if let Some(stream) = &durable {
+            stream.register();
+        }
         self.pending
             .lock()
             .map_err(|_| "pending DFE tracker lock poisoned".to_owned())?
@@ -671,6 +1103,7 @@ impl PendingTracker {
                     rows,
                     bytes,
                     enqueued_at_ms: now,
+                    durable,
                 },
             );
         Ok(id)
@@ -689,8 +1122,25 @@ impl PendingTracker {
             .map(|other| other.enqueued_at_ms)
             .min();
         drop(pending);
+        // Count the durable backlog before releasing in-memory pressure so a
+        // concurrent snapshot never under-reports the acknowledged batch.
+        if ack && batch.durable.is_some() {
+            self.metrics
+                .durable_backlog_admitted(&batch.table, batch.rows, batch.bytes);
+        }
         self.metrics
             .batch_resolved(&batch.table, batch.rows, batch.bytes, ack, remaining_oldest);
+        if let Some(stream) = batch.durable {
+            stream.record(ack);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_ids(&self) -> Vec<u64> {
+        self.pending
+            .lock()
+            .map(|pending| pending.keys().copied().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -762,11 +1212,13 @@ mod tests {
         assert_eq!(after.rich.buffered_batches.current().get(), 0);
     }
 
-    /// Scenario: Operators inspect DFE delivery claims.
-    /// Guarantees: Capability metadata explicitly denies receipt polling and at-least-once delivery.
+    /// Scenario: Operators inspect DFE delivery claims while native Quiver is disabled.
+    /// Guarantees: Capability metadata stays best-effort without receipt polling or an at-least-once
+    /// claim, reports native Quiver as supported but disabled, and keeps the legacy info metric.
     #[test]
     fn capabilities_label_best_effort() {
         let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        metrics.configure_admission("dfe", false).expect("admission mode");
         let encoded = serde_json::to_value(metrics.capabilities(1024)).expect("capabilities JSON");
         assert_eq!(encoded["delivery_guarantee"], "best_effort");
         assert_eq!(encoded["completion_mode"], "best_effort_admission");
@@ -775,7 +1227,135 @@ mod tests {
         assert_eq!(encoded["at_least_once"], false);
         assert_eq!(encoded["pdata_signal_discriminator"], "logs");
         assert_eq!(encoded["pdata_signal_semantics"], "representation_local_not_otap");
-        assert_eq!(encoded["native_quiver"]["feature_gap"], QUIVER_UNSUPPORTED_GAP);
+        assert_eq!(
+            encoded["native_quiver"],
+            serde_json::json!({"supported": true, "enabled": false})
+        );
+        assert_eq!(metrics.delivery_guarantee(), "best_effort");
+        assert!(metrics.prometheus().contains(
+            "arrowcol_delivery_guarantee_info{delivery_guarantee=\"best_effort\",completion_mode=\"best_effort_admission\",receipt_polling=\"false\",at_least_once=\"false\"} 1\n"
+        ));
+        let pressure = serde_json::to_value(metrics.pressure().expect("pressure")).expect("pressure JSON");
+        assert_eq!(pressure["rich"]["quiver_state"], "disabled");
+        assert_eq!(pressure["native_quiver_enabled"], false);
+        assert_eq!(pressure["native_quiver_buffered_bytes"], serde_json::Value::Null);
+        assert_eq!(pressure["dfe_channel_occupancy_source"], "ack_tracked_end_to_end");
+        assert!(pressure.get("native_quiver_feature_gap").is_none());
+    }
+
+    /// Scenario: Operators inspect DFE delivery claims while native Quiver durable admission is enabled.
+    /// Guarantees: Capabilities, readiness labels, and the Prometheus info metric report
+    /// `durable_admission` with at-least-once delivery and without receipts or receipt polling.
+    #[test]
+    fn capabilities_label_durable_admission() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        metrics.configure_admission("dfe", true).expect("admission mode");
+        let encoded = serde_json::to_value(metrics.capabilities(1024)).expect("capabilities JSON");
+        assert_eq!(encoded["delivery_guarantee"], "durable_admission");
+        assert_eq!(encoded["completion_mode"], "durable_admission");
+        assert_eq!(encoded["receipt_polling"], false);
+        assert_eq!(encoded["sql_delivery_receipts"], false);
+        assert_eq!(encoded["at_least_once"], true);
+        assert_eq!(
+            encoded["native_quiver"],
+            serde_json::json!({"supported": true, "enabled": true})
+        );
+        assert_eq!(metrics.delivery_guarantee(), "durable_admission");
+        let exposition = metrics.prometheus();
+        assert!(exposition.contains(
+            "arrowcol_delivery_guarantee_info{delivery_guarantee=\"durable_admission\",completion_mode=\"durable_admission\",receipt_polling=\"false\",at_least_once=\"true\"} 1\n"
+        ));
+        assert!(exposition.contains("# TYPE arrowcol_dataflow_rebound_batches_total counter\n"));
+        let pressure = serde_json::to_value(metrics.pressure().expect("pressure")).expect("pressure JSON");
+        assert_eq!(pressure["rich"]["quiver_state"], "ready");
+        assert_eq!(pressure["native_quiver_enabled"], true);
+        assert_eq!(pressure["native_quiver_buffered_bytes"], 0);
+        assert_eq!(
+            pressure["native_quiver_backlog_source"],
+            "durable_acks_minus_exporter_resolutions"
+        );
+    }
+
+    /// Scenario: The receiver admits durable batches and the exporter releases them, including a release
+    /// observed before its acknowledgement and a replayed layout measured a few bytes smaller.
+    /// Guarantees: Global and per-table pressure include the backlog, `quiver_state` follows the
+    /// configured limits without blocking DFE state, and counters re-anchor to zero once the backlog empties.
+    #[test]
+    fn durable_backlog_pressure_is_honest() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        metrics.configure_receiver(4, u64::MAX / 4, 1_000, 100, 4, 4);
+        metrics.configure_exporter(4);
+        metrics.configure_admission("dfe", true).expect("admission mode");
+        let identity = table();
+        metrics.durable_backlog_admitted(&identity, 3, 128);
+        let pressure = metrics.pressure().expect("pressure");
+        assert_eq!(pressure.rich.buffered_batches.current().get(), 1);
+        assert_eq!(pressure.rich.buffered_rows.current().get(), 3);
+        assert_eq!(pressure.rich.buffered_bytes.current().get(), 128);
+        assert_eq!(pressure.rich.quiver_pressure_bps.get(), 2_500);
+        assert_eq!(pressure.rich.quiver_state, SubsystemState::Ready);
+        assert_eq!(pressure.rich.tables[0].buffered_batches.get(), 1);
+        assert_eq!(pressure.rich.tables[0].active_streams.get(), 1);
+        assert!(!pressure.rich.tables[0].is_drained());
+
+        for _ in 0..3 {
+            metrics.durable_backlog_admitted(&identity, 3, 128);
+        }
+        let pressure = metrics.pressure().expect("pressure");
+        assert_eq!(pressure.rich.quiver_pressure_bps.get(), 10_000);
+        assert_eq!(pressure.rich.quiver_state, SubsystemState::Degraded);
+        assert!(pressure.rich.accepting_deliveries);
+
+        metrics.durable_backlog_admitted(&identity, 3, 128);
+        let pressure = metrics.pressure().expect("pressure");
+        assert_eq!(pressure.rich.quiver_state, SubsystemState::Blocked);
+        assert_eq!(pressure.rich.dfe_state, SubsystemState::Ready);
+        assert!(!pressure.rich.accepting_deliveries);
+
+        for _ in 0..5 {
+            metrics.durable_backlog_released(&identity, 3, 120);
+        }
+        let pressure = metrics.pressure().expect("pressure");
+        assert_eq!(pressure.rich.buffered_batches.current().get(), 0);
+        assert_eq!(pressure.rich.buffered_bytes.current().get(), 0);
+        assert!(pressure.rich.tables[0].is_drained());
+        assert_eq!(pressure.rich.quiver_state, SubsystemState::Ready);
+
+        metrics.durable_backlog_released(&identity, 3, 128);
+        assert_eq!(
+            metrics
+                .pressure()
+                .expect("pressure")
+                .rich
+                .buffered_batches
+                .current()
+                .get(),
+            0
+        );
+        metrics.durable_backlog_admitted(&identity, 3, 128);
+        let pressure = metrics.pressure().expect("pressure");
+        assert_eq!(pressure.rich.buffered_batches.current().get(), 0);
+        assert_eq!(pressure.rich.buffered_rows.current().get(), 0);
+        assert!(
+            metrics
+                .prometheus()
+                .contains("arrowcol_dataflow_durable_released_batches_total 6\n")
+        );
+    }
+
+    /// Scenario: Several pipeline cores record the receiver's instance key and delivery mode.
+    /// Guarantees: Identical settings are shared process-wide, while a conflicting key or mode is rejected.
+    #[test]
+    fn admission_identity_is_process_wide() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        assert_eq!(metrics.instance_key(), None);
+        assert!(!metrics.native_quiver_enabled());
+        metrics.configure_admission("dfe-0", true).expect("first core");
+        metrics.configure_admission("dfe-0", true).expect("second core");
+        assert_eq!(metrics.instance_key(), Some("dfe-0"));
+        assert!(metrics.native_quiver_enabled());
+        assert!(metrics.configure_admission("dfe-1", true).is_err());
+        assert!(metrics.configure_admission("dfe-0", false).is_err());
     }
 
     /// Scenario: Multiple pipeline cores request the collector's stream allowance.

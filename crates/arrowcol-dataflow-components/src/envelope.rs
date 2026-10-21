@@ -15,11 +15,16 @@ use serde::{Deserialize, Serialize};
 
 /// Stable representation ID emitted by the Arrow Flight receiver.
 pub const ARROWCOL_FLIGHT_REPRESENTATION_ID: &str = "arrowcol.flight";
-/// Current representation contract version.
-pub const ARROWCOL_FLIGHT_REPRESENTATION_VERSION: RepresentationVersion = RepresentationVersion::new(1, 0);
+/// Current representation contract version (`arrowcol.flight@1.1`).
+///
+/// Version 1.1 added [`ArrowcolBatchEnvelope::instance_key`], which lets a
+/// restarted collector recognize durable-buffer replays admitted by its
+/// predecessor. Other versions are rejected rather than reinterpreted.
+pub const ARROWCOL_FLIGHT_REPRESENTATION_VERSION: RepresentationVersion = RepresentationVersion::new(1, 1);
 
 const SCHEMA_ID_PREFIX: &str = "arrowcol.flight.v1:";
 const ROOT_TABLE_ID: u32 = 0;
+const MAX_INSTANCE_KEY_BYTES: usize = 200;
 
 /// Arrowcol control metadata carried inside the representation-local schema ID.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -33,10 +38,16 @@ pub struct ArrowcolBatchEnvelope {
     pub target_schema_version: SchemaVersion,
     /// Routing lease lineage.
     pub lease_id: LeaseId,
-    /// Collector that admitted the stream.
+    /// Collector process lifetime that admitted the stream.
     pub holder_instance_id: CollectorInstanceId,
     /// Monotonic routing fencing token.
     pub fencing_token: FencingToken,
+    /// Stable deployment key (`registration.instance_key`) of the admitting collector.
+    ///
+    /// Unlike `holder_instance_id`, the key survives a process restart, so a
+    /// successor that replays the same durable buffer can prove the batch was
+    /// admitted by its own deployment slot.
+    pub instance_key: String,
 }
 
 impl ArrowcolBatchEnvelope {
@@ -45,10 +56,17 @@ impl ArrowcolBatchEnvelope {
     /// # Errors
     ///
     /// Returns an invalid version-range error when the source is newer than
-    /// the aligned target.
+    /// the aligned target, or an invalid instance-key error when the key is
+    /// empty, longer than 200 bytes, or contains control characters.
     pub fn validate(&self) -> Result<(), EnvelopeError> {
         if self.source_schema_version > self.target_schema_version {
             return Err(EnvelopeError::InvalidSchemaVersionRange);
+        }
+        if self.instance_key.is_empty()
+            || self.instance_key.len() > MAX_INSTANCE_KEY_BYTES
+            || self.instance_key.chars().any(char::is_control)
+        {
+            return Err(EnvelopeError::InvalidInstanceKey);
         }
         Ok(())
     }
@@ -182,6 +200,9 @@ pub enum EnvelopeError {
     /// Source schema cannot be newer than the aligned target.
     #[error("Arrowcol pdata source schema version exceeds target schema version")]
     InvalidSchemaVersionRange,
+    /// The admitting collector's instance key is empty, oversized, or contains control characters.
+    #[error("Arrowcol pdata instance key must be 1-200 bytes without control characters")]
+    InvalidInstanceKey,
     /// The Arrow arrays no longer match the admitted schema fingerprint.
     #[error("Arrowcol pdata schema fingerprint mismatch: expected {expected}, got {actual}")]
     SchemaFingerprintMismatch {
@@ -204,6 +225,7 @@ mod tests {
     use arrow_array::{ArrayRef, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use arrowcol_protocol::{CatalogName, CollectorInstanceId, FencingToken, LeaseId, SchemaName, TableName};
+    use base64::Engine as _;
 
     use super::*;
 
@@ -219,11 +241,41 @@ mod tests {
             lease_id: LeaseId::new(),
             holder_instance_id: CollectorInstanceId::new(),
             fencing_token: FencingToken::new(7).expect("fence"),
+            instance_key: "arrowcol-dataflow-0".to_owned(),
         }
     }
 
+    fn records_with_version(version: RepresentationVersion) -> PdataArrowRecordSet {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)]));
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(UInt64Array::from(vec![1]))]).expect("batch");
+        let fingerprint = fingerprint_schema(schema.as_ref());
+        let table = PdataArrowTable::new(
+            ROOT_TABLE_ID,
+            encode_schema_id(&envelope()).expect("schema id").into(),
+            SchemaFingerprint::new(*fingerprint.as_bytes()),
+            batch,
+        )
+        .expect("table");
+        PdataArrowRecordSet::new(
+            PdataRepresentation::new(PdataRepresentationId::new(ARROWCOL_FLIGHT_REPRESENTATION_ID), version),
+            SignalType::Logs,
+            1,
+            [table],
+        )
+        .expect("records")
+    }
+
+    /// Scenario: The receiver labels pdata with the current Arrowcol representation identity.
+    /// Guarantees: The exact wire label is `arrowcol.flight@1.1`, the version that carries the instance key.
+    #[test]
+    fn representation_is_version_one_one() {
+        assert_eq!(arrowcol_flight_representation().to_string(), "arrowcol.flight@1.1");
+    }
+
     /// Scenario: An arbitrary generated schema is moved into and out of Arrowcol pdata.
-    /// Guarantees: Table/schema/lease metadata and Arrow value-buffer ownership are preserved exactly.
+    /// Guarantees: Table/schema/lease metadata, the admitting instance key, and Arrow value-buffer
+    /// ownership are preserved exactly.
     #[test]
     fn arbitrary_schema_round_trip_is_zero_copy() {
         let ids = Arc::new(UInt64Array::from(vec![1, 2, 3])) as ArrayRef;
@@ -245,6 +297,7 @@ mod tests {
 
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].envelope, expected);
+        assert_eq!(decoded[0].envelope.instance_key, "arrowcol-dataflow-0");
         assert!(Arc::ptr_eq(decoded[0].batch.column(0), &ids));
         let decoded_values = decoded[0]
             .batch
@@ -277,6 +330,63 @@ mod tests {
         assert!(matches!(
             decode_record_set(records),
             Err(EnvelopeError::SchemaFingerprintMismatch { .. })
+        ));
+    }
+
+    /// Scenario: A record set labeled with the previous `arrowcol.flight@1.0` contract reaches the exporter.
+    /// Guarantees: Decoding rejects the unsupported version by name instead of guessing a missing instance key.
+    #[test]
+    fn rejects_previous_representation_version() {
+        let error = decode_record_set(records_with_version(RepresentationVersion::new(1, 0))).expect_err("1.0");
+        assert_eq!(
+            error,
+            EnvelopeError::UnsupportedRepresentation("arrowcol.flight@1.0".to_owned())
+        );
+        assert_eq!(
+            decode_record_set(records_with_version(ARROWCOL_FLIGHT_REPRESENTATION_VERSION))
+                .expect("1.1")
+                .len(),
+            1
+        );
+    }
+
+    /// Scenario: A schema identity omits the v1.1 instance key or adds an unknown field.
+    /// Guarantees: Strict decoding rejects both shapes, and encoding refuses an empty instance key.
+    #[test]
+    fn envelope_fields_are_strict() {
+        let mut value = serde_json::to_value(envelope()).expect("envelope JSON");
+        let object = value.as_object_mut().expect("object");
+        object.remove("instance_key");
+        let missing = format!(
+            "{SCHEMA_ID_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).expect("JSON"))
+        );
+        assert!(matches!(
+            decode_schema_id(&missing.into()),
+            Err(EnvelopeError::InvalidSchemaIdentity(_))
+        ));
+
+        let mut value = serde_json::to_value(envelope()).expect("envelope JSON");
+        value["unexpected"] = serde_json::json!(true);
+        let unknown = format!(
+            "{SCHEMA_ID_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).expect("JSON"))
+        );
+        assert!(matches!(
+            decode_schema_id(&unknown.into()),
+            Err(EnvelopeError::InvalidSchemaIdentity(_))
+        ));
+
+        let mut empty = envelope();
+        empty.instance_key.clear();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)])),
+            vec![Arc::new(UInt64Array::from(vec![1]))],
+        )
+        .expect("batch");
+        assert!(matches!(
+            encode_record_batch(empty, batch),
+            Err(EnvelopeError::InvalidInstanceKey)
         ));
     }
 }

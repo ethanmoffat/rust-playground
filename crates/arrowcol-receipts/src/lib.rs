@@ -2,6 +2,8 @@
 //!
 //! Receipt creation consumes [`arrowcol_catalog::ValidatedIncomingSchema`], so
 //! callers cannot persist an accepted delivery before catalog validation.
+//! [`ValidatedDelivery::recovered`] only rebuilds a delivery that was validated
+//! before its batch was persisted to a collector's local durable buffer.
 //! SQL stores control metadata only; Arrow arrays remain in the buffer crate.
 
 #![forbid(unsafe_code)]
@@ -16,8 +18,9 @@ mod store;
 pub use error::{ReceiptError, ReceiptErrorKind, ReceiptResult};
 pub use fence::LeasePublicationFence;
 pub use model::{
-    FailureDisposition, OwnerDrain, OwnerRegistration, PublicationBatch, ReceiptFailure, ReceiptRecord, ReceiptVersion,
-    ReconciliationReport, TableLeaseRequest, ValidatedDelivery,
+    AdoptionCandidate, FailureDisposition, MAX_DURABLE_RECOVERY_WINDOW_MS, OwnerDrain, OwnerRegistration,
+    PublicationBatch, ReceiptAdoption, ReceiptAdoptionReport, ReceiptFailure, ReceiptRecord, ReceiptVersion,
+    ReconciliationReport, RejectedAdoption, TableLeaseRequest, ValidatedDelivery,
 };
 pub use sql_server::{SqlServerReceiptConfig, SqlServerReceiptStore};
 pub use store::ReceiptStore;

@@ -157,6 +157,14 @@ pub struct RunArgs {
     #[arg(long, env = "LOADTEST_MAX_ATTEMPTS", default_value_t = 16)]
     pub max_attempts: u32,
 
+    /// Keep retrying one pool/logical batch past max attempts until this much time has elapsed.
+    #[arg(long, env = "LOADTEST_RETRY_WINDOW")]
+    pub retry_window: Option<DurationArg>,
+
+    /// Both collectors persist every batch to native Quiver before acknowledging it.
+    #[arg(long, env = "LOADTEST_QUIVER", default_value_t = false)]
+    pub quiver: bool,
+
     /// Router Arrow Flight endpoint.
     #[arg(long, env = "LOADTEST_ROUTER_ENDPOINT", default_value = "http://router:50050")]
     pub router_endpoint: String,
@@ -299,6 +307,10 @@ pub struct ValidateArgs {
         default_value = "http://dataflow-1:32011"
     )]
     pub dataflow_admin_endpoints: Vec<String>,
+
+    /// Both collectors persisted to native Quiver: every acknowledged dataflow row must be published.
+    #[arg(long, env = "LOADTEST_QUIVER", default_value_t = false)]
+    pub quiver: bool,
 }
 
 #[cfg(test)]
@@ -394,6 +406,8 @@ mod tests {
             batch_rows: 1,
             seed: 1,
             max_attempts: 1,
+            retry_window: None,
+            quiver: false,
             router_endpoint: "http://localhost".to_owned(),
             catalog_endpoint: "http://localhost".to_owned(),
             receipt_endpoint: "http://localhost".to_owned(),

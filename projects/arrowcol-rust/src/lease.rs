@@ -7,11 +7,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use arrow_deltalake::commit::BatchedTable;
+use arrowcol_buffer::StageLeases;
 use arrowcol_protocol::{
     CollectorInstanceId, ImplementationPool, PublicationFence, TableIdentity, TableLease, UnixMillis,
 };
 use arrowcol_receipts::{LeasePublicationFence, ReceiptStore, TableLeaseRequest};
 use arrowcol_routing::{LeaseKey, LeaseState, RoutingStore};
+use async_trait::async_trait;
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use uuid::Uuid;
 
@@ -378,4 +380,21 @@ pub fn add_duration(value: UnixMillis, duration: Duration) -> Result<UnixMillis>
     let delta = u64::try_from(duration.as_millis()).context("duration exceeds protocol range")?;
     let value = value.get().checked_add(delta).context("timestamp overflow")?;
     UnixMillis::new(value).map_err(|error| anyhow!(error.to_string()))
+}
+
+#[async_trait]
+impl StageLeases for TableLeaseManager {
+    async fn current_lease(&self, table_id: Uuid, table: &TableIdentity) -> Result<TableLease, String> {
+        let handle = self
+            .lease_for(table_id, table)
+            .await
+            .map_err(|error| format!("acquire table lease: {error:#}"))?;
+        let lease = handle
+            .current()
+            .map_err(|error| format!("load table lease: {error:#}"))?;
+        if lease.holder_instance_id() != self.instance_id {
+            return Err("table lease is held by another collector".to_owned());
+        }
+        Ok(lease)
+    }
 }

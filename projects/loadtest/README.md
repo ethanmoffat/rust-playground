@@ -29,6 +29,8 @@ so you can inspect the charts and output; the next start resets it.
 | `--batch-rows` | Rows per Arrow batch | `8192` |
 | `--measure` | Stop after a finite measurement, such as `5m` | Until Ctrl+C |
 | `--validate` | Check Delta snapshots and native Kusto data after the generator finishes | Off |
+| `--quiver` | Both collectors persist every batch to [Quiver](#disk-persistence-with-quiver) on local disk before acknowledging it, then publish to Delta from disk | Off |
+| `--crash-after` | With `--quiver`, `kill -9` both collectors this long after they start persisting, restart them, and require replay from disk | Off |
 
 Both collectors use two CPUs and matching buffer limits: 128 MiB overall,
 32 MiB per table, and 32 MiB per flush. SQL Server defaults to a 16 GiB memory
@@ -40,6 +42,48 @@ To change the SQL budget (in MiB):
 ```bash
 SQLSERVER_MEMORY_LIMIT_MB=8192 npx nx run loadtest:run -- --warmup 2m --concurrency 8 --batch-rows 1024
 ```
+
+## Disk persistence with Quiver
+
+```bash
+npx nx run loadtest:run -- --quiver --measure 2m --crash-after 30s --validate
+```
+
+`--quiver` puts [Quiver](https://github.com/mdrakiburrahman/otel-arrow/tree/main/rust/otap-dataflow/crates/quiver),
+the OpenTelemetry Arrow write-ahead log and segment store, in front of Delta in
+both collectors. A batch is written and fsynced to disk **before** the client
+gets its acknowledgement, and Delta publication reads it back from disk:
+
+- **Direct** persists each batch with its receipt identity under
+  `direct-state-1/quiver/`. Its receipt is still the delivery contract. The
+  Quiver copy is released only after the receipt reaches `published`.
+- **Dataflow** routes batches through the DFE `durable_buffer` processor under
+  `dataflow-state-1/quiver/core_N/`. The Flight stream completes with
+  `durable_admission`, replacing `best_effort`, only after every batch is on
+  disk. Dataflow still has no SQL receipts.
+
+An fsync per acknowledgement costs throughput; that is the trade-off on show.
+Watch the **Quiver** panels in Grafana for disk usage, backlog, and persist and
+drain rates.
+
+`--crash-after` sends `SIGKILL` to both collectors mid-load, so no drain or
+flush runs. It then restarts them on the same disk.
+
+- The restarted Direct process is a new generation. It adopts its predecessor's
+  receipts and publishes the persisted batches under their original receipt IDs.
+- Dataflow replays its write-ahead log and rebinds the replayed batches to its
+  new table leases.
+
+The load generator keeps retrying through the outage for up to five minutes.
+`results/quiver-recovery.json` records the outage, the backlog on disk at the
+moment of the kill, and the replay counts. The run fails unless both collectors
+replay batches from disk.
+
+With `--quiver`, `--validate` requires **every acknowledged row** in Delta for
+both pools. Without it, Dataflow admission is best effort, so validation only
+requires a published batch per Dataflow table. Recovery is at least once:
+a batch whose publication landed just before the kill can be published again,
+so row counts are lower bounds.
 
 ## Watch and inspect
 
@@ -66,9 +110,11 @@ Do not share startup logs containing local-development passwords.
 Output is always under `onelake/benchmark/latest/`:
 
 ```text
-direct/    Direct Delta tables
-dataflow/  Dataflow Delta tables
-results/   Metrics, manifests, diagnostics, and validation output
+direct/                   Direct Delta tables
+dataflow/                 Dataflow Delta tables
+results/                  Metrics, manifests, diagnostics, and validation output
+direct-state-1/quiver/    Direct Quiver WAL and segments (--quiver)
+dataflow-state-1/quiver/  Dataflow Quiver WAL and segments (--quiver)
 ```
 
 The runner prints the absolute Delta paths at startup. It samples memory,
@@ -148,7 +194,10 @@ npx nx run loadtest:verify
 ```
 
 Its functional E2E uses 1,024-row batches while retaining all 13 schemas and all
-26 native-table assertions. Ordinary `loadtest:run` defaults are unchanged.
+26 native-table assertions. It runs twice in sequence: the baseline, then
+`--quiver --crash-after 15s`. The second run resets the first, so the retained
+results are from the Quiver crash run. Ordinary `loadtest:run` defaults are
+unchanged.
 
 Inspect these files under `onelake/benchmark/latest/results/`:
 
@@ -163,6 +212,7 @@ Inspect these files under `onelake/benchmark/latest/results/`:
 | `kusto-explorer-export.json` | Per-table row counts exported through the UI |
 | `kusto-explorer-*.png` | UI screenshots in the dark and light themes, or `kusto-explorer-failure.png` |
 | `provenance.json` | Image identities and sanitized effective resource configuration |
+| `quiver-recovery.json` | `--crash-after` outage, on-disk backlog at the kill, and replay counts per collector |
 
 Startup diagnostics remain separate if synchronization subsequently recovers.
 Missing or malformed final synchronization status is degraded, never assumed

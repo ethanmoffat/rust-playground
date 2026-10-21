@@ -16,10 +16,10 @@ mod sink;
 pub use config::{BufferConfig, CapacityLimits};
 pub use error::{BufferError, BufferErrorKind, BufferResult};
 pub use manager::{
-    Admission, BufferManager, BufferPressureSnapshot, FlushReason, IncompleteWork, ShutdownReport,
-    TablePressureSnapshot,
+    Admission, BufferManager, BufferPressureSnapshot, DeliveryCompletion, DeliveryOutcome, FlushReason, IncompleteWork,
+    ShutdownReport, TablePressureSnapshot, TrackedState,
 };
-pub use quiver::{PersistenceCapability, QuiverPersistence};
+pub use quiver::{PersistRequest, QuiverStage, QuiverStageConfig, QuiverStageSnapshot, StageLeases};
 pub use sink::{
     DeltaPublicationSink, PublicationContext, PublicationOutcome, PublicationSession, PublicationSink, SinkError,
     SinkErrorKind,

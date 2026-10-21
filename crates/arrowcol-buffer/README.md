@@ -45,14 +45,32 @@ Use `admit_with_timeout` when the transport has a request deadline. Call
 shutdown, first put the SQL owner into draining state, call `shutdown`, resolve
 or report any `IncompleteWork`, and then finish the owner drain.
 
-## Quiver boundary
+## Quiver durable stage
 
-`QuiverPersistence::open` returns
-`BufferErrorKind::UnsupportedCapability`. The checked-in Quiver format is tied
-to fixed OTAP bundle slots and cannot directly persist arbitrary Arrowcol
-table/schema identities, schema fingerprints, receipt IDs, and generic record
-batches. A future adapter must add those native persistence semantics; this
-crate does not invent a lossy mode or map arbitrary tables into OTAP slots.
+`QuiverStage` puts a Quiver write-ahead log and segment store in front of the
+buffer for direct collectors that must not lose acknowledged payloads:
+
+- `persist` writes one accepted delivery (its record batch plus a versioned
+  manifest with the receipt, owner, table lease, and schema identity) to Quiver
+  as bundle metadata. With a zero WAL flush interval it returns only after the
+  WAL fsync, so an acknowledgement implies durable local storage.
+- A consumer reads finalized bundles back from disk, admits them through
+  `BufferManager::admit_tracked`, and acknowledges a bundle only after its
+  receipt is published (or Delta committed). Terminal receipt failures drop the
+  bundle; unknown outcomes defer it for a retry with backoff.
+- After a crash, replayed bundles are reconciled against SQL: published
+  receipts are acknowledged without republishing, failed ones are dropped, and
+  active receipts of a predecessor (or of an older lease) are adopted onto the
+  current owner and lease through `ReceiptStore::adopt_receipts` before they are
+  published. Receipts adopted while `flushing` are published again, so a commit
+  that landed just before the crash can appear twice (at least once).
+- `check_admissible` rejects deliveries that could never fit the buffer before
+  they are persisted. `drain` waits for a stable empty backlog; `snapshot`
+  reports disk usage, backlog, and counters for pressure and metrics.
+
+`admit_tracked` also lets any durable stage admit recovered deliveries whose
+receipts are already `buffered` or `flushing` (`TrackedState`) and returns a
+`DeliveryCompletion` that resolves to a `DeliveryOutcome`.
 
 ## Validation
 
@@ -62,5 +80,7 @@ npx --no-install nx run arrowcol-buffer:verify
 
 Tests cover zero-copy array identity, capacity/backpressure, every flush
 trigger, adaptive convergence, schema isolation, grouped receipt publication,
-receipt and sink failures, stale fencing, cancellation, explicit drain, and
-shutdown reporting.
+receipt and sink failures, stale fencing, cancellation, explicit drain,
+shutdown reporting, publishing persisted batches from disk, crash replay with
+receipt adoption, and acknowledging already-published replays without
+republishing.

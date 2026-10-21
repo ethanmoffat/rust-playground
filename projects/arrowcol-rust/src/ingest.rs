@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow_deltalake::record_batch_logical_bytes;
-use arrowcol_buffer::{Admission, BufferError, BufferErrorKind, BufferManager};
+use arrowcol_buffer::{Admission, BufferError, BufferErrorKind, BufferManager, PersistRequest, QuiverStage};
 use arrowcol_catalog::{CatalogStore, SchemaValidator, ValidatedIncomingSchema};
 use arrowcol_flight::{
     BatchAdmission, PutResultEmitter, PutResultMetadata, RuntimeError, RuntimeResult, StreamAbortReason,
@@ -25,6 +25,7 @@ pub struct DirectAdmission {
     catalog: Arc<dyn CatalogStore>,
     receipts: Arc<dyn ReceiptStore>,
     buffer: Arc<BufferManager>,
+    quiver: Option<Arc<QuiverStage>>,
     leases: Arc<TableLeaseManager>,
     activity: Arc<TableActivity>,
     owner: CollectorInstanceId,
@@ -50,12 +51,23 @@ impl DirectAdmission {
             catalog,
             receipts,
             buffer,
+            quiver: None,
             leases,
             activity,
             owner,
             receipt_lease_duration,
             admission_timeout,
         }
+    }
+}
+
+impl DirectAdmission {
+    /// Persists every accepted batch to the Quiver durable stage before its
+    /// receipt is acknowledged; the stage publishes it from disk.
+    #[must_use]
+    pub fn with_quiver(mut self, quiver: Arc<QuiverStage>) -> Self {
+        self.quiver = Some(quiver);
+        self
     }
 }
 
@@ -87,6 +99,7 @@ impl BatchAdmission for DirectAdmission {
         Ok(Box::new(DirectStream {
             receipts: Arc::clone(&self.receipts),
             buffer: Arc::clone(&self.buffer),
+            quiver: self.quiver.clone(),
             leases: Arc::clone(&self.leases),
             owner: self.owner,
             validation,
@@ -103,6 +116,7 @@ impl BatchAdmission for DirectAdmission {
 struct DirectStream {
     receipts: Arc<dyn ReceiptStore>,
     buffer: Arc<BufferManager>,
+    quiver: Option<Arc<QuiverStage>>,
     leases: Arc<TableLeaseManager>,
     owner: CollectorInstanceId,
     validation: ValidatedIncomingSchema,
@@ -128,6 +142,14 @@ impl StreamLifecycle for DirectStream {
         let bytes = record_batch_logical_bytes(&batch).map_err(|_| RuntimeError::internal())?;
         let delivery = ValidatedDelivery::new(&self.validation, rows, 1, bytes)
             .map_err(|error| receipt_runtime_error(&error, None))?;
+        if self.quiver.is_some() {
+            // A persisted batch is acknowledged before it reaches the buffer, so
+            // reject batches the buffer could never admit while the client can
+            // still be told.
+            self.buffer
+                .check_admissible(delivery.table_id(), rows, bytes, 1)
+                .map_err(|error| buffer_runtime_error(&error))?;
+        }
         let handle = self
             .leases
             .lease_for(delivery.table_id(), delivery.table())
@@ -150,16 +172,31 @@ impl StreamLifecycle for DirectStream {
         let accepted_version = ReceiptVersion::new(accepted.receipt_id, accepted.revision);
         self.pending_receipt = Some(accepted_version);
         let receipt_id = accepted.receipt_id;
-        let admission = Admission {
-            receipt: accepted_version,
-            delivery,
-            lease,
-            batches: vec![batch],
-        };
-        if let Err(error) = self.buffer.admit_with_timeout(admission, self.admission_timeout).await {
-            self.fail_pending("batch could not enter the bounded publication buffer")
-                .await;
-            return Err(buffer_runtime_error(&error).with_receipt_id(receipt_id));
+        if let Some(quiver) = &self.quiver {
+            let request = PersistRequest {
+                receipt: accepted_version,
+                owner: self.owner,
+                delivery: &delivery,
+                lease: &lease,
+                batch,
+            };
+            if let Err(error) = quiver.persist(request, self.admission_timeout).await {
+                self.fail_pending("batch could not be persisted to local durable storage")
+                    .await;
+                return Err(buffer_runtime_error(&error).with_receipt_id(receipt_id));
+            }
+        } else {
+            let admission = Admission {
+                receipt: accepted_version,
+                delivery,
+                lease,
+                batches: vec![batch],
+            };
+            if let Err(error) = self.buffer.admit_with_timeout(admission, self.admission_timeout).await {
+                self.fail_pending("batch could not enter the bounded publication buffer")
+                    .await;
+                return Err(buffer_runtime_error(&error).with_receipt_id(receipt_id));
+            }
         }
         self.pending_receipt = None;
         let summary = StreamSummary::new(1, rows, bytes);
@@ -248,6 +285,11 @@ fn buffer_runtime_error(error: &BufferError) -> RuntimeError {
             ErrorCode::PublicationFailed,
             Code::Unavailable,
             "Delta publication is unavailable",
+        ),
+        BufferErrorKind::DurableStorage => RuntimeError::new(
+            ErrorCode::PublicationFailed,
+            Code::Unavailable,
+            "local durable storage is unavailable",
         ),
         BufferErrorKind::InvalidConfiguration
         | BufferErrorKind::UnsupportedCapability

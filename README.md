@@ -82,7 +82,9 @@ That initial Flight result is **not purge permission**. A client may purge its
 source copy only after the receipt HTTP API reports `published` and
 `purge_allowed: true`, after the fenced Delta commit is durable. The DFE pool
 honestly reports only best-effort admission and has no receipt polling or
-at-least-once claim. See the
+at-least-once claim. With native Quiver (`loadtest:run -- --quiver`), both pools
+fsync every batch to local disk before acknowledging it and replay it after a
+crash, so DFE completion becomes durable admission. See the
 [platform architecture](docs/architecture/arrowcol-platform/README.md) for the full
 catalog, router, receipt, fencing, buffering, and capability contracts.
 

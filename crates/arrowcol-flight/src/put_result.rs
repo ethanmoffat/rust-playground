@@ -15,6 +15,9 @@ pub const PUT_RESULT_WIRE_VERSION: u32 = 1;
 pub enum DeliveryGuarantee {
     /// A durable receipt was created and can be queried.
     DurableReceipt,
+    /// Every batch was persisted to local durable storage before completion;
+    /// the collector owns delivery from there, but no receipt can be queried.
+    DurableAdmission,
     /// The runtime admitted the batches without promising a durable receipt.
     BestEffort,
 }
@@ -26,6 +29,9 @@ pub enum CompletionMode {
     DurableReceipt(ReceiptId),
     /// Dataflow mode admitted the stream on a clearly labeled best-effort basis.
     BestEffortAdmission,
+    /// Dataflow mode persisted every batch to a local durable buffer before
+    /// completing the stream.
+    DurableAdmission,
     /// The implementation emitted one or more durable receipt results while
     /// incrementally admitting batches, so no synthetic final result is added.
     ResultsAlreadyEmitted,
@@ -51,6 +57,15 @@ impl StreamCompletion {
     pub const fn best_effort() -> Self {
         Self {
             mode: CompletionMode::BestEffortAdmission,
+        }
+    }
+
+    /// Creates a durable-admission completion: every batch was persisted to a
+    /// local durable buffer before the stream completed.
+    #[must_use]
+    pub const fn durable_admission() -> Self {
+        Self {
+            mode: CompletionMode::DurableAdmission,
         }
     }
 
@@ -128,6 +143,24 @@ pub enum PutResultMetadata {
         /// Final admitted stream summary.
         summary: StreamSummary,
     },
+    /// Dataflow completion after every batch was persisted to a local durable
+    /// buffer. There is no receipt to poll.
+    DurableAdmission {
+        /// Stable application-metadata wire version.
+        wire_version: u32,
+        /// Arrowcol protocol version.
+        protocol_version: ProtocolVersion,
+        /// Explicit delivery guarantee.
+        delivery_guarantee: DeliveryGuarantee,
+        /// Registered schema version sent by the client.
+        source_schema_version: SchemaVersion,
+        /// Current authoritative target schema version.
+        target_schema_version: SchemaVersion,
+        /// Fingerprint computed from the received Arrow schema.
+        schema_fingerprint: SchemaFingerprint,
+        /// Final admitted stream summary.
+        summary: StreamSummary,
+    },
 }
 
 impl PutResultMetadata {
@@ -168,6 +201,15 @@ impl PutResultMetadata {
                 wire_version: PUT_RESULT_WIRE_VERSION,
                 protocol_version: ProtocolVersion::CURRENT,
                 delivery_guarantee: DeliveryGuarantee::BestEffort,
+                source_schema_version,
+                target_schema_version,
+                schema_fingerprint,
+                summary,
+            }),
+            CompletionMode::DurableAdmission => Some(Self::DurableAdmission {
+                wire_version: PUT_RESULT_WIRE_VERSION,
+                protocol_version: ProtocolVersion::CURRENT,
+                delivery_guarantee: DeliveryGuarantee::DurableAdmission,
                 source_schema_version,
                 target_schema_version,
                 schema_fingerprint,
@@ -225,6 +267,15 @@ impl PutResultMetadata {
                 target_schema_version,
                 ..
             } => *delivery_guarantee == DeliveryGuarantee::BestEffort && source_schema_version <= target_schema_version,
+            Self::DurableAdmission {
+                delivery_guarantee,
+                source_schema_version,
+                target_schema_version,
+                ..
+            } => {
+                *delivery_guarantee == DeliveryGuarantee::DurableAdmission
+                    && source_schema_version <= target_schema_version
+            }
         };
         if !valid {
             return Err(RuntimeError::new(
@@ -262,7 +313,8 @@ impl PutResultMetadata {
         match self {
             Self::Progress { wire_version, .. }
             | Self::Receipt { wire_version, .. }
-            | Self::BestEffortAdmission { wire_version, .. } => *wire_version,
+            | Self::BestEffortAdmission { wire_version, .. }
+            | Self::DurableAdmission { wire_version, .. } => *wire_version,
         }
     }
 
@@ -271,7 +323,7 @@ impl PutResultMetadata {
     pub const fn receipt_id(&self) -> Option<ReceiptId> {
         match self {
             Self::Receipt { receipt_id, .. } => Some(*receipt_id),
-            Self::Progress { .. } | Self::BestEffortAdmission { .. } => None,
+            Self::Progress { .. } | Self::BestEffortAdmission { .. } | Self::DurableAdmission { .. } => None,
         }
     }
 
@@ -280,9 +332,9 @@ impl PutResultMetadata {
     pub const fn delivery_guarantee(&self) -> Option<DeliveryGuarantee> {
         match self {
             Self::Progress { .. } => None,
-            Self::Receipt { delivery_guarantee, .. } | Self::BestEffortAdmission { delivery_guarantee, .. } => {
-                Some(*delivery_guarantee)
-            }
+            Self::Receipt { delivery_guarantee, .. }
+            | Self::BestEffortAdmission { delivery_guarantee, .. }
+            | Self::DurableAdmission { delivery_guarantee, .. } => Some(*delivery_guarantee),
         }
     }
 }
@@ -293,8 +345,55 @@ mod tests {
     use arrowcol_catalog::SchemaVersion;
     use arrowcol_protocol::{SchemaFingerprint, fingerprint_schema};
 
-    use super::{PutResultMetadata, StreamCompletion};
+    use super::{DeliveryGuarantee, PutResultMetadata, StreamCompletion};
     use crate::StreamSummary;
+
+    /// Scenario: A dataflow stream completes after durable-buffer persistence.
+    /// Guarantees: The final PutResult is labeled `durable_admission`, carries no
+    /// receipt, and survives an encode/decode round trip.
+    #[test]
+    fn durable_admission_round_trips_without_receipt() -> Result<(), Box<dyn std::error::Error>> {
+        let fingerprint: SchemaFingerprint = fingerprint_schema(&Schema::empty());
+        let metadata = PutResultMetadata::completion(
+            StreamCompletion::durable_admission(),
+            SchemaVersion::FIRST,
+            SchemaVersion::FIRST,
+            fingerprint,
+            StreamSummary::new(3, 30, 300),
+        )
+        .ok_or("durable admission must produce a completion")?;
+        let encoded = metadata.encode()?;
+        let json: serde_json::Value = serde_json::from_slice(&encoded)?;
+        assert_eq!(json["kind"], "durable_admission");
+        assert_eq!(json["delivery_guarantee"], "durable_admission");
+        assert!(json.get("receipt_id").is_none());
+
+        let decoded = PutResultMetadata::decode(&encoded)?;
+        assert_eq!(decoded, metadata);
+        assert_eq!(decoded.delivery_guarantee(), Some(DeliveryGuarantee::DurableAdmission));
+        assert_eq!(decoded.receipt_id(), None);
+        Ok(())
+    }
+
+    /// Scenario: A durable-admission result claims a different delivery guarantee.
+    /// Guarantees: Decoding rejects the inconsistent label instead of overstating durability.
+    #[test]
+    fn durable_admission_rejects_mismatched_guarantee() -> Result<(), Box<dyn std::error::Error>> {
+        let fingerprint: SchemaFingerprint = fingerprint_schema(&Schema::empty());
+        let metadata = PutResultMetadata::completion(
+            StreamCompletion::durable_admission(),
+            SchemaVersion::FIRST,
+            SchemaVersion::FIRST,
+            fingerprint,
+            StreamSummary::new(1, 1, 1),
+        )
+        .ok_or("durable admission must produce a completion")?;
+        let mut json: serde_json::Value = serde_json::from_slice(&metadata.encode()?)?;
+        json["delivery_guarantee"] = serde_json::json!("best_effort");
+        let tampered = serde_json::to_vec(&json)?;
+        assert!(PutResultMetadata::decode(&tampered).is_err());
+        Ok(())
+    }
 
     #[test]
     fn already_emitted_receipts_do_not_create_a_synthetic_result() {

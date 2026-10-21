@@ -31,10 +31,14 @@ RUN apt-get update \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --no-create-home --no-log-init --home-dir /nonexistent --shell /usr/sbin/nologin app \
     && install -d --owner root --group root --mode 0755 /etc/arrowcol-dataflow-rust \
-    && install -d --owner app --group app --mode 0750 /onelake
+    && install -d --owner app --group app --mode 0750 /onelake \
+    && install -d --owner root --group root --mode 0755 /var/lib/arrowcol \
+    && install -d --owner app --group app --mode 0750 /var/lib/arrowcol/quiver
 COPY --from=builder --chmod=0555 /usr/local/bin/arrowcol-dataflow-rust /usr/local/bin/arrowcol-dataflow-rust
 COPY --chmod=0444 projects/arrowcol-dataflow-rust/config.yaml /etc/arrowcol-dataflow-rust/config.yaml
 COPY --chmod=0444 projects/arrowcol-dataflow-rust/config.smoke.yaml /etc/arrowcol-dataflow-rust/config.smoke.yaml
+COPY --chmod=0444 projects/arrowcol-dataflow-rust/config.quiver.yaml /etc/arrowcol-dataflow-rust/config.quiver.yaml
+COPY --chmod=0444 projects/arrowcol-dataflow-rust/config.smoke-quiver.yaml /etc/arrowcol-dataflow-rust/config.smoke-quiver.yaml
 USER 10001:10001
 WORKDIR /onelake
 STOPSIGNAL SIGTERM

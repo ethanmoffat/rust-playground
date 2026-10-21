@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use arrow_deltalake::commit::CommitOptions;
 use arrow_deltalake::sizing::AdaptiveFileSizeConfig;
-use arrowcol_buffer::{BufferConfig, CapacityLimits, QuiverPersistence};
+use arrowcol_buffer::{BufferConfig, CapacityLimits, QuiverStageConfig};
 use arrowcol_flight::RuntimeLimits;
 use arrowcol_protocol::{CollectorInstanceId, ImplementationPool};
 use clap::Parser;
@@ -528,36 +528,114 @@ impl AdaptiveFileConfig {
     }
 }
 
-/// Native Quiver opt-in.
+/// Native Quiver persistence: accepted batches are written to a local
+/// write-ahead log before they are acknowledged and published from disk.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeQuiverConfig {
-    /// Request native Quiver persistence.
+    /// Persist accepted batches to Quiver before acknowledging them.
     pub enabled: bool,
-    /// Reserved directory for a future generic adapter.
+    /// Directory for the write-ahead log, segments, and progress files.
     pub directory: Option<PathBuf>,
-    /// Reserved capacity for a future generic adapter.
+    /// Hard cap on disk space used by Quiver.
     pub capacity_bytes: Option<u64>,
+    /// Maximum time between WAL fsyncs; 0 fsyncs before every acknowledgement.
+    #[serde(default)]
+    pub wal_flush_interval_ms: u64,
+    /// Maximum time a segment stays open before it is published from disk.
+    #[serde(default = "default_quiver_segment_max_open_ms")]
+    pub segment_max_open_ms: u64,
+    /// Maximum persisted batches admitted from disk but not yet resolved.
+    #[serde(default = "default_quiver_max_in_flight")]
+    pub max_in_flight: usize,
+    /// First retry delay for a batch whose publication outcome was unknown.
+    #[serde(default = "default_quiver_retry_initial_ms")]
+    pub retry_initial_ms: u64,
+    /// Maximum retry delay for one persisted batch.
+    #[serde(default = "default_quiver_retry_max_ms")]
+    pub retry_max_ms: u64,
+    /// How long receipts of a crashed instance stay reserved for its restarted
+    /// successor before ordinary expiry reconciliation may fail them.
+    #[serde(default = "default_quiver_recovery_window_ms")]
+    pub recovery_window_ms: u64,
 }
 
+const fn default_quiver_segment_max_open_ms() -> u64 {
+    500
+}
+
+const fn default_quiver_max_in_flight() -> usize {
+    512
+}
+
+const fn default_quiver_retry_initial_ms() -> u64 {
+    250
+}
+
+const fn default_quiver_retry_max_ms() -> u64 {
+    5_000
+}
+
+const fn default_quiver_recovery_window_ms() -> u64 {
+    600_000
+}
+
+/// Largest recovery window the receipt store accepts (24 hours).
+const MAX_QUIVER_RECOVERY_WINDOW_MS: u64 = 86_400_000;
+
 impl NativeQuiverConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// Returns the durable stage settings when Quiver is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a missing directory or capacity and out-of-range durations.
+    pub fn stage_config(&self) -> Result<Option<QuiverStageConfig>, ConfigError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let directory = self
+            .directory
+            .clone()
+            .ok_or_else(|| invalid("buffer.native_quiver.directory is required when enabled"))?;
+        let capacity_bytes = self
+            .capacity_bytes
+            .ok_or_else(|| invalid("buffer.native_quiver.capacity_bytes is required when enabled"))?;
+        Ok(Some(QuiverStageConfig {
+            directory,
+            capacity_bytes,
+            wal_flush_interval: Duration::from_millis(self.wal_flush_interval_ms),
+            segment_max_open: duration_ms(self.segment_max_open_ms, "buffer.native_quiver.segment_max_open_ms")?,
+            max_in_flight: self.max_in_flight,
+            retry_initial: duration_ms(self.retry_initial_ms, "buffer.native_quiver.retry_initial_ms")?,
+            retry_max: duration_ms(self.retry_max_ms, "buffer.native_quiver.retry_max_ms")?,
+        }))
+    }
+
+    /// Receipt recovery window registered with the receipt owner when enabled.
+    #[must_use]
+    pub const fn recovery_window_ms(&self) -> Option<u64> {
         if self.enabled {
-            let error = match QuiverPersistence::open() {
-                Ok(_) => {
-                    return Err(invalid("native Quiver unexpectedly reported generic Arrow support"));
-                }
-                Err(error) => error,
-            };
-            return Err(ConfigError::UnsupportedCapability {
-                capability: "native_quiver_generic_arrow",
-                reason: error.message().to_owned(),
-            });
+            Some(self.recovery_window_ms)
+        } else {
+            None
         }
-        if self.directory.is_some() || self.capacity_bytes.is_some() {
-            return Err(invalid("buffer.native_quiver directory/capacity require enabled=true"));
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let Some(stage) = self.stage_config()? else {
+            if self.directory.is_some() || self.capacity_bytes.is_some() {
+                return Err(invalid("buffer.native_quiver directory/capacity require enabled=true"));
+            }
+            return Ok(());
+        };
+        if self.recovery_window_ms == 0 || self.recovery_window_ms > MAX_QUIVER_RECOVERY_WINDOW_MS {
+            return Err(invalid(
+                "buffer.native_quiver.recovery_window_ms must be between 1 and 86400000",
+            ));
         }
-        Ok(())
+        stage
+            .validate()
+            .map_err(|error| invalid(format!("buffer.native_quiver is invalid: {}", error.message())))
     }
 }
 

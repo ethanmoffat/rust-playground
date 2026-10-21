@@ -38,8 +38,9 @@ Every decoded non-empty `RecordBatch` receives a fresh server-generated receipt,
 including byte-identical resends. Each receipt is emitted in its own Flight
 `PutResult`; there is no client idempotency key or deduplication path. A
 `PutResult` means SQL has recorded the receipt and the process has retained the
-batch in its bounded in-memory buffer. It is not a durable payload
-acknowledgement and is not purge permission. Source data may be purged only
+batch in its bounded in-memory buffer. With [native Quiver](#native-quiver) it
+instead means the batch was fsynced to the local Quiver write-ahead log. Either
+way it is not purge permission. Source data may be purged only
 when `GET /v1/receipts/{id}` returns `"state": "published"` and
 `"purge_allowed": true`, after the fenced Delta commit is durable.
 
@@ -73,7 +74,7 @@ The document covers:
 - TLS identity and optional client CA;
 - router-HMAC, static-bearer, or explicit development allow-all auth;
 - graceful stream/publication drain ceilings; and
-- optional native Quiver settings.
+- optional [native Quiver](#native-quiver) disk persistence.
 
 Direct reuses separate bounded SQL Server connection pools for receipts,
 routing, and catalog operations. `sql_server.pool` defaults to
@@ -87,10 +88,49 @@ semantics are unchanged; router and Dataflow stores do not opt into these pools.
 The `/metrics` endpoint exposes `arrowcol_direct_sql_pool_*` counters and pool
 occupancy with fixed `receipts`, `routing`, and `catalog` role labels.
 
-Native Quiver is rejected during config validation with the typed
-`native_quiver_generic_arrow` capability error. The checked-in Quiver boundary
-supports fixed OTAP slots, not arbitrary Arrow table/schema/receipt identities,
-so this collector does not invent a lossy adapter.
+### Native Quiver
+
+`buffer.native_quiver` persists every accepted batch to
+[Quiver](https://github.com/mdrakiburrahman/otel-arrow/tree/main/rust/otap-dataflow/crates/quiver)
+(an Arrow write-ahead log plus segment files) before the receipt is returned,
+then publishes it to Delta from disk:
+
+```text
+receipt (accepted) -> Quiver WAL append + fsync -> PutResult(receipt)
+Quiver segment -> bounded buffer -> Delta commit -> receipt published -> bundle acknowledged
+```
+
+```yaml
+buffer:
+  native_quiver:
+    enabled: true
+    directory: /var/lib/arrowcol/quiver
+    capacity_bytes: 4294967296   # hard disk cap; ingest backpressures when full
+    wal_flush_interval_ms: 0     # 0 = fsync before every acknowledgement
+    segment_max_open_ms: 500     # how long a segment stays open before publishing
+    max_in_flight: 512           # persisted batches admitted but unresolved
+    retry_initial_ms: 250
+    retry_max_ms: 5000
+    recovery_window_ms: 600000   # receipts reserved for a restarted successor
+```
+
+Only `enabled`, `directory`, and `capacity_bytes` are required; the rest
+default to the values shown. Batches that could never fit the buffer are
+rejected before they are persisted. The capabilities document adds
+`durable_payload_storage`, the pressure document reports Quiver disk usage as
+`quiver_pressure_bps`/`quiver_state` and counts the persisted backlog as
+buffered batches, and `/metrics` exposes `arrowcol_direct_quiver_*`.
+
+**Crash recovery.** The owner registers its `recovery_window_ms`, so expiry
+reconciliation leaves its receipts alone while it is alive and for the window
+after its owner lease expires. A restart with the same `identity.instance_key`
+and a greater `identity.generation` waits for the crashed owner's lease to
+expire, registers, replays every unacknowledged batch from disk, adopts the
+predecessor's receipts onto its own table lease, and publishes them under the
+original receipt IDs. Replayed batches whose receipts were already published
+are acknowledged without republishing. Receipts adopted while `flushing` are
+published again, so rows committed just before the crash can be duplicated.
+Graceful shutdown drains the Quiver backlog to Delta before releasing leases.
 
 Validate without opening sockets or dependencies:
 
@@ -159,9 +199,11 @@ reconciliation; they are never blindly replayed.
 
 SQL stores receipt/control metadata, hashes, counts, errors, and Delta
 publication observations only. Arrow IPC and Arrow value buffers are never
-stored in SQL. A crash therefore loses the in-memory batch; after lease expiry
-the retryable receipt result tells the client to resend, creating a new
-delivery and a new receipt. A resend can coexist with an earlier copy that was
+stored in SQL. Without native Quiver, a crash therefore loses the in-memory
+batch; after lease expiry the retryable receipt result tells the client to
+resend, creating a new delivery and a new receipt. With native Quiver the batch
+survives on local disk and the restarted collector publishes it under its
+original receipt. A resend can coexist with an earlier copy that was
 already published or later reconciled, so downstream consumers must tolerate
 duplicates.
 
@@ -212,8 +254,9 @@ RUSTDOCFLAGS='-D warnings' cargo doc --locked --package arrowcol-rust --no-deps
 npx --no-install nx run arrowcol-rust:verify
 ```
 
-Unit/in-process integration coverage includes strict config, typed Quiver
-rejection, router HMAC tamper rejection, pre-receipt schema rejection,
+Unit/in-process integration coverage includes strict config, native Quiver
+settings and persist-before-receipt publication from disk, router HMAC tamper
+rejection, pre-receipt schema rejection,
 per-batch duplicate receipts, bounded backpressure, grouped receipt publication,
 stale-fence rejection, graceful buffer drain, and reading committed Delta
 Parquet content.

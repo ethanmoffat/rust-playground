@@ -28,6 +28,9 @@ pub enum BufferErrorKind {
     /// The requested persistence capability is unavailable.
     #[error("persistence capability is unsupported")]
     UnsupportedCapability,
+    /// The local durable stage (Quiver) failed.
+    #[error("local durable storage failed")]
+    DurableStorage,
     /// Internal synchronization state was poisoned.
     #[error("buffer synchronization failed")]
     Synchronization,
