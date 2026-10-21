@@ -209,11 +209,24 @@ pub fn sample_row(directory: &Path, identity: &str, summary: &TableSummary) -> R
 ///
 /// Rejects missing roots, corrupt logs, unsupported layouts, and unsafe paths.
 pub async fn inventory(directory: &Path) -> Result<SnapshotInventory> {
+    inventory_selected(directory, &[]).await
+}
+
+/// Lists committed files for the selected exact table identities, or all tables
+/// when the selection is empty. Unselected Delta logs are not opened.
+///
+/// # Errors
+///
+/// Rejects missing roots, corrupt selected logs, unsupported layouts, and unsafe paths.
+pub async fn inventory_selected(directory: &Path, selected: &[String]) -> Result<SnapshotInventory> {
     let directory =
         fs::canonicalize(directory).with_context(|| format!("canonicalize Delta root {}", directory.display()))?;
     let mut tables = BTreeMap::new();
     for root in find_delta_roots(&directory)? {
         let identity = table_identity(&directory, &root)?;
+        if !selected.is_empty() && !selected.contains(&identity) {
+            continue;
+        }
         let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table path"))?;
         let delta = deltalake_core::open_table(url)
             .await

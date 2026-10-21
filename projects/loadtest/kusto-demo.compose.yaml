@@ -1,0 +1,35 @@
+name: arrowcol-kusto-demo
+
+services:
+  kusto:
+    image: mcr.microsoft.com/azuredataexplorer/kustainer-linux@sha256:51e2250da2faf292de903f871a073eb37d3f2641cf63381b183879d21ebb1013
+    mem_limit: ${KUSTO_MEMORY_LIMIT:-4g}
+    environment:
+      ACCEPT_EULA: "Y"
+    ports:
+      - "127.0.0.1:${KUSTO_PORT:-8080}:8080"
+    volumes:
+      - kusto-data:/kustodata
+      - type: bind
+        source: ${ARROWCOL_DELTA_ROOT:?Set the absolute WSL Arrowcol Delta root}
+        target: /delta/arrowcol
+        read_only: true
+        bind:
+          create_host_path: false
+
+  kusto-explorer:
+    image: ghcr.io/mdrakiburrahman/rust-playground/kusto-explorer:dev
+    pull_policy: never
+    environment:
+      KUSTO_EXPLORER_CONNECTIONS: "Arrowcol demo=http://kusto:8080"
+      KUSTO_EXPLORER_DEFAULT_DATABASE: ${ARROWCOL_DEMO_DATABASE:-arrowcol_demo}
+    ports:
+      - "127.0.0.1:${KUSTO_EXPLORER_PORT:-8090}:8080"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp
+
+volumes:
+  kusto-data:

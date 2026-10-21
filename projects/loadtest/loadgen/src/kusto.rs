@@ -19,7 +19,10 @@ use sha2::{Digest, Sha256};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::{cli::RunArgs, transport::now_unix_millis};
+use crate::{
+    cli::{MirrorDeltaArgs, RunArgs},
+    transport::now_unix_millis,
+};
 
 const DATABASE: &str = "loadtest";
 const STATUS: &str = "kusto-status.json";
@@ -31,6 +34,7 @@ struct KustoClient {
     http: Client,
     endpoint: Url,
     results: PathBuf,
+    database: String,
 }
 
 impl KustoClient {
@@ -53,6 +57,7 @@ impl KustoClient {
                 .build()?,
             endpoint,
             results: results.to_owned(),
+            database: DATABASE.to_owned(),
         })
     }
 
@@ -63,7 +68,7 @@ impl KustoClient {
             "properties": "{\"Options\":{\"notruncation\":true}}"
         });
         if phase != "bootstrap" {
-            request["db"] = json!(DATABASE);
+            request["db"] = json!(self.database);
         }
         let response = self
             .http
@@ -90,18 +95,20 @@ impl KustoClient {
         let rows = self.execute(".show databases", true, "bootstrap").await?;
         if rows
             .iter()
-            .any(|row| row.get("DatabaseName").and_then(Value::as_str) == Some(DATABASE))
+            .any(|row| row.get("DatabaseName").and_then(Value::as_str) == Some(self.database.as_str()))
         {
             return Ok(());
         }
         let marker = self.results.join("kusto-database.json");
+        let database = identifier(&self.database)?;
+        let path = format!("/kustodata/dbs/{}", self.database);
         let command = if marker.exists() {
-            ".attach database loadtest from @\"/kustodata/dbs/loadtest/md\""
+            format!(".attach database {database} from @\"{path}/md\"")
         } else {
-            ".create database loadtest persist (@\"/kustodata/dbs/loadtest/md\", @\"/kustodata/dbs/loadtest/data\")"
+            format!(".create database {database} persist (@\"{path}/md\", @\"{path}/data\")")
         };
-        self.execute(command, true, "bootstrap").await?;
-        write_json(&marker, &json!({"database": DATABASE}))?;
+        self.execute(&command, true, "bootstrap").await?;
+        write_json(&marker, &json!({"database": self.database}))?;
         Ok(())
     }
 
@@ -283,6 +290,7 @@ fn columns(schema: &Value) -> Result<Vec<(String, String)>> {
                 "boolean" => "bool",
                 "byte" | "short" | "integer" => "int",
                 "long" => "long",
+                "decimal(20,0)" => "decimal",
                 "float" | "double" => "real",
                 "string" => "string",
                 "timestamp" => "datetime",
@@ -323,6 +331,195 @@ fn write_json(file: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct StandaloneLayout {
+    delta_root: PathBuf,
+    container_root: PathBuf,
+    endpoint: String,
+    database: String,
+    table_prefix: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tables: Vec<String>,
+}
+
+impl StandaloneLayout {
+    fn new(arguments: &MirrorDeltaArgs) -> Result<Self> {
+        identifier(&arguments.database)?;
+        identifier(&arguments.table_prefix)?;
+        ensure!(
+            arguments.container_root.is_absolute()
+                && arguments
+                    .container_root
+                    .components()
+                    .all(|part| matches!(part, Component::RootDir | Component::Normal(_))),
+            "container root must be an absolute Linux mount path without parent components"
+        );
+        let delta_root = fs::canonicalize(&arguments.delta_root).context("open Arrowcol Delta root")?;
+        ensure!(delta_root.is_dir(), "Delta root is not a directory");
+        let mut layout = Self {
+            delta_root,
+            container_root: arguments.container_root.clone(),
+            endpoint: arguments.endpoint.clone(),
+            database: arguments.database.clone(),
+            table_prefix: arguments.table_prefix.clone(),
+            tables: arguments.tables.clone(),
+        };
+        layout.tables.sort();
+        layout.tables.dedup();
+        for table in &layout.tables {
+            layout.table_name(table)?;
+        }
+        Ok(layout)
+    }
+
+    fn table_name(&self, table: &str) -> Result<String> {
+        let parts = table.split('.').collect::<Vec<_>>();
+        ensure!(parts.len() == 3, "expected Arrowcol catalog.schema.table identity");
+        for part in &parts {
+            identifier(part)?;
+        }
+        identifier(&format!("{}_{}", self.table_prefix, parts.join("_")))
+    }
+
+    fn container_file(&self, table: &str, file: &str) -> Result<String> {
+        self.table_name(table)?;
+        ensure!(
+            !file.is_empty()
+                && !file.contains('\\')
+                && Path::new(file)
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_))),
+            "unsafe active file path"
+        );
+        self.container_root
+            .join(table.replace('.', "/"))
+            .join(file)
+            .to_str()
+            .context("non-UTF8 container file path")
+            .map(str::to_owned)
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct BridgeCheckpoint {
+    layout: StandaloneLayout,
+    observed: SnapshotInventory,
+}
+
+impl BridgeCheckpoint {
+    fn observe(&mut self, snapshot: SnapshotInventory) -> Result<()> {
+        let mut names = BTreeSet::new();
+        for table in snapshot.tables.keys() {
+            ensure!(
+                names.insert(self.layout.table_name(table)?),
+                "Delta table names collide in Kusto"
+            );
+        }
+        for (table, previous) in &self.observed.tables {
+            let current = snapshot
+                .tables
+                .get(table)
+                .context("previously observed Delta table disappeared")?;
+            ensure!(current.schema == previous.schema, "Delta schema changed for {table}");
+            ensure!(
+                current.version >= previous.version,
+                "Delta version moved backwards for {table}"
+            );
+            let files = current.files.iter().collect::<BTreeSet<_>>();
+            ensure!(
+                previous.files.iter().all(|file| files.contains(file)),
+                "active files were removed/replaced for {table}; only append-only Delta is supported"
+            );
+        }
+        self.observed = snapshot;
+        Ok(())
+    }
+}
+
+/// Mirror fixed-schema, append-only Arrowcol Delta output independently of load generation.
+///
+/// # Errors
+///
+/// Rejects invalid settings, incompatible checkpoint reuse, and one-shot synchronization
+/// failures. Watch mode records synchronization failures as degraded and retries.
+pub async fn mirror_delta(arguments: MirrorDeltaArgs) -> Result<()> {
+    ensure!(
+        !arguments.poll_interval.get().is_zero(),
+        "poll interval must be positive"
+    );
+    let layout = StandaloneLayout::new(&arguments)?;
+    fs::create_dir_all(&arguments.state_dir)?;
+    let checkpoint_path = arguments.state_dir.join("delta-bridge.json");
+    let mut checkpoint = if checkpoint_path.exists() {
+        let saved: BridgeCheckpoint =
+            serde_json::from_slice(&fs::read(&checkpoint_path)?).context("read Delta bridge checkpoint")?;
+        ensure!(
+            saved.layout == layout,
+            "bridge settings differ from checkpoint; reuse the original settings or use a new state directory and destination"
+        );
+        saved
+    } else {
+        BridgeCheckpoint {
+            layout: layout.clone(),
+            observed: SnapshotInventory {
+                tables: BTreeMap::new(),
+            },
+        }
+    };
+    // Bind ingestion identities to the source and destination, not a process or demo run.
+    let source_id = hex::encode(Sha256::digest(serde_json::to_vec(&layout)?));
+    let mut mirror = Mirror::new(&layout.endpoint, &arguments.state_dir, &source_id)?;
+    mirror.client.database.clone_from(&layout.database);
+    mirror.layout = Some(layout.clone());
+    write_json(&checkpoint_path, &checkpoint)?;
+    eprintln!(
+        "Mirroring {} -> {} database {} (Ctrl+C stops only the bridge)",
+        layout.delta_root.display(),
+        layout.endpoint,
+        layout.database
+    );
+    loop {
+        let result = async {
+            let snapshot = delta_inspect::inventory_selected(&layout.delta_root, &layout.tables).await?;
+            ensure!(
+                !arguments.once || !snapshot.tables.is_empty(),
+                "no committed Delta tables found"
+            );
+            checkpoint.observe(snapshot)?;
+            write_json(&checkpoint_path, &checkpoint)?;
+            mirror.client.bootstrap().await?;
+            mirror
+                .sync("direct", &checkpoint.observed, &AtomicBool::new(false), true)
+                .await
+        }
+        .await;
+        mirror.persist(result.as_ref().err())?;
+        if result.is_ok() {
+            if checkpoint.observed.tables.is_empty() {
+                mirror.status.state = "pending".to_owned();
+                write_json(&arguments.state_dir.join(STATUS), &mirror.status)?;
+            }
+            if arguments.once {
+                eprintln!(
+                    "Kusto caught up: {} tables, {} files",
+                    mirror.status.tables.len(),
+                    mirror.status.files_ingested
+                );
+            }
+        }
+        if arguments.once {
+            return result;
+        }
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("listen for Ctrl+C")?;
+                return result;
+            }
+            () = tokio::time::sleep(arguments.poll_interval.get()) => {}
+        }
+    }
+}
+
 #[derive(Default, Deserialize, Serialize)]
 struct MirrorStatus {
     state: String,
@@ -347,6 +544,7 @@ struct Mirror {
     status: MirrorStatus,
     schemas: BTreeMap<String, Value>,
     ingested: BTreeMap<String, BTreeSet<String>>,
+    layout: Option<StandaloneLayout>,
 }
 
 impl Mirror {
@@ -360,6 +558,7 @@ impl Mirror {
             },
             schemas: BTreeMap::new(),
             ingested: BTreeMap::new(),
+            layout: None,
         })
     }
 
@@ -367,7 +566,12 @@ impl Mirror {
         if let Some(error) = error {
             let message = format!("{error:#}");
             if self.status.error.as_ref() != Some(&message) {
-                eprintln!("Kusto DEGRADED (collector load continues): {message}");
+                let scope = if self.layout.is_some() {
+                    "independent Delta bridge"
+                } else {
+                    "collector load continues"
+                };
+                eprintln!("Kusto DEGRADED ({scope}): {message}");
             }
             self.status.state = "degraded".to_owned();
             self.status.error = Some(message);
@@ -421,24 +625,28 @@ impl Mirror {
     }
 
     async fn sync(&mut self, pool: &str, snapshot: &SnapshotInventory, live: &AtomicBool, all: bool) -> Result<()> {
+        let names = snapshot
+            .tables
+            .keys()
+            .map(|table| self.destination(pool, table))
+            .collect::<Result<BTreeSet<_>>>()?;
+        ensure!(
+            names.len() == snapshot.tables.len(),
+            "Delta table names collide in Kusto"
+        );
+        let prefix = self.layout.as_ref().map_or(pool, |layout| layout.table_prefix.as_str());
         for name in self
             .schemas
             .keys()
-            .filter(|name| name.starts_with(&format!("['{pool}_")))
+            .filter(|name| name.starts_with(&format!("['{prefix}_")))
         {
-            ensure!(
-                snapshot
-                    .tables
-                    .keys()
-                    .any(|table| table_name(pool, table).is_ok_and(|candidate| candidate == *name)),
-                "Delta table disappeared for {name}"
-            );
+            ensure!(names.contains(name), "Delta table disappeared for {name}");
         }
         for (table, snapshot) in &snapshot.tables {
             if !all && !live.load(Ordering::Acquire) {
                 break;
             }
-            let name = table_name(pool, table)?;
+            let name = self.destination(pool, table)?;
             self.ensure_table(&name, &snapshot.schema).await?;
             let expected = snapshot
                 .files
@@ -459,7 +667,10 @@ impl Mirror {
                 .collect::<Vec<_>>();
             for file in missing {
                 let identity = file_identity(&self.status.run_id, pool, table, &file);
-                let source = container_file(pool, table, &file)?;
+                let source = match &self.layout {
+                    Some(layout) => layout.container_file(table, &file)?,
+                    None => container_file(pool, table, &file)?,
+                };
                 // Reconcile before each retry: an earlier timeout may have committed.
                 let known = self.client.tags(&name).await?;
                 self.ingested.insert(name.clone(), known);
@@ -511,6 +722,13 @@ impl Mirror {
             );
         }
         Ok(())
+    }
+
+    fn destination(&self, pool: &str, table: &str) -> Result<String> {
+        match &self.layout {
+            Some(layout) => layout.table_name(table),
+            None => table_name(pool, table),
+        }
     }
 
     async fn sync_roots(&mut self, direct: &Path, dataflow: &Path, live: &AtomicBool, all: bool) -> Result<()> {
@@ -703,6 +921,13 @@ fn payload_predicate(schema: &Value, sample: &Value) -> Result<String> {
                 "long" | "int" => {
                     let number = if let Some(text) = value.as_str() { text.parse::<i64>()? } else { value.as_i64().context("reference integer type mismatch")? };
                     format!("{kind}({number})")
+                }
+                "decimal" => {
+                    let number = if let Some(text) = value.as_str() { text.parse::<i128>()? } else {
+                        value.as_i64().map(i128::from).or_else(|| value.as_u64().map(i128::from))
+                            .context("reference decimal integer type mismatch")?
+                    };
+                    format!("decimal({number})")
                 }
                 "real" => {
                     let value = value.as_f64().context("reference real type mismatch")?;
@@ -973,23 +1198,25 @@ mod tests {
             {"name":"flag","type":"boolean"},{"name":"small","type":"short"},
             {"name":"count","type":"long"},{"name":"value","type":"double"},
             {"name":"time","type":"timestamp"},{"name":"time__unix_nanos","type":"long"},
-            {"name":"text","type":"string"}
+            {"name":"text","type":"string"},{"name":"unsigned_count","type":"decimal(20,0)"}
         ]});
         assert_eq!(
             columns(&schema)?
                 .iter()
                 .map(|(_, kind)| kind.as_str())
                 .collect::<Vec<_>>(),
-            ["bool", "int", "long", "real", "datetime", "long", "string"]
+            ["bool", "int", "long", "real", "datetime", "long", "string", "decimal"]
         );
         let predicate = payload_predicate(
             &schema,
             &json!({
                 "flag":true,"small":7,"count":"9007199254740993","value":0.5,
-                "time":"1970-01-01 00:00:00 +00:00","time__unix_nanos":-1,"text":"a\"b\\c"
+                "time":"1970-01-01 00:00:00 +00:00","time__unix_nanos":-1,"text":"a\"b\\c",
+                "unsigned_count":"18446744073709551615"
             }),
         )?;
         assert!(predicate.contains("long(9007199254740993)"));
+        assert!(predicate.contains("decimal(18446744073709551615)"));
         assert!(predicate.contains("long(-1)"));
         assert!(predicate.contains("todatetime("));
         assert!(predicate.contains("a\\\"b\\\\c"));
@@ -1120,6 +1347,204 @@ mod tests {
         let mut changed = snapshot;
         changed.tables.get_mut(table).context("table")?.schema["fields"][0]["type"] = json!("string");
         assert!(mirror.sync("direct", &changed, &live, true).await.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn independent_checkpoint_rejects_non_append_changes_and_name_collisions() -> Result<()> {
+        let directory = Directory::new()?;
+        let arguments = MirrorDeltaArgs {
+            delta_root: directory.0.clone(),
+            tables: Vec::new(),
+            container_root: "/delta/arrowcol".into(),
+            endpoint: "http://127.0.0.1:8080".to_owned(),
+            database: "arrowcol_demo".to_owned(),
+            table_prefix: "demo".to_owned(),
+            state_dir: directory.0.join("state"),
+            poll_interval: "1s".parse()?,
+            once: true,
+        };
+        let layout = StandaloneLayout::new(&arguments)?;
+        assert_eq!(
+            layout.container_file("catalog.public.events", "part.parquet")?,
+            "/delta/arrowcol/catalog/public/events/part.parquet"
+        );
+        assert!(layout.container_file("catalog.public.events", "../outside").is_err());
+        assert!(layout.table_name("catalog.public.bad/name").is_err());
+        let table = TableInventory {
+            schema: json!({"fields":[{"name":"id","type":"long"}]}),
+            version: 1,
+            files: vec!["part.parquet".to_owned()],
+        };
+        let snapshot = SnapshotInventory {
+            tables: BTreeMap::from([("catalog.public.events".to_owned(), table.clone())]),
+        };
+        let mut checkpoint = BridgeCheckpoint {
+            layout,
+            observed: snapshot.clone(),
+        };
+        let mut appended = snapshot.clone();
+        appended
+            .tables
+            .get_mut("catalog.public.events")
+            .context("table")?
+            .files
+            .push("next.parquet".to_owned());
+        checkpoint.observe(appended)?;
+        // Persisted observations must still reject removals after a process restart.
+        let mut restored: BridgeCheckpoint = serde_json::from_slice(&serde_json::to_vec(&checkpoint)?)?;
+        assert!(restored.observe(snapshot.clone()).is_err());
+        let mut changed = checkpoint.observed.clone();
+        changed.tables.get_mut("catalog.public.events").context("table")?.schema = json!({"fields":[]});
+        assert!(restored.observe(changed).is_err());
+        let mut rollback = checkpoint.observed.clone();
+        rollback
+            .tables
+            .get_mut("catalog.public.events")
+            .context("table")?
+            .version = 0;
+        assert!(restored.observe(rollback).is_err());
+        assert!(
+            restored
+                .observe(SnapshotInventory {
+                    tables: BTreeMap::new()
+                })
+                .is_err()
+        );
+        assert!(
+            restored
+                .observe(SnapshotInventory {
+                    tables: BTreeMap::from([
+                        ("a_b.c.events".to_owned(), table.clone()),
+                        ("a.b_c.events".to_owned(), table),
+                    ]),
+                })
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn independent_bridge_reads_committed_delta_and_resumes_without_reingestion() -> Result<()> {
+        use arrow::{
+            array::{Int64Array, RecordBatch},
+            datatypes::{DataType, Field, Schema},
+        };
+        use arrow_deltalake::delta::DeltaTableWriter;
+
+        let directory = Directory::new()?;
+        let delta_root = directory.0.join("delta");
+        let table_root = delta_root.join("catalog/public/events");
+        let mut writer = DeltaTableWriter::open(&table_root)?;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+        )?;
+        writer.write(&batch).await?;
+        writer.flush().await?;
+        fs::write(table_root.join("orphan.parquet"), b"not a committed file")?;
+        let unrelated_log = delta_root.join("catalog/public/unselected/_delta_log");
+        fs::create_dir_all(&unrelated_log)?;
+        fs::write(
+            unrelated_log.join("00000000000000000000.json"),
+            b"invalid unrelated Delta log",
+        )?;
+        assert!(delta_inspect::inventory(&delta_root).await.is_err());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::clone(&calls);
+        let mut tags = BTreeSet::new();
+        let server = Server::start(move |request| {
+            let command = request["csl"].as_str().context("command missing")?;
+            if command == ".show databases" {
+                return Ok(Some(response(&["DatabaseName"], vec![json!(["arrowcol_demo"])])));
+            }
+            ensure!(request["db"] == "arrowcol_demo", "wrong destination database");
+            if command.contains("getschema") {
+                return Ok(Some(response(
+                    &["ColumnName", "ColumnType"],
+                    vec![json!(["id", "long"])],
+                )));
+            }
+            if command.starts_with(".ingest into") {
+                ensure!(
+                    command.contains("['demo_catalog_public_events']"),
+                    "wrong destination table"
+                );
+                ensure!(
+                    command.contains("/delta/arrowcol/catalog/public/events/"),
+                    "wrong source path"
+                );
+                ensure!(!command.contains("orphan"), "uncommitted file ingested");
+                let tag = command
+                    .split("ingest-by:loadtest:")
+                    .nth(1)
+                    .context("ingestion tag missing")?;
+                tags.insert(format!(
+                    "ingest-by:loadtest:{}",
+                    tag.chars().take(64).collect::<String>()
+                ));
+                requests.fetch_add(1, Ordering::Relaxed);
+            }
+            if command.contains("extents") {
+                return Ok(Some(response(&["Tags"], vec![json!([json!(tags).to_string()])])));
+            }
+            Ok(Some(response(&[], vec![])))
+        })?;
+        let arguments = MirrorDeltaArgs {
+            delta_root,
+            tables: vec!["catalog.public.events".to_owned()],
+            container_root: "/delta/arrowcol".into(),
+            endpoint: server.endpoint.clone(),
+            database: "arrowcol_demo".to_owned(),
+            table_prefix: "demo".to_owned(),
+            state_dir: directory.0.join("state"),
+            poll_interval: "1s".parse()?,
+            once: true,
+        };
+        mirror_delta(arguments.clone()).await?;
+        mirror_delta(arguments.clone()).await?;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        writer.write(&batch).await?;
+        writer.flush().await?;
+        mirror_delta(arguments.clone()).await?;
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let status: MirrorStatus = serde_json::from_slice(&fs::read(arguments.state_dir.join(STATUS))?)?;
+        assert_eq!(status.state, "healthy");
+        assert_eq!(status.files_ingested, 2);
+        let mut incompatible = arguments;
+        incompatible.table_prefix = "other".to_owned();
+        assert!(mirror_delta(incompatible).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn independent_one_shot_reports_empty_and_unavailable_sources() -> Result<()> {
+        let directory = Directory::new()?;
+        let root = directory.0.join("delta");
+        fs::create_dir(&root)?;
+        let arguments = MirrorDeltaArgs {
+            delta_root: root,
+            tables: Vec::new(),
+            container_root: "/delta/arrowcol".into(),
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            database: "arrowcol_demo".to_owned(),
+            table_prefix: "demo".to_owned(),
+            state_dir: directory.0.join("state"),
+            poll_interval: "1s".parse()?,
+            once: true,
+        };
+        assert!(mirror_delta(arguments.clone()).await.is_err());
+        let status: MirrorStatus = serde_json::from_slice(&fs::read(arguments.state_dir.join(STATUS))?)?;
+        assert_eq!(status.state, "degraded");
+        assert!(
+            status
+                .error
+                .context("error missing")?
+                .contains("no committed Delta tables")
+        );
+        let mut invalid = arguments;
+        invalid.container_root = "relative".into();
+        assert!(mirror_delta(invalid).await.is_err());
         Ok(())
     }
 

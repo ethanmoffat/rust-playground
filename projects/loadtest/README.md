@@ -122,6 +122,93 @@ threads, readiness, and row counters while the generator is running.
 
 ## Live Kusto inspection
 
+### Independent Arrowcol-to-Kusto demo
+
+The bridge can run without the load generator, SQL/Hive lifecycle management,
+or workload fixtures. It reads the committed Delta snapshots below an existing
+Arrowcol output root and mirrors their active Parquet files into native Kusto
+tables. Arrowcol continues writing Delta unchanged.
+
+From the repository root in WSL, set `ARROWCOL_DELTA_ROOT` to the absolute,
+existing directory configured as Arrowcol's `delta.root`. Keep the source on
+the WSL Linux filesystem. For example, for the checked-in local collector config:
+
+```bash
+export ARROWCOL_DELTA_ROOT="$(realpath projects/arrowcol-rust/.data/delta)"
+export KUSTO_PORT=28081
+export KUSTO_EXPLORER_PORT=28091
+
+docker compose -f projects/loadtest/kusto-demo.compose.yaml up -d
+
+cargo run --locked --package arrowcol-loadgen -- mirror-delta \
+  --delta-root "$ARROWCOL_DELTA_ROOT" \
+  --endpoint "http://127.0.0.1:$KUSTO_PORT" \
+  --state-dir target/kusto-demo-state
+```
+
+The separate `arrowcol-kusto-demo` Compose project does not start collectors or
+reset existing data. It uses a persistent Kusto volume, mounts the Delta root
+read-only at `/delta/arrowcol`, and starts the browser workbench. The locally
+built `kusto-explorer:dev` image is required; if absent, build it first with
+`npx --no-install nx run kusto-explorer:image` in the development environment.
+Running the emulator accepts the [Microsoft license terms][emulator-install].
+
+Open <http://localhost:28091> and select database `arrowcol_demo`. A Delta table
+at `telemetry/sqlserver/sqlserver_wait_stats` becomes
+`arrowcol_telemetry_sqlserver_sqlserver_wait_stats`:
+
+```kusto
+arrowcol_telemetry_sqlserver_sqlserver_wait_stats | take 10
+```
+
+The command watches every two seconds, including when the source starts empty,
+and retries emulator startup/connection errors. Ctrl+C stops only the bridge.
+Add `--once` to catch up and exit with a failure on any synchronization error
+or an empty source. The same command is available through
+`npx --no-install nx run loadtest:mirror-delta -- <bridge options>`.
+No loadtest is started by that target.
+
+To mirror a real SQL Server Arrow route rather than retained loadtest fixtures,
+point `ARROWCOL_DELTA_ROOT` at the deployed collector's actual Delta root and
+pass `--table catalog.schema.table` for the live route. Repeat `--table` to
+allowlist multiple routes; unrelated tables are not mirrored. Use a fresh
+`--state-dir` and `--database` when switching sources, and set
+`ARROWCOL_DEMO_DATABASE` before starting Compose to select that database in
+the workbench. These settings do not enable SQL Server's Arrow producer:
+the modified SQL instance, route registration, and producer session must
+already be configured. Synthetic fixtures are not a substitute for that path.
+SQL Arrow `UInt64` fields stored as Delta `decimal(20,0)` map to Kusto
+`decimal`, preserving their full integer range instead of rounding through
+floating point or overflowing a signed `long`.
+
+Reuse the same source, destination settings, and `--state-dir` after restart.
+The bridge checkpoints observed Delta schemas, versions, and active file names
+and reconciles Kusto ingestion tags before retrying a file, including after a
+lost ingestion response. Only committed snapshot files are selected; orphan
+Parquet is ignored. `kusto-status.json` in the state directory reports
+`pending` for an empty source, `healthy` after catch-up, or `degraded` with the
+error. The directory also retains ingestion and query diagnostics.
+
+This demo supports local, unpartitioned `catalog/schema/table` layouts with
+flat primitive columns supported by the existing loadtest mirror. Names must
+be simple identifiers; destination-name collisions are rejected. It supports
+fixed-schema, append-only Delta only: schema changes, backwards versions,
+disappearing tables, and removed/replaced active files explicitly degrade
+synchronization. Updates, deletes, compaction, and general Delta CDC are not
+implemented. Arrowcol's published receipt still means durable in Delta, not
+ingested into Kusto.
+
+Use a dedicated destination database/prefix and one bridge per state directory.
+Do not reset or replace the source under a running bridge, or delete bridge
+state to conceal a source reset. For a fresh demo, use a new state directory
+and new destination database; `--database` and `--table-prefix` customize them.
+If changing the database, also update the workbench's selected database.
+`docker compose -f projects/loadtest/kusto-demo.compose.yaml stop` stops only
+this demo's containers without deleting its Kusto volume. This demo is for
+functional inspection, not emulator performance benchmarking.
+
+### Loadtest integration
+
 The emulator requires Linux/amd64 Docker, a CPU supporting SSE4.2/AVX2, and
 sufficient host memory. Its first image download is over 1 GB compressed. The
 Compose service pins an immutable digest of Microsoft's documented

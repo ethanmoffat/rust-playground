@@ -52,6 +52,14 @@
         "forwardAllArgs": true
       }
     },
+    "mirror-delta": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo run --locked --package arrowcol-loadgen -- mirror-delta",
+        "forwardAllArgs": true
+      }
+    },
     "build": {
       "executor": "nx:run-commands",
       "cache": false,

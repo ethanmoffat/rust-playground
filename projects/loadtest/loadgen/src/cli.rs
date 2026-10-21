@@ -21,8 +21,42 @@ pub enum Command {
     Run(Box<RunArgs>),
     /// Validate benchmark manifests and independent Delta snapshots.
     Validate(ValidateArgs),
+    /// Mirror committed append-only Delta files to Kusto without generating traffic.
+    MirrorDelta(MirrorDeltaArgs),
     /// Print the exact public Flight SQL schema fixture.
     PrintSchemas,
+}
+
+/// Independent local Delta-to-Kusto demo settings.
+#[derive(Clone, Debug, Args)]
+pub struct MirrorDeltaArgs {
+    /// Arrowcol output root containing catalog/schema/table Delta directories.
+    #[arg(long)]
+    pub delta_root: PathBuf,
+    /// Only mirror these exact catalog.schema.table identities; repeat for multiple tables.
+    #[arg(long = "table")]
+    pub tables: Vec<String>,
+    /// The same root's absolute mount path inside the Kusto container.
+    #[arg(long, default_value = "/delta/arrowcol")]
+    pub container_root: PathBuf,
+    /// Local emulator HTTP origin, without authentication.
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    pub endpoint: String,
+    /// Dedicated destination database (persisted below /kustodata/dbs).
+    #[arg(long, default_value = "arrowcol_demo")]
+    pub database: String,
+    /// Destination table prefix; table names include catalog, schema, and table.
+    #[arg(long, default_value = "arrowcol")]
+    pub table_prefix: String,
+    /// Persistent bridge state and diagnostics; reuse this directory on restart.
+    #[arg(long)]
+    pub state_dir: PathBuf,
+    /// Polling interval in whole seconds or a duration such as 2s.
+    #[arg(long, default_value = "2s")]
+    pub poll_interval: DurationArg,
+    /// Catch up once and exit; fail on errors or an empty source.
+    #[arg(long)]
+    pub once: bool,
 }
 
 /// Benchmark scenario.
