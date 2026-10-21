@@ -30,7 +30,7 @@ use otel_arrow_dfe_quiver::{
     CancellationToken, DiskBudget, QuiverConfig, QuiverEngine, QuiverEngineBuilder, SegmentStore,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -293,6 +293,9 @@ pub struct QuiverStage {
     receipt_lease_duration: Duration,
     config: QuiverStageConfig,
     in_flight: Arc<Semaphore>,
+    /// One receipt adoption transaction at a time: each one locks the table
+    /// lease and owner rows, so overlapping adoptions only add SQL lock cycles.
+    adoption: AsyncMutex<()>,
     /// Ingest and finalize calls in progress. While a segment is finalized its
     /// bundles are briefly in neither the open segment nor the subscriber's
     /// pending progress, so the backlog must not read as empty then.
@@ -352,6 +355,7 @@ impl QuiverStage {
             owner,
             receipt_lease_duration,
             in_flight: Arc::new(Semaphore::new(config.max_in_flight)),
+            adoption: AsyncMutex::new(()),
             storage_operations: AtomicU64::new(0),
             processing: AtomicU64::new(0),
             config,
@@ -770,11 +774,13 @@ impl QuiverStage {
             adopted_at: now,
             receipts: vec![AdoptionCandidate::from_record(record)],
         };
-        let mut report = self
-            .receipts
-            .adopt_receipts(&request)
-            .await
-            .map_err(|error| Resolution::Retry(format!("adopt receipt: {error}")))?;
+        let mut report = {
+            let _adopting = self.adoption.lock().await;
+            self.receipts
+                .adopt_receipts(&request)
+                .await
+                .map_err(|error| Resolution::Retry(format!("adopt receipt: {error}")))?
+        };
         if let Some(adopted) = report.adopted.pop() {
             self.counters.adopted_receipts.fetch_add(1, Ordering::Relaxed);
             info!(

@@ -153,17 +153,23 @@ impl SqlServerReceiptConfig {
 }
 
 /// SQL Server-backed receipt store over the Arrowcol application database.
+///
+/// Transactions chosen as deadlock victims (SQL error 1205) are rolled back by
+/// the server and retried a few times before the error is surfaced. Every
+/// operation runs at most one transaction, so a retry never repeats committed
+/// work.
 #[derive(Clone)]
 pub struct SqlServerReceiptStore {
-    config: SqlServerReceiptConfig,
-    pool: Option<SqlPool>,
+    inner: RawSqlReceiptStore,
 }
 
 impl SqlServerReceiptStore {
     /// Creates a receipt store.
     #[must_use]
     pub const fn new(config: SqlServerReceiptConfig) -> Self {
-        Self { config, pool: None }
+        Self {
+            inner: RawSqlReceiptStore { config, pool: None },
+        }
     }
 
     /// Uses a shared pool with the same credentials, TLS policy, and timeouts.
@@ -176,16 +182,149 @@ impl SqlServerReceiptStore {
     ///
     /// Rejects a pool whose connection configuration differs from this store.
     pub fn with_pool(mut self, pool: SqlPool) -> ReceiptResult<Self> {
-        if !pool.matches_config(&self.config.connection_config()) {
+        if !pool.matches_config(&self.inner.config.connection_config()) {
             return Err(ReceiptError::new(
                 ReceiptErrorKind::InvalidConfiguration,
                 "SQL Server pool configuration does not match store configuration",
             ));
         }
-        self.pool = Some(pool);
+        self.inner.pool = Some(pool);
         Ok(self)
     }
+}
 
+const DEADLOCK_ATTEMPTS: u32 = 6;
+
+async fn retry_deadlock<T, F, Fut>(mut operation: F) -> ReceiptResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ReceiptResult<T>>,
+{
+    let mut attempt = 1;
+    loop {
+        match operation().await {
+            Err(error) if attempt < DEADLOCK_ATTEMPTS && is_deadlock_victim(&error) => {
+                tokio::time::sleep(Duration::from_millis(25 * u64::from(attempt))).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+fn is_deadlock_victim(error: &ReceiptError) -> bool {
+    error.kind() == ReceiptErrorKind::Database && error.to_string().contains("deadlock victim")
+}
+
+#[async_trait]
+impl ReceiptStore for SqlServerReceiptStore {
+    async fn register_owner(&self, registration: OwnerRegistration) -> ReceiptResult<()> {
+        retry_deadlock(|| self.inner.register_owner(registration.clone())).await
+    }
+
+    async fn heartbeat_owner(&self, owner: CollectorInstanceId, lease_deadline: UnixMillis) -> ReceiptResult<()> {
+        retry_deadlock(|| self.inner.heartbeat_owner(owner, lease_deadline)).await
+    }
+
+    async fn start_owner_drain(&self, owner: CollectorInstanceId) -> ReceiptResult<OwnerDrain> {
+        retry_deadlock(|| self.inner.start_owner_drain(owner)).await
+    }
+
+    async fn finish_owner_drain(&self, owner: CollectorInstanceId, stopped_at: UnixMillis) -> ReceiptResult<()> {
+        retry_deadlock(|| self.inner.finish_owner_drain(owner, stopped_at)).await
+    }
+
+    async fn acquire_table_lease(&self, request: TableLeaseRequest) -> ReceiptResult<TableLease> {
+        retry_deadlock(|| self.inner.acquire_table_lease(request.clone())).await
+    }
+
+    async fn renew_table_lease(&self, lease: &TableLease, expires_at: UnixMillis) -> ReceiptResult<TableLease> {
+        retry_deadlock(|| self.inner.renew_table_lease(lease, expires_at)).await
+    }
+
+    async fn release_table_lease(&self, lease: &TableLease, released_at: UnixMillis) -> ReceiptResult<()> {
+        retry_deadlock(|| self.inner.release_table_lease(lease, released_at)).await
+    }
+
+    async fn create_flight_batch(
+        &self,
+        owner: CollectorInstanceId,
+        lease: &TableLease,
+        lease_deadline: UnixMillis,
+        deliveries: &[ValidatedDelivery],
+    ) -> ReceiptResult<Vec<ReceiptRecord>> {
+        retry_deadlock(|| self.inner.create_flight_batch(owner, lease, lease_deadline, deliveries)).await
+    }
+
+    async fn mark_buffered(
+        &self,
+        owner: CollectorInstanceId,
+        receipts: &[ReceiptVersion],
+        lease_deadline: UnixMillis,
+    ) -> ReceiptResult<Vec<ReceiptRecord>> {
+        retry_deadlock(|| self.inner.mark_buffered(owner, receipts, lease_deadline)).await
+    }
+
+    async fn mark_flushing(
+        &self,
+        owner: CollectorInstanceId,
+        receipts: &[ReceiptVersion],
+        lease_deadline: UnixMillis,
+    ) -> ReceiptResult<Vec<ReceiptRecord>> {
+        retry_deadlock(|| self.inner.mark_flushing(owner, receipts, lease_deadline)).await
+    }
+
+    async fn heartbeat_receipts(
+        &self,
+        owner: CollectorInstanceId,
+        receipts: &[ReceiptVersion],
+        lease_deadline: UnixMillis,
+    ) -> ReceiptResult<()> {
+        retry_deadlock(|| self.inner.heartbeat_receipts(owner, receipts, lease_deadline)).await
+    }
+
+    async fn publish_commit(
+        &self,
+        owner: CollectorInstanceId,
+        batch: &PublicationBatch,
+    ) -> ReceiptResult<Vec<ReceiptRecord>> {
+        retry_deadlock(|| self.inner.publish_commit(owner, batch)).await
+    }
+
+    async fn fail_batch(
+        &self,
+        owner: CollectorInstanceId,
+        receipts: &[ReceiptVersion],
+        failure: &ReceiptFailure,
+        failed_at: UnixMillis,
+    ) -> ReceiptResult<Vec<ReceiptRecord>> {
+        retry_deadlock(|| self.inner.fail_batch(owner, receipts, failure, failed_at)).await
+    }
+
+    async fn receipt(&self, receipt_id: ReceiptId) -> ReceiptResult<Option<ReceiptRecord>> {
+        retry_deadlock(|| self.inner.receipt(receipt_id)).await
+    }
+
+    async fn receipts(&self, receipt_ids: &[ReceiptId]) -> ReceiptResult<Vec<Option<ReceiptRecord>>> {
+        retry_deadlock(|| self.inner.receipts(receipt_ids)).await
+    }
+
+    async fn reconcile_expired(&self, now: UnixMillis, limit: usize) -> ReceiptResult<ReconciliationReport> {
+        retry_deadlock(|| self.inner.reconcile_expired(now, limit)).await
+    }
+
+    async fn adopt_receipts(&self, request: &ReceiptAdoption) -> ReceiptResult<ReceiptAdoptionReport> {
+        retry_deadlock(|| self.inner.adopt_receipts(request)).await
+    }
+}
+
+#[derive(Clone)]
+struct RawSqlReceiptStore {
+    config: SqlServerReceiptConfig,
+    pool: Option<SqlPool>,
+}
+
+impl RawSqlReceiptStore {
     async fn connect(&self) -> ReceiptResult<SqlConnection> {
         match &self.pool {
             Some(pool) => pool.acquire().await,
@@ -209,7 +348,7 @@ impl SqlServerReceiptStore {
 }
 
 #[async_trait]
-impl ReceiptStore for SqlServerReceiptStore {
+impl ReceiptStore for RawSqlReceiptStore {
     async fn register_owner(&self, registration: OwnerRegistration) -> ReceiptResult<()> {
         if registration.generation == 0 || registration.instance_key.is_empty() || registration.instance_key.len() > 200
         {
@@ -2135,8 +2274,8 @@ mod pooling_tests {
         )?;
         let bounded = config.clone().with_batch_limits(1, 2)?;
         let store = SqlServerReceiptStore::new(bounded).with_pool(pool.clone())?;
-        assert!(store.clone().pool.is_some());
-        assert!(SqlServerReceiptStore::new(config.clone()).pool.is_none());
+        assert!(store.clone().inner.pool.is_some());
+        assert!(SqlServerReceiptStore::new(config.clone()).inner.pool.is_none());
 
         for field in 0..8 {
             let mut mismatch = config.clone();
@@ -2160,7 +2299,10 @@ mod pooling_tests {
         }
         assert_eq!(pool.stats().created, 0);
         pool.close();
-        assert_eq!(store.clone().pool.as_ref().map(|pool| pool.stats().max_size), Some(0));
+        assert_eq!(
+            store.clone().inner.pool.as_ref().map(|pool| pool.stats().max_size),
+            Some(0)
+        );
         Ok(())
     }
 }
@@ -2286,5 +2428,53 @@ mod adoption_validation_tests {
         assert!(predicate.contains("durable_owner.instance_id = r.owner_instance_id"));
         assert!(predicate.contains("durable_owner.durable_recovery_window_ms IS NOT NULL"));
         assert!(predicate.contains("DATEADD(millisecond, -durable_owner.durable_recovery_window_ms, @P4)"));
+    }
+}
+
+#[cfg(test)]
+mod deadlock_tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    /// Scenario: SQL Server picks a receipt transaction as a deadlock victim
+    /// twice in a row, as happens when a restarted collector adopts receipts
+    /// while its heartbeat and flushes contend for the same rows.
+    /// Guarantees: The store retries the rolled-back transaction until it
+    /// commits instead of surfacing a transient lock conflict that would fail
+    /// the collector closed.
+    #[tokio::test]
+    async fn deadlock_victims_are_retried_until_they_commit() -> anyhow::Result<()> {
+        let attempts = AtomicU32::new(0);
+        let value = retry_deadlock(|| async {
+            if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                Err(database_error(
+                    "heartbeat receipt owner",
+                    "Transaction (Process ID 85) was deadlocked on lock resources with another process \
+                     and has been chosen as the deadlock victim. Rerun the transaction.",
+                ))
+            } else {
+                Ok(7)
+            }
+        })
+        .await?;
+        assert_eq!(value, 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
+    /// Scenario: A receipt operation fails for a reason other than a deadlock.
+    /// Guarantees: The error surfaces after one attempt; only transactions the
+    /// server rolled back as deadlock victims are retried.
+    #[tokio::test]
+    async fn other_failures_are_not_retried() {
+        let attempts = AtomicU32::new(0);
+        let result: ReceiptResult<()> = retry_deadlock(|| async {
+            let _ = attempts.fetch_add(1, Ordering::SeqCst);
+            Err(ReceiptError::new(ReceiptErrorKind::Fenced, "table lease is invalid"))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }
