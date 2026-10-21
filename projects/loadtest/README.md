@@ -62,6 +62,8 @@ gets its acknowledgement, and Delta publication reads it back from disk:
   `durable_admission`, replacing `best_effort`, only after every batch is on
   disk. Dataflow still has no SQL receipts.
 
+To look inside these directories, see [Quiver on disk](../../docs/quiver/README.md#8-the-benchmarks-directories).
+
 An fsync per acknowledgement costs throughput; that is the trade-off on show.
 Watch the **Quiver** panels in Grafana for disk usage, backlog, and persist and
 drain rates.

@@ -19,7 +19,10 @@ pub use manager::{
     Admission, BufferManager, BufferPressureSnapshot, DeliveryCompletion, DeliveryOutcome, FlushReason, IncompleteWork,
     ShutdownReport, TablePressureSnapshot, TrackedState,
 };
-pub use quiver::{PersistRequest, QuiverStage, QuiverStageConfig, QuiverStageSnapshot, StageLeases};
+pub use quiver::{
+    DELIVERY_MANIFEST_FORMAT, DELIVERY_MANIFEST_VERSION, DELIVERY_SLOT, DELTA_SUBSCRIBER, DeliveryBundle,
+    DeliveryManifest, PersistRequest, QuiverStage, QuiverStageConfig, QuiverStageSnapshot, StageLeases,
+};
 pub use sink::{
     DeltaPublicationSink, PublicationContext, PublicationOutcome, PublicationSession, PublicationSink, SinkError,
     SinkErrorKind,

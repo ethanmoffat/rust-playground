@@ -59,6 +59,8 @@ collector replays them. See
 | Benchmark host | `onelake/benchmark/latest/direct-state-1/quiver` | `onelake/benchmark/latest/dataflow-state-1/quiver` |
 | Benchmark container | `/state/quiver` | `/quiver` |
 
+[Quiver on disk](../../quiver/README.md) shows these files with `quiver-cli`.
+
 A Quiver directory must outlive the process and belong to one
 `instance_key`. Disk usage is capped by the configured capacity, and a full
 budget backpressures ingest.
