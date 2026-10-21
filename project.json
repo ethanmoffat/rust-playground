@@ -21,6 +21,7 @@
     "otelcol-rust",
     "greeting",
     "hello-world",
+    "quiver-cli",
     "loadtest"
   ],
   "metadata": {
@@ -51,6 +52,7 @@
             "otelcol-rust",
             "greeting",
             "hello-world",
+            "quiver-cli",
             "loadtest",
             "auth-automation",
             "arrowcol-sdk-gen-tool",
@@ -94,6 +96,7 @@
             "otelcol-rust",
             "greeting",
             "hello-world",
+            "quiver-cli",
             "loadtest"
           ],
           "target": "format"
@@ -130,6 +133,7 @@
             "otelcol-rust",
             "greeting",
             "hello-world",
+            "quiver-cli",
             "loadtest"
           ],
           "target": "format-check"
@@ -172,6 +176,7 @@
             "otelcol-rust",
             "greeting",
             "hello-world",
+            "quiver-cli",
             "loadtest"
           ],
           "target": "lint"
@@ -225,7 +230,8 @@
             "otel-deltalake-exporter",
             "otelcol-rust",
             "greeting",
-            "hello-world"
+            "hello-world",
+            "quiver-cli"
           ],
           "target": "build"
         },
@@ -267,6 +273,7 @@
             "otelcol-rust",
             "greeting",
             "hello-world",
+            "quiver-cli",
             "loadtest"
           ],
           "target": "test"

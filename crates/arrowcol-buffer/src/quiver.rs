@@ -41,14 +41,14 @@ use crate::{
     TrackedState,
 };
 
-/// Quiver slot holding the single record batch of a direct delivery.
-const DIRECT_SLOT: SlotId = SlotId::new(0);
-/// Stable manifest format identifier.
-const MANIFEST_FORMAT: &str = "arrowcol.direct";
-/// Current manifest format version.
-const MANIFEST_VERSION: u16 = 1;
-/// Quiver subscriber that publishes bundles to Delta.
-const SUBSCRIBER: &str = "arrowcol-delta";
+/// Quiver slot holding the single record batch of a persisted delivery.
+pub const DELIVERY_SLOT: SlotId = SlotId::new(0);
+/// Format identifier of a [`DeliveryManifest`].
+pub const DELIVERY_MANIFEST_FORMAT: &str = "arrowcol.direct";
+/// Current [`DeliveryManifest`] version.
+pub const DELIVERY_MANIFEST_VERSION: u16 = 1;
+/// Quiver subscriber that publishes persisted deliveries to Delta.
+pub const DELTA_SUBSCRIBER: &str = "arrowcol-delta";
 /// Upper bound on one wait for the next finalized bundle.
 const POLL_TIMEOUT: Duration = Duration::from_millis(250);
 /// Interval between Quiver maintenance passes (progress flush and cleanup).
@@ -182,36 +182,68 @@ struct Counters {
     backpressure_waits: AtomicU64,
 }
 
-/// Durable bundle manifest persisted as Quiver bundle metadata.
+/// Manifest persisted as Quiver bundle metadata with every delivery.
+///
+/// It carries the receipt, lease, and schema identity a restarted collector
+/// needs to publish the delivery from disk. It is serialized as JSON.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct DirectBundleManifest {
-    format: String,
-    version: u16,
-    receipt_id: ReceiptId,
-    receipt_revision: u64,
-    owner_instance_id: CollectorInstanceId,
-    lease_id: LeaseId,
-    fencing_token: u64,
-    table_id: Uuid,
-    table: TableIdentity,
-    schema_version: SchemaVersion,
-    schema_fingerprint: SchemaFingerprint,
-    rows: u64,
-    batches: u64,
-    arrow_memory_bytes: u64,
+pub struct DeliveryManifest {
+    /// Always [`DELIVERY_MANIFEST_FORMAT`].
+    pub format: String,
+    /// Always [`DELIVERY_MANIFEST_VERSION`].
+    pub version: u16,
+    /// Server receipt of the delivery.
+    pub receipt_id: ReceiptId,
+    /// Receipt revision when the delivery was persisted.
+    pub receipt_revision: u64,
+    /// Collector that owned the receipt.
+    pub owner_instance_id: CollectorInstanceId,
+    /// Table lease the receipt was bound to.
+    pub lease_id: LeaseId,
+    /// Fencing epoch of that lease.
+    pub fencing_token: u64,
+    /// Catalog table identifier.
+    pub table_id: Uuid,
+    /// Fully qualified table.
+    pub table: TableIdentity,
+    /// Registered schema version.
+    pub schema_version: SchemaVersion,
+    /// Fingerprint of the registered Arrow schema.
+    pub schema_fingerprint: SchemaFingerprint,
+    /// Rows in the delivery.
+    pub rows: u64,
+    /// Record batches in the delivery; always 1 for a persisted delivery.
+    pub batches: u64,
+    /// Arrow memory of the delivery's batch.
+    pub arrow_memory_bytes: u64,
 }
 
-impl DirectBundleManifest {
-    fn decode(bytes: &[u8]) -> Result<Self, String> {
+impl DeliveryManifest {
+    /// Decodes and checks a manifest read from Quiver bundle metadata.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed JSON and other manifest formats or versions.
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         let manifest: Self = serde_json::from_slice(bytes).map_err(|error| format!("invalid manifest: {error}"))?;
-        if manifest.format != MANIFEST_FORMAT || manifest.version != MANIFEST_VERSION {
+        if manifest.format != DELIVERY_MANIFEST_FORMAT || manifest.version != DELIVERY_MANIFEST_VERSION {
             return Err(format!(
                 "unsupported manifest format {}@{}",
                 manifest.format, manifest.version
             ));
         }
         Ok(manifest)
+    }
+
+    /// Serializes the manifest as Quiver bundle metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization failure.
+    pub fn encode(&self) -> BufferResult<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|error| BufferError::new(BufferErrorKind::InvalidConfiguration, error.to_string()))
     }
 
     fn delivery(&self) -> BufferResult<ValidatedDelivery> {
@@ -232,8 +264,9 @@ impl DirectBundleManifest {
     }
 }
 
-/// One persisted direct delivery as a Quiver record bundle.
-struct DirectBundle {
+/// One persisted delivery as a Quiver record bundle: its single record batch
+/// in [`DELIVERY_SLOT`] plus a [`DeliveryManifest`] as bundle metadata.
+pub struct DeliveryBundle {
     descriptor: BundleDescriptor,
     batch: RecordBatch,
     fingerprint: [u8; 32],
@@ -243,7 +276,32 @@ struct DirectBundle {
     ingestion_time: SystemTime,
 }
 
-impl RecordBundle for DirectBundle {
+impl DeliveryBundle {
+    /// Builds the bundle the Direct collector persists for one delivery.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a manifest that does not describe exactly this one batch.
+    pub fn new(manifest: &DeliveryManifest, batch: RecordBatch) -> BufferResult<Self> {
+        if manifest.batches != 1 || u64::try_from(batch.num_rows()).ok() != Some(manifest.rows) {
+            return Err(BufferError::new(
+                BufferErrorKind::InvalidConfiguration,
+                "a persisted delivery must hold exactly one record batch with the manifest's rows",
+            ));
+        }
+        Ok(Self {
+            descriptor: BundleDescriptor::new(vec![SlotDescriptor::new(DELIVERY_SLOT, "ArrowcolDirect")]),
+            fingerprint: *manifest.schema_fingerprint.as_bytes(),
+            batch,
+            manifest: manifest.encode()?,
+            rows: manifest.rows,
+            bytes: manifest.arrow_memory_bytes,
+            ingestion_time: SystemTime::now(),
+        })
+    }
+}
+
+impl RecordBundle for DeliveryBundle {
     fn descriptor(&self) -> &BundleDescriptor {
         &self.descriptor
     }
@@ -253,7 +311,7 @@ impl RecordBundle for DirectBundle {
     }
 
     fn payload(&self, slot: SlotId) -> Option<PayloadRef<'_>> {
-        (slot == DIRECT_SLOT).then_some(PayloadRef {
+        (slot == DELIVERY_SLOT).then_some(PayloadRef {
             schema_fingerprint: self.fingerprint,
             batch: &self.batch,
         })
@@ -331,19 +389,19 @@ impl QuiverStage {
             .with_wal_item_counter(Arc::new(|bundle: &dyn RecordBundle| {
                 bundle
                     .metadata()
-                    .and_then(|bytes| DirectBundleManifest::decode(bytes).ok())
+                    .and_then(|bytes| DeliveryManifest::decode(bytes).ok())
                     .map(|manifest| manifest.rows)
             }))
             .with_wal_byte_counter(Arc::new(|bundle: &dyn RecordBundle| {
                 bundle
                     .metadata()
-                    .and_then(|bytes| DirectBundleManifest::decode(bytes).ok())
+                    .and_then(|bytes| DeliveryManifest::decode(bytes).ok())
                     .map(|manifest| manifest.arrow_memory_bytes)
             }))
             .build()
             .await
             .map_err(durable_error)?;
-        let subscriber = SubscriberId::new(SUBSCRIBER).map_err(durable_error)?;
+        let subscriber = SubscriberId::new(DELTA_SUBSCRIBER).map_err(durable_error)?;
         engine.register_subscriber(subscriber.clone()).map_err(durable_error)?;
         engine.activate_subscriber(&subscriber).map_err(durable_error)?;
         let stage = Arc::new(Self {
@@ -646,7 +704,7 @@ impl QuiverStage {
 
     async fn deliver(&self, handle: &QuiverHandle, attempt: u32) -> Resolution {
         let bundle = handle.data();
-        let manifest = match bundle.metadata().map(DirectBundleManifest::decode) {
+        let manifest = match bundle.metadata().map(DeliveryManifest::decode) {
             Some(Ok(manifest)) => manifest,
             Some(Err(error)) => {
                 error!(%error, "dropping persisted bundle with an unreadable manifest");
@@ -657,7 +715,7 @@ impl QuiverStage {
                 return Resolution::Reject;
             }
         };
-        let Some(batch) = bundle.payload(DIRECT_SLOT).cloned() else {
+        let Some(batch) = bundle.payload(DELIVERY_SLOT).cloned() else {
             error!(receipt_id = %manifest.receipt_id, "dropping persisted bundle without its record batch");
             return Resolution::Reject;
         };
@@ -689,7 +747,7 @@ impl QuiverStage {
     /// still `accepted` on the lease it was created with.
     async fn fresh(
         &self,
-        manifest: &DirectBundleManifest,
+        manifest: &DeliveryManifest,
         delivery: &ValidatedDelivery,
         batch: RecordBatch,
     ) -> Result<DeliveryCompletion, String> {
@@ -714,7 +772,7 @@ impl QuiverStage {
     /// a predecessor or an older lease, and admits it in its current state.
     async fn reconcile(
         &self,
-        manifest: &DirectBundleManifest,
+        manifest: &DeliveryManifest,
         delivery: ValidatedDelivery,
         batch: RecordBatch,
     ) -> Result<DeliveryCompletion, Resolution> {
@@ -847,7 +905,7 @@ fn resolve(outcome: DeliveryOutcome) -> Resolution {
     }
 }
 
-fn direct_bundle(request: PersistRequest<'_>) -> BufferResult<DirectBundle> {
+fn direct_bundle(request: PersistRequest<'_>) -> BufferResult<DeliveryBundle> {
     let PersistRequest {
         receipt,
         owner,
@@ -855,15 +913,9 @@ fn direct_bundle(request: PersistRequest<'_>) -> BufferResult<DirectBundle> {
         lease,
         batch,
     } = request;
-    if delivery.batches().get() != 1 {
-        return Err(BufferError::new(
-            BufferErrorKind::InvalidConfiguration,
-            "a persisted direct delivery must hold exactly one record batch",
-        ));
-    }
-    let manifest = DirectBundleManifest {
-        format: MANIFEST_FORMAT.to_owned(),
-        version: MANIFEST_VERSION,
+    let manifest = DeliveryManifest {
+        format: DELIVERY_MANIFEST_FORMAT.to_owned(),
+        version: DELIVERY_MANIFEST_VERSION,
         receipt_id: receipt.receipt_id,
         receipt_revision: receipt.revision,
         owner_instance_id: owner,
@@ -877,19 +929,93 @@ fn direct_bundle(request: PersistRequest<'_>) -> BufferResult<DirectBundle> {
         batches: delivery.batches().get(),
         arrow_memory_bytes: delivery.arrow_memory_bytes().get(),
     };
-    let encoded = serde_json::to_vec(&manifest)
-        .map_err(|error| BufferError::new(BufferErrorKind::InvalidConfiguration, error.to_string()))?;
-    Ok(DirectBundle {
-        descriptor: BundleDescriptor::new(vec![SlotDescriptor::new(DIRECT_SLOT, "ArrowcolDirect")]),
-        fingerprint: *delivery.schema_fingerprint().as_bytes(),
-        batch,
-        manifest: encoded,
-        rows: manifest.rows,
-        bytes: manifest.arrow_memory_bytes,
-        ingestion_time: SystemTime::now(),
-    })
+    DeliveryBundle::new(&manifest, batch)
 }
 
 fn durable_error(error: impl std::fmt::Display) -> BufferError {
     BufferError::new(BufferErrorKind::DurableStorage, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrowcol_protocol::{CatalogName, SchemaName, TableName, fingerprint_schema};
+
+    use super::*;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    fn batch(values: &[i64]) -> TestResult<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
+        Ok(RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(values.to_vec()))],
+        )?)
+    }
+
+    fn manifest(rows: u64) -> TestResult<DeliveryManifest> {
+        Ok(DeliveryManifest {
+            format: DELIVERY_MANIFEST_FORMAT.to_owned(),
+            version: DELIVERY_MANIFEST_VERSION,
+            receipt_id: ReceiptId::new(),
+            receipt_revision: 0,
+            owner_instance_id: CollectorInstanceId::new(),
+            lease_id: LeaseId::new(),
+            fencing_token: 3,
+            table_id: Uuid::new_v4(),
+            table: TableIdentity::new(
+                CatalogName::new("telemetry")?,
+                SchemaName::new("sqlserver")?,
+                TableName::new("sqlserver_wait_stats")?,
+            ),
+            schema_version: SchemaVersion::FIRST,
+            schema_fingerprint: fingerprint_schema(batch(&[1])?.schema().as_ref()),
+            rows,
+            batches: 1,
+            arrow_memory_bytes: 64,
+        })
+    }
+
+    /// Scenario: A delivery manifest is persisted as Quiver bundle metadata
+    /// and read back by a restarted collector or an inspection tool.
+    /// Guarantees: Decoding returns the encoded manifest; other formats,
+    /// versions, and malformed bytes are rejected.
+    #[test]
+    fn delivery_manifest_round_trips_and_rejects_other_formats() -> TestResult {
+        let manifest = manifest(2)?;
+        assert_eq!(DeliveryManifest::decode(&manifest.encode()?)?, manifest);
+        let mut other = manifest.clone();
+        other.version = DELIVERY_MANIFEST_VERSION + 1;
+        assert!(DeliveryManifest::decode(&other.encode()?).is_err());
+        assert!(DeliveryManifest::decode(b"QPA\x01").is_err());
+        Ok(())
+    }
+
+    /// Scenario: The Direct collector or quiver-cli builds the bundle it
+    /// persists for one delivery.
+    /// Guarantees: The batch sits in DELIVERY_SLOT with the manifest's schema
+    /// fingerprint, the manifest is the bundle metadata, and a manifest that
+    /// does not describe exactly this batch is rejected.
+    #[test]
+    fn delivery_bundle_carries_its_batch_and_manifest() -> TestResult {
+        let manifest = manifest(3)?;
+        let bundle = DeliveryBundle::new(&manifest, batch(&[1, 2, 3])?)?;
+        let payload = bundle.payload(DELIVERY_SLOT).ok_or("payload")?;
+        assert_eq!(payload.batch.num_rows(), 3);
+        assert_eq!(&payload.schema_fingerprint, manifest.schema_fingerprint.as_bytes());
+        assert!(bundle.payload(SlotId::new(1)).is_none());
+        assert_eq!(
+            DeliveryManifest::decode(bundle.metadata().ok_or("metadata")?)?,
+            manifest
+        );
+        assert_eq!(bundle.item_count(), 3);
+        assert!(DeliveryBundle::new(&manifest, batch(&[1])?).is_err());
+        let mut two_batches = manifest.clone();
+        two_batches.batches = 2;
+        assert!(DeliveryBundle::new(&two_batches, batch(&[1, 2, 3])?).is_err());
+        Ok(())
+    }
 }

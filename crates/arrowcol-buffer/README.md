@@ -68,6 +68,11 @@ buffer for direct collectors that must not lose acknowledged payloads:
   they are persisted. `drain` waits for a stable empty backlog; `snapshot`
   reports disk usage, backlog, and counters for pressure and metrics.
 
+The bundle format is public: `DeliveryManifest` (`arrowcol.direct` version 1)
+and `DeliveryBundle` put one record batch in `DELIVERY_SLOT`, and
+`DELTA_SUBSCRIBER` names the consumer. [`quiver-cli`](../../bin/quiver-cli/README.md)
+uses them to write and decode the same bundles.
+
 `admit_tracked` also lets any durable stage admit recovered deliveries whose
 receipts are already `buffered` or `flushing` (`TrackedState`) and returns a
 `DeliveryCompletion` that resolves to a `DeliveryOutcome`.

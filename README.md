@@ -84,7 +84,8 @@ source copy only after the receipt HTTP API reports `published` and
 honestly reports only best-effort admission and has no receipt polling or
 at-least-once claim. With native Quiver (`loadtest:run -- --quiver`), both pools
 fsync every batch to local disk before acknowledging it and replay it after a
-crash, so DFE completion becomes durable admission. See the
+crash, so DFE completion becomes durable admission. [Quiver on disk](docs/quiver/README.md)
+walks through those files with `quiver-cli`. See the
 [platform architecture](docs/architecture/arrowcol-platform/README.md) for the full
 catalog, router, receipt, fencing, buffering, and capability contracts.
 
@@ -282,6 +283,9 @@ docker run --rm --platform linux/amd64 \
   in here. This is like `cmd` in the `go` project. Crates within this folder
   will often contain accessories to the corresponding source code like
   `Dockerfile`s.
+- `bin/quiver-cli/` - Writes real SQL Server rows to Quiver like the Direct
+  collector and inspects any Quiver directory; see
+  [Quiver on disk](docs/quiver/README.md).
 - `crates/` - For library crates. Library crates may depend on each other and
   binary crates may also depend on them. This is just like `pkg` in the `go`
   project.
