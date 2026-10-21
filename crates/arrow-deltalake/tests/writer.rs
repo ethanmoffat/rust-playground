@@ -148,6 +148,59 @@ fn lossless_normalization() -> Result<()> {
     Ok(())
 }
 
+/// Scenario: nullable SQL time values use Arrow microsecond and nanosecond encodings.
+/// Guarantees: Delta preserves exact values, nulls, and logical units, rejecting unit changes.
+#[cfg(feature = "delta")]
+#[tokio::test]
+async fn time64_round_trip_through_kernel() -> Result<()> {
+    use arrow::array::{ArrayRef, Int64Array, Time64MicrosecondArray, Time64NanosecondArray};
+    use arrow_deltalake::delta::DeltaTableWriter;
+    use arrow_deltalake::normalize::{ORIGINAL_TYPE, align, batch};
+    let directory = tempfile::tempdir()?;
+    let nanos = vec![Some(0), Some(43_200_000_000_100), Some(86_399_999_999_999), None];
+    let micros = vec![Some(0), Some(43_200_000_001), Some(86_399_999_999), None];
+    let input = RecordBatch::try_from_iter(vec![
+        (
+            "nanos",
+            Arc::new(Time64NanosecondArray::from(nanos.clone())) as ArrayRef,
+        ),
+        (
+            "micros",
+            Arc::new(Time64MicrosecondArray::from(micros.clone())) as ArrayRef,
+        ),
+    ])?;
+    let mut writer = DeltaTableWriter::open(directory.path())?;
+    writer.write(&input).await?;
+    let append = writer.close().await?.ok_or_else(|| anyhow::anyhow!("missing append"))?;
+    let mut reader =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(append.file.path)?)?
+            .build()?;
+    let output = reader.next().ok_or_else(|| anyhow::anyhow!("missing rows"))??;
+    for (index, expected) in [nanos, micros].into_iter().enumerate() {
+        let values = output
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow::anyhow!("not time integers"))?;
+        assert_eq!(values, &Int64Array::from(expected));
+        assert_eq!(
+            output.schema().field(index).metadata().get(ORIGINAL_TYPE),
+            Some(&input.schema().field(index).data_type().to_string())
+        );
+    }
+    let changed = RecordBatch::try_from_iter(vec![(
+        "nanos",
+        Arc::new(Time64MicrosecondArray::from(vec![1])) as ArrayRef,
+    )])?;
+    assert!(
+        align(&batch(&changed)?, output.schema())
+            .expect_err("time unit changes must be rejected")
+            .to_string()
+            .contains("incompatible logical Arrow type")
+    );
+    Ok(())
+}
+
 /// Scenario: Delta normalization widens and adds physical columns after input accounting.
 /// Guarantees: completed-file input bytes describe the caller's Arrow batch, not normalized storage.
 #[cfg(feature = "delta")]

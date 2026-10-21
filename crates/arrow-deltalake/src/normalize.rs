@@ -20,7 +20,7 @@ fn target_type(ty: &DataType) -> Result<DataType> {
         DataType::UInt32 => DataType::Int64,
         DataType::UInt64 => DataType::Decimal128(20, 0),
         DataType::FixedSizeBinary(_) => DataType::Binary,
-        DataType::Duration(_) => DataType::Int64,
+        DataType::Duration(_) | DataType::Time64(_) => DataType::Int64,
         DataType::Timestamp(_, _) => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         DataType::Struct(fields) => DataType::Struct(normalized_fields(fields)?),
         DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
@@ -33,7 +33,6 @@ fn target_type(ty: &DataType) -> Result<DataType> {
         | DataType::Union(_, _)
         | DataType::Interval(_)
         | DataType::Time32(_)
-        | DataType::Time64(_)
         | DataType::Float16
         | DataType::Decimal256(_, _)
         | DataType::RunEndEncoded(_, _)
