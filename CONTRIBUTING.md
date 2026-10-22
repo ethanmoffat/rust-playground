@@ -15,67 +15,37 @@ CI uses the same development environment.
    code --install-extension ms-vscode-remote.remote-containers
    ```
 
-1. Run the Windows bootstrap from PowerShell 7 as Administrator:
+1. Clone your fork on Windows, then check out and push the branch you want to
+   work on:
 
    ```powershell
-   $GIT_ROOT = git rev-parse --show-toplevel
-   & "$GIT_ROOT\dev\bootstrap-dev-env.ps1"
+   git clone https://github.com/<your-github-user>/rust-playground.git
    ```
 
-1. Enter Ubuntu 24.04, clone your fork into the WSL filesystem, and configure
-   your Git identity:
+1. From an **elevated PowerShell 7** prompt in the checkout, install
+   [Task](https://taskfile.dev) and run
+   [`dev/bootstrap-dev-env.yaml`](dev/bootstrap-dev-env.yaml):
 
-   ```bash
-   sudo install -d -m 0775 -o "$USER" -g "$USER" /workspaces
-   cd /workspaces
+   > ⚠️ This **deletes every WSL distribution** on the machine before
+   > recreating `Ubuntu-24.04`. Push any work inside WSL first.
 
-   read -rp "Enter your name (for example, FirstName LastName): " user_name
-   read -rp "Enter your email: " user_email
-   read -rp "Enter your fork URL: " git_fork_url
-
-   git config --global user.name "$user_name"
-   git config --global user.email "$user_email"
-   git clone "$git_fork_url" rust-playground
-   cd rust-playground
-   git submodule update --init --recursive
+   ```powershell
+   winget install Task.Task
+   $env:PATH = [Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('PATH', 'User')
+   task --taskfile dev/bootstrap-dev-env.yaml
    ```
 
-   Do not clone the development copy under `/mnt/c`; Docker bind mounts and
-   Linux filesystem operations are substantially more reliable under
-   `/workspaces`.
-
-   To reuse Git for Windows credentials from WSL:
-
-   ```bash
-   git config --global credential.helper \
-     '/mnt/c/"Program Files"/Git/mingw64/bin/git-credential-manager.exe'
-   ```
-
-1. Run the idempotent Linux host bootstrap:
-
-   ```bash
-   GIT_ROOT=$(git rev-parse --show-toplevel)
-   chmod +x "$GIT_ROOT/dev/bootstrap-dev-env.sh"
-   "$GIT_ROOT/dev/bootstrap-dev-env.sh"
-   ```
-
-   The bootstrap installs and configures Azure CLI, GitHub CLI, Docker,
-   Node.js, and the Dev Containers CLI. It also restarts Docker and clears
-   existing Docker containers, volumes, and networks.
-
-1. Clean install npm:
-
-   ```bash
-   npm ci
-   ```
-
-1. Start and enter the devcontainer:
-
-   ```bash
-   npx nx run devcontainer:up
-   WORKSPACE_HEX=$(printf '%s' "$(wslpath -w .)" | od -An -tx1 | tr -d '[:space:]')
-   code --folder-uri "vscode-remote://dev-container+${WORKSPACE_HEX}/workspaces/rust-playground"
-   ```
+   Without any prompts, this recreates WSL on the drive with the most free
+   space and clones your current branch, with submodules, into
+   `/workspaces/rust-playground`. Git inside WSL reuses your Git for Windows
+   credentials and identity. It then runs the idempotent
+   [Linux host bootstrap](dev/bootstrap-dev-env.sh), which installs Azure CLI,
+   GitHub CLI, Docker, Node.js, and the Dev Containers CLI, signs in the Azure
+   CLI through your signed-in browser with single sign-on, restarts Docker, and
+   clears existing Docker containers, volumes, and networks. Finally, it runs
+   `npm ci`, starts the devcontainer, and opens it in VS Code. After a restart,
+   run `task --taskfile dev/bootstrap-dev-env.yaml up` instead; it keeps WSL
+   and reopens the devcontainer.
 
    The devcontainer initialization creates the host credential directories
    used for the read/write mounts at `~/.azure` and `~/.config/gh`.
