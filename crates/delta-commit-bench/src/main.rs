@@ -103,6 +103,15 @@ enum CheckpointMode {
     Off,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, clap::ValueEnum)]
+enum CommitRuntime {
+    /// Multi-thread runtime with `--commit-threads` workers.
+    Multi,
+    /// Current-thread runtime on one dedicated thread. On Azure, kernel log replays with many
+    /// concurrent GETs (checkpoints) stall until the 30 s client timeout under this runtime.
+    Current,
+}
+
 #[derive(Args, Serialize)]
 struct RunArgs {
     #[command(flatten)]
@@ -154,9 +163,11 @@ struct RunArgs {
     max_files_per_commit: usize,
     #[arg(long, default_value_t = 100)]
     scan_window: u64,
-    /// Threads for commit loops; 1 = one committer core (current-thread runtime).
+    /// Worker threads for commit loops (one committer core = 1).
     #[arg(long, default_value_t = 1)]
     commit_threads: usize,
+    #[arg(long, value_enum, default_value_t = CommitRuntime::Multi)]
+    commit_runtime: CommitRuntime,
     /// JSONL output.
     #[arg(long)]
     out: PathBuf,
@@ -339,11 +350,11 @@ async fn run(args: RunArgs) -> Result<()> {
         let _ = out.flush();
     });
 
-    let commit_rt = if args.commit_threads <= 1 {
+    let commit_rt = if args.commit_runtime == CommitRuntime::Current {
         tokio::runtime::Builder::new_current_thread().thread_name("commit-blk").enable_all().build()?
     } else {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(args.commit_threads)
+            .worker_threads(args.commit_threads.max(1))
             .thread_name_fn(|| "commit".to_owned())
             .enable_all()
             .build()?

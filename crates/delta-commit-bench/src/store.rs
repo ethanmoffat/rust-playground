@@ -279,6 +279,10 @@ impl ObjectStore for InstrumentedStore {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         let log = is_log(location);
+        tracing::trace!(target: "dcb::store", path = %location, head = options.head, "get");
+        if std::env::var("DCB_BT_PATH").is_ok_and(|p| location.as_ref().ends_with(&p)) {
+            eprintln!("BACKTRACE {location}\n{}", std::backtrace::Backtrace::force_capture());
+        }
         self.before(log).await?;
         bump(match (log, options.head) {
             (true, true) => &self.counters.log_head,
@@ -291,6 +295,7 @@ impl ObjectStore for InstrumentedStore {
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         let log = is_log(location);
+        tracing::trace!(target: "dcb::store", path = %location, "get_ranges");
         self.before(log).await?;
         bump(if log { &self.counters.log_get } else { &self.counters.data_get });
         self.inner.get_ranges(location, ranges).await

@@ -135,6 +135,13 @@ pub struct CommitLoop {
     next_version: i64,
     /// Last `txn` version this loop knows it committed. Used to detect fencing and expiry.
     last_committed: Option<i64>,
+    /// Snapshot version whose log has been checked for this loop's batches and fences. Every
+    /// commit up to it is either this loop's own or passed the delta-rs conflict checker, which
+    /// rejects winning commits that carry this loop's appId. While the snapshot stays at this
+    /// version, the pre-commit landed check is skipped: the kernel's `txn` lookup replays the
+    /// whole log since the last checkpoint, and the scan-log check reads up to `scan_window`
+    /// commits one by one.
+    verified_through: Option<u64>,
     out: mpsc::UnboundedSender<CommitRecord>,
 }
 
@@ -148,8 +155,16 @@ impl CommitLoop {
         adopt: Option<Adopt>,
         out: mpsc::UnboundedSender<CommitRecord>,
     ) -> Result<Self> {
-        let mut this =
-            Self { table: bench.table, counters: bench.counters, wal, cfg, next_version: 0, last_committed: None, out };
+        let mut this = Self {
+            table: bench.table,
+            counters: bench.counters,
+            wal,
+            cfg,
+            next_version: 0,
+            last_committed: None,
+            verified_through: None,
+            out,
+        };
         this.recover(adopt).await?;
         Ok(this)
     }
@@ -382,9 +397,11 @@ impl CommitLoop {
         while attempts < self.cfg.loop_max_attempts {
             attempts += 1;
             // The conflict checker only sees commits after our snapshot. A fence already inside
-            // the snapshot must be caught here.
-            match self.landed(manifest).await {
-                Ok(Landed::No) => {}
+            // the snapshot must be caught here, unless the snapshot is already verified.
+            let verified = self.verified_through.is_some() && self.verified_through == self.table.version();
+            let pre_check = if verified { Ok(Landed::No) } else { self.landed(manifest).await };
+            match pre_check {
+                Ok(Landed::No) => self.verified_through = self.table.version(),
                 Ok(Landed::Yes) => {
                     outcome = "landed_after_error";
                     break;
@@ -440,6 +457,7 @@ impl CommitLoop {
                 Ok(finalized) => {
                     library_retries += finalized.metrics.num_retries;
                     self.table.state = Some(finalized.snapshot());
+                    self.verified_through = self.table.version();
                     outcome = if attempts == 1 { "ok" } else { "ok_after_loop_retry" };
                     break;
                 }
