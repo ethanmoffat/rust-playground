@@ -7,6 +7,8 @@
 # ---------------------------------------------------------------------------------------
 #
 
+set -eo pipefail
+
 REPO_ROOT=$(git rev-parse --show-toplevel)
 DOCKER_VERSION="5:27.5.1-1~ubuntu.24.04~noble"
 
@@ -20,7 +22,7 @@ reset_docker_state() {
 # This allows us to mount ~/.azure from WSL.
 #
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v "/mnt/c" | tr '\n' ':' | sed 's/:$//')
-AZ_PATH=$(which az 2>/dev/null)
+AZ_PATH=$(which az 2>/dev/null || true)
 if [[ -z "$AZ_PATH" || "$AZ_PATH" == *"/mnt/c"* ]]; then
   echo "Native Linux Azure CLI not found, installing..."
   curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
@@ -53,10 +55,12 @@ else
   echo "GitHub CLI is already installed."
 fi
 
-az account get-access-token --query "expiresOn" -o tsv >/dev/null 2>&1
-if [[ $? -ne 0 ]]; then
+if ! az account get-access-token --query "expiresOn" -o tsv >/dev/null 2>&1; then
     echo "az is not logged in, logging in..."
-    az login >/dev/null
+    # prompt=none lets the signed-in Windows browser complete the login with single sign-on, without clicks.
+    # Login experience v2 off skips the subscription picker that waits for input in a terminal.
+    BROWSER='bash -c "exec wslview \"${0/prompt=select_account/prompt=none}\"" %s' AZURE_CORE_LOGIN_EXPERIENCE_V2=off \
+        az login --output none
 fi
 
 if ! [ -x "$(command -v docker)" ]; then
@@ -91,6 +95,7 @@ echo "docker is installed, restarting..."
 sudo systemctl restart docker
 
 sudo chmod 666 /var/run/docker.sock
+sudo usermod -aG docker "$USER"
 reset_docker_state || exit 1
 
 if ! [ -x "$(command -v npm)" ]; then
