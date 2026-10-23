@@ -83,7 +83,7 @@ for point in before after; do
     "$DCB" run --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) \
       --fault-crash-$point-log-put 20 --out "$D/r1.jsonl" 2>"$D/r1.err"
     extra=()
-    [ $mode = adopt ] && extra=(--adopt-wal "$D/wal/inst-a_$(basename "$T")")
+    [ $mode = adopt ] && extra=(--adopt-from inst-a)
     "$DCB" run --table-url "$T" --app-id inst-b --wal-dir "$D/wal" "${extra[@]}" --rate 1 --encoders 1 --duration 3 \
       --out "$D/r2.jsonl" 2>"$D/r2.err"
     check $n "$T" "$D/wal" -- "$D/r1.sent.jsonl" "$D/r2.sent.jsonl"
@@ -97,6 +97,40 @@ n=crash-before-log-txn; T=$(scenario $n); D=$WORK/$n
 "$DCB" run --table-url "$T" --app-id inst-a --wal-dir "$D/wal" --rate 1 --encoders 1 --duration 3 \
   --out "$D/r2.jsonl" 2>"$D/r2.err"
 check $n "$T" "$D/wal" -- "$D/r1.sent.jsonl" "$D/r2.sent.jsonl"
+
+# Zombie owner: pause A (likely mid-commit, log requests are slowed), B fences A's appId and adopts its
+# WAL, then A resumes. A must stop with outcome "fenced" and never land a commit after the fence.
+# A second adoption pass by B picks up anything A wrote to its WAL after the fence.
+n=zombie-fence; T=$(scenario $n); D=$WORK/$n
+# B adopts from its own copy of A's WAL (replicated or reattached disk), so A keeps running on resume.
+copy_a_wal() { mkdir -p "$D/wal-b"; cp -r "$D"/wal/inst-a_* "$D/wal-b/"; }
+"$DCB" run --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) \
+  --fault-delay-ms 150 --fault-scope log --out "$D/r1.jsonl" 2>"$D/r1.err" &
+A=$!
+sleep 5; kill -STOP $A; copy_a_wal
+"$DCB" run --table-url "$T" --app-id inst-b --wal-dir "$D/wal-b" --adopt-from inst-a --rate 1 --encoders 1 --duration 3 \
+  --out "$D/r2.jsonl" 2>"$D/r2.err"
+kill -CONT $A; wait $A; echo "  zombie exit=$? ($(tail -c 300 "$D/r1.err" | tr '\n' ' '))"
+copy_a_wal
+"$DCB" run --table-url "$T" --app-id inst-b --wal-dir "$D/wal-b" --adopt-from inst-a --rate 1 --encoders 1 --duration 2 \
+  --out "$D/r3.jsonl" 2>"$D/r3.err"
+check $n "$T" "$D/wal-b" -- "$D/r1.sent.jsonl" "$D/r2.sent.jsonl" "$D/r3.sent.jsonl"
+python3 - "$T" "$D" <<'PY'
+import json,glob,sys,os,urllib.parse
+t,d=sys.argv[1],sys.argv[2]
+log=urllib.parse.urlparse(t).path+"/_delta_log"
+fence=None; after=[]
+for f in sorted(glob.glob(log+"/*.json")):
+    v=int(os.path.basename(f)[:20])
+    for l in open(f):
+        a=json.loads(l)
+        x=a.get("txn")
+        if x and x["appId"].startswith("inst-a/"):
+            if x["version"]>=1<<62: fence=v
+            elif fence is not None: after.append(v)
+a_out=[json.loads(l)["outcome"] for l in open(d+"/r1.jsonl") if '"kind":"commit"' in l]
+print(f"  fence_version={fence} inst-a commits after fence={after} inst-a outcomes after resume tail={a_out[-3:]}")
+PY
 
 # Encoder killed mid-upload (process abort after the first multipart part). The partial blob must never be referenced.
 n=crash-mid-upload; T=$(scenario $n); D=$WORK/$n

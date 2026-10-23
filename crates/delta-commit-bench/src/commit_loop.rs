@@ -101,6 +101,31 @@ fn add_action(file: &FileReady) -> Action {
     })
 }
 
+/// `txn` versions at or above this mark an appId as fenced. The fence stores the fenced
+/// owner's last committed version as `FENCE_OFFSET + last + 1` (`last` = -1 if none).
+pub const FENCE_OFFSET: i64 = 1 << 62;
+
+fn decode_fence(raw: i64) -> Option<i64> {
+    let last = raw - FENCE_OFFSET - 1;
+    (last >= 0).then_some(last)
+}
+
+/// Another identity's WAL to take over. Its appId is fenced before any manifest moves.
+pub struct Adopt {
+    pub wal: Wal,
+    pub app_id: String,
+}
+
+/// Whether a manifest is in the table, from this loop's point of view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Landed {
+    Yes,
+    No,
+    /// This appId was fenced (or its `txn` entry vanished) and the batch is not known to have
+    /// landed. The loop must stop; the manifest stays pending for the adopting owner.
+    Fenced,
+}
+
 /// The commit loop for one table.
 pub struct CommitLoop {
     table: DeltaTable,
@@ -108,27 +133,83 @@ pub struct CommitLoop {
     wal: Wal,
     cfg: LoopConfig,
     next_version: i64,
+    /// Last `txn` version this loop knows it committed. Used to detect fencing and expiry.
+    last_committed: Option<i64>,
     out: mpsc::UnboundedSender<CommitRecord>,
 }
 
 impl CommitLoop {
-    /// Build the loop and replay any pending manifests. `adopt` is the WAL of a previous
-    /// identity; its pending manifests are recommitted under this loop's appId.
+    /// Build the loop and replay any pending manifests. With `adopt`, fence the previous
+    /// identity in the table log, then recommit its unlanded manifests under this loop's appId.
     pub async fn start(
         bench: BenchTable,
         wal: Wal,
         cfg: LoopConfig,
-        adopt: Option<Wal>,
+        adopt: Option<Adopt>,
         out: mpsc::UnboundedSender<CommitRecord>,
     ) -> Result<Self> {
-        let mut this = Self { table: bench.table, counters: bench.counters, wal, cfg, next_version: 0, out };
+        let mut this =
+            Self { table: bench.table, counters: bench.counters, wal, cfg, next_version: 0, last_committed: None, out };
         this.recover(adopt).await?;
         Ok(this)
     }
 
-    async fn committed_txn_version(&self) -> Result<Option<i64>> {
+    async fn txn_version_of(&self, app_id: &str) -> Result<Option<i64>> {
         let Ok(state) = self.table.snapshot() else { return Ok(None) };
-        Ok(state.transaction_version(self.table.log_store().as_ref(), &self.cfg.app_id).await?)
+        Ok(state.transaction_version(self.table.log_store().as_ref(), app_id).await?)
+    }
+
+    async fn committed_txn_version(&self) -> Result<Option<i64>> {
+        self.txn_version_of(&self.cfg.app_id).await
+    }
+
+    /// Commit a `txn`-only entry that fences `old_app_id`, retrying until it lands or the appId
+    /// is already fenced. Returns the fenced owner's last committed version.
+    ///
+    /// The fence carries the same appId as the old owner's commits, so the delta-rs conflict
+    /// checker rejects whichever of the two loses the race with ConcurrentTransaction. Every
+    /// old-owner commit is therefore either below the fence (and counted in the returned
+    /// version) or rejected.
+    async fn fence(&mut self, old_app_id: &str) -> Result<Option<i64>> {
+        let mut delay = Duration::from_millis(100);
+        for attempt in 1..=30 {
+            self.refresh().await?;
+            let raw = self.txn_version_of(old_app_id).await?;
+            if let Some(raw) = raw.filter(|v| *v >= FENCE_OFFSET) {
+                return Ok(decode_fence(raw));
+            }
+            let marker = FENCE_OFFSET + raw.unwrap_or(-1) + 1;
+            let props = CommitProperties::default().with_application_transaction(Transaction::new_with_last_update(
+                old_app_id,
+                marker,
+                Some(now_millis()),
+            ));
+            let result = match self.table.snapshot() {
+                Ok(state) => {
+                    CommitBuilder::from(props)
+                        .with_actions(Vec::new())
+                        .build(
+                            Some(state),
+                            self.table.log_store(),
+                            DeltaOperation::Write { mode: SaveMode::Append, partition_by: None, predicate: None },
+                        )
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(finalized) => {
+                    self.table.state = Some(finalized.snapshot());
+                    tracing::info!(old_app_id, last = ?raw, "fenced");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, attempt, "fence commit failed; re-reading");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(5));
+                }
+            }
+        }
+        anyhow::bail!("could not fence {old_app_id}")
     }
 
     async fn refresh(&mut self) -> Result<()> {
@@ -161,35 +242,73 @@ impl CommitLoop {
         Ok(false)
     }
 
-    async fn landed(&self, manifest: &Manifest) -> Result<bool> {
+    async fn landed(&self, manifest: &Manifest) -> Result<Landed> {
         match self.cfg.idempotency {
-            Idempotency::Txn => Ok(self.committed_txn_version().await?.is_some_and(|v| v >= manifest.version)),
+            Idempotency::Txn => {
+                let raw = self.committed_txn_version().await?;
+                Ok(match raw {
+                    Some(v) if v >= FENCE_OFFSET => {
+                        if decode_fence(v).is_some_and(|last| last >= manifest.version) {
+                            Landed::Yes
+                        } else {
+                            Landed::Fenced
+                        }
+                    }
+                    Some(v) if v >= manifest.version => Landed::Yes,
+                    // The entry went backwards or vanished (retention expiry): someone else owns
+                    // this appId's history now, so committing could duplicate.
+                    v if self.last_committed.is_some_and(|last| v.is_none_or(|v| v < last)) => Landed::Fenced,
+                    _ => Landed::No,
+                })
+            }
             Idempotency::ScanLog => match manifest.files.first() {
-                Some(file) => self.scan_log_for(&file.path).await,
-                None => Ok(true),
+                Some(file) => Ok(if self.scan_log_for(&file.path).await? { Landed::Yes } else { Landed::No }),
+                None => Ok(Landed::Yes),
             },
         }
     }
 
-    async fn recover(&mut self, adopt: Option<Wal>) -> Result<()> {
-        let committed = self.committed_txn_version().await?.unwrap_or(-1);
+    async fn recover(&mut self, adopt: Option<Adopt>) -> Result<()> {
+        let raw = self.committed_txn_version().await?;
+        if raw.is_some_and(|v| v >= FENCE_OFFSET) {
+            anyhow::bail!("fenced: appId {} was taken over; pending manifests belong to the new owner", self.cfg.app_id);
+        }
+        self.last_committed = raw;
         let wal_max = self.wal.max_version()?.unwrap_or(-1);
-        self.next_version = committed.max(wal_max) + 1;
+        self.next_version = raw.unwrap_or(-1).max(wal_max) + 1;
         for manifest in self.wal.pending()? {
-            if self.landed(&manifest).await? {
-                self.wal.release(manifest.version)?;
-                self.emit_replay(&manifest, "replay_already_landed");
-            } else {
-                self.commit_recovered(&manifest).await?;
+            match self.landed(&manifest).await? {
+                Landed::Yes => {
+                    self.wal.release(manifest.version)?;
+                    self.emit_replay(&manifest, "replay_already_landed");
+                }
+                Landed::No => self.commit_recovered(&manifest).await?,
+                Landed::Fenced => anyhow::bail!("fenced during replay of txn version {}", manifest.version),
             }
         }
-        if let Some(old_wal) = adopt {
+        if let Some(Adopt { wal: old_wal, app_id: old_app_id }) = adopt {
+            let old_last = self.fence(&old_app_id).await?;
+            // A restart in the middle of adoption may find a batch in both WALs.
+            let mine: std::collections::HashSet<String> = self
+                .wal
+                .pending()?
+                .into_iter()
+                .chain(self.wal.released()?)
+                .filter_map(|m| m.files.first().map(|f| f.path.clone()))
+                .collect();
             for old in old_wal.pending()? {
                 let old_version = old.version;
+                let already_landed = old_last.is_some_and(|last| old_version <= last);
+                let already_mine = old.files.first().is_some_and(|f| mine.contains(&f.path));
+                if already_landed || already_mine {
+                    old_wal.release(old_version)?;
+                    if already_landed {
+                        self.emit_replay(&old, "adopt_already_landed");
+                    }
+                    continue;
+                }
                 let manifest = Manifest { app_id: self.cfg.app_id.clone(), version: self.next_version, ..old };
                 self.next_version += 1;
-                // Ownership moves once the new manifest is durable; a crash between these two
-                // steps would adopt the batch twice.
                 self.wal.write(&manifest)?;
                 old_wal.release(old_version)?;
                 self.commit_recovered(&manifest).await?;
@@ -202,8 +321,8 @@ impl CommitLoop {
         let record = self.commit_manifest(manifest, true).await;
         let outcome = record.outcome;
         let _ = self.out.send(record);
-        if outcome == "failed" || outcome == "unresolved" {
-            anyhow::bail!("replay of txn version {} did not complete", manifest.version);
+        if matches!(outcome, "failed" | "unresolved" | "fenced") {
+            anyhow::bail!("replay of txn version {} did not complete: {outcome}", manifest.version);
         }
         self.wal.release(manifest.version)
     }
@@ -236,7 +355,7 @@ impl CommitLoop {
     /// After a failed commit, decide whether the batch landed. Only a fresh snapshot and a
     /// successful check count as an answer. `None` means storage never gave one; the caller
     /// must not recommit, because a blind retry can duplicate the batch.
-    async fn resolve(&mut self, manifest: &Manifest, errors: &mut Vec<String>) -> Option<bool> {
+    async fn resolve(&mut self, manifest: &Manifest, errors: &mut Vec<String>) -> Option<Landed> {
         let mut delay = Duration::from_millis(100);
         for _ in 0..20 {
             match self.refresh().await {
@@ -262,6 +381,37 @@ impl CommitLoop {
         let mut delay = Duration::from_millis(100);
         while attempts < self.cfg.loop_max_attempts {
             attempts += 1;
+            // The conflict checker only sees commits after our snapshot. A fence already inside
+            // the snapshot must be caught here.
+            match self.landed(manifest).await {
+                Ok(Landed::No) => {}
+                Ok(Landed::Yes) => {
+                    outcome = "landed_after_error";
+                    break;
+                }
+                Ok(Landed::Fenced) => {
+                    outcome = "fenced";
+                    break;
+                }
+                Err(error) => {
+                    errors.push(format!("pre-commit check: {error}"));
+                    match self.resolve(manifest, &mut errors).await {
+                        Some(Landed::No) => {}
+                        Some(Landed::Yes) => {
+                            outcome = "landed_after_error";
+                            break;
+                        }
+                        Some(Landed::Fenced) => {
+                            outcome = "fenced";
+                            break;
+                        }
+                        None => {
+                            outcome = "unresolved";
+                            break;
+                        }
+                    }
+                }
+            }
             let mut props = CommitProperties::default()
                 .with_create_checkpoint(self.cfg.inline_checkpoint)
                 .with_max_retries(self.cfg.library_max_retries);
@@ -296,11 +446,15 @@ impl CommitLoop {
                 Err(error) => {
                     errors.push(error.to_string());
                     match self.resolve(manifest, &mut errors).await {
-                        Some(true) => {
+                        Some(Landed::Yes) => {
                             outcome = "landed_after_error";
                             break;
                         }
-                        Some(false) => {}
+                        Some(Landed::Fenced) => {
+                            outcome = "fenced";
+                            break;
+                        }
+                        Some(Landed::No) => {}
                         None => {
                             outcome = "unresolved";
                             break;
@@ -310,6 +464,9 @@ impl CommitLoop {
                     delay = (delay * 2).min(Duration::from_secs(5));
                 }
             }
+        }
+        if matches!(outcome, "ok" | "ok_after_loop_retry" | "landed_after_error") {
+            self.last_committed = Some(self.last_committed.map_or(manifest.version, |v| v.max(manifest.version)));
         }
         let commit_ms = ms(started.elapsed());
         let now = now_millis();
@@ -402,7 +559,7 @@ impl CommitLoop {
                 record.queue_ms =
                     (commit_start - manifest.files.iter().map(|f| f.upload_done_ms).min().unwrap_or(commit_start)) as f64;
             }
-            if record.outcome == "failed" || record.outcome == "unresolved" {
+            if matches!(record.outcome, "failed" | "unresolved" | "fenced") {
                 let _ = self.out.send(record);
                 anyhow::bail!("commit of txn version {} did not complete", manifest.version);
             }

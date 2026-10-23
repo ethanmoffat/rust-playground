@@ -9,7 +9,7 @@ mod wal;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use commit_loop::{CommitLoop, CommitRecord, Idempotency, LoopConfig, Pacing};
+use commit_loop::{Adopt, CommitLoop, CommitRecord, Idempotency, LoopConfig, Pacing};
 use deltalake_core::kernel::transaction::{CommitBuilder, CommitProperties};
 use deltalake_core::kernel::{Action, Add, Remove};
 use deltalake_core::protocol::DeltaOperation;
@@ -119,9 +119,10 @@ struct RunArgs {
     app_id: String,
     #[arg(long)]
     wal_dir: PathBuf,
-    /// Recommit pending manifests of another identity (`<wal-root>/<sanitized appId>`).
+    /// Take over another identity: fence `<adopt-from>/<table>` in the table log, then recommit
+    /// its unlanded pending manifests from `--wal-dir` under this loop's appId.
     #[arg(long)]
-    adopt_wal: Option<PathBuf>,
+    adopt_from: Option<String>,
     /// Files per second per table.
     #[arg(long, default_value_t = 1.2)]
     rate: f64,
@@ -365,10 +366,10 @@ async fn run(args: RunArgs) -> Result<()> {
         Arc::new(FaultPlan { fault_crash_mid_upload: args.faults.fault_crash_mid_upload, ..FaultPlan::default() }),
     ));
 
-    if args.adopt_wal.is_some() && urls.len() != 1 {
-        bail!("--adopt-wal needs exactly one table");
+    if args.adopt_from.is_some() && urls.len() != 1 {
+        bail!("--adopt-from needs exactly one table");
     }
-    let mut adopt = args.adopt_wal.clone();
+    let mut adopt = args.adopt_from.clone();
 
     let mut loops = Vec::new();
     let mut producers = Vec::new();
@@ -395,7 +396,7 @@ async fn run(args: RunArgs) -> Result<()> {
         let root_c = Arc::clone(&root);
         let faults_c = Arc::clone(&faults);
         let record_tx = record_tx.clone();
-        let adopt_dir = adopt.take();
+        let adopt_app_id = adopt.take().map(|old| format!("{old}/{name}"));
         loops.push(commit_handle.spawn(async move {
             let mut delay = Duration::from_millis(100);
             let mut attempt = 0;
@@ -403,8 +404,11 @@ async fn run(args: RunArgs) -> Result<()> {
                 attempt += 1;
                 let bench = table::open_with_retry(&url_c, Arc::clone(&root_c), Arc::clone(&faults_c)).await?;
                 let wal = wal::Wal::open(&wal_dir, &cfg.app_id)?;
-                let old_wal = adopt_dir.as_deref().map(wal::Wal::at).transpose()?;
-                match CommitLoop::start(bench, wal, cfg.clone(), old_wal, record_tx.clone()).await {
+                let old = adopt_app_id
+                    .as_ref()
+                    .map(|id| Ok::<_, anyhow::Error>(Adopt { wal: wal::Wal::open(&wal_dir, id)?, app_id: id.clone() }))
+                    .transpose()?;
+                match CommitLoop::start(bench, wal, cfg.clone(), old, record_tx.clone()).await {
                     Ok(lp) => break lp,
                     Err(error) if attempt < 30 => {
                         tracing::warn!(%error, attempt, "recovery failed; retrying");
@@ -486,6 +490,7 @@ async fn run(args: RunArgs) -> Result<()> {
     eprintln!("done: {produced} files in {:.1}s, loop errors: {}", elapsed.as_secs_f64(), loop_errors.len());
     if !loop_errors.is_empty() {
         eprintln!("{loop_errors:#?}");
+        bail!("{} commit loop(s) failed", loop_errors.len());
     }
     Ok(())
 }

@@ -61,17 +61,6 @@ fn read_dir_manifests(dir: &Path) -> Result<Vec<Manifest>> {
 }
 
 impl Wal {
-    /// Open an existing manifest directory (for example, another identity's WAL to adopt).
-    pub fn at(base: &Path) -> Result<Self> {
-        let pending = base.join("pending");
-        let released = base.join("released");
-        if !pending.is_dir() {
-            anyhow::bail!("{} has no pending/ directory", base.display());
-        }
-        fs::create_dir_all(&released)?;
-        Ok(Self { pending, released })
-    }
-
     /// Open or create the manifest directory for `app_id` under `root`.
     pub fn open(root: &Path, app_id: &str) -> Result<Self> {
         let base = root.join(sanitize(app_id));
