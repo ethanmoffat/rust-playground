@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Experiment 1: one commit loop, one table. Runs on a bench VM inside tmux; results under ~/results/exp1/<account>.
-# Usage: exp1.sh <storage-account> [phase...]   phases: pacing scanlog ceiling loglen (default: all)
+# Usage: exp1.sh <storage-account> [phase...]   phases: pacing scanlog ceiling loglen findings (default: all)
 set -uo pipefail
 
 ACCT=$1; shift
-PHASES=${*:-pacing scanlog ceiling loglen}
+PHASES=${*:-pacing scanlog ceiling loglen findings}
 DUR=${DUR:-180}
 BASE=abfss://bench@$ACCT.dfs.core.windows.net/exp1
 OUT=$HOME/results/exp1/$ACCT
@@ -49,6 +49,11 @@ for phase in $PHASES; do case $phase in
       "$DCB" read --table-url "$BASE/$name" --repeat 5 > "$d/read-before.jsonl" 2>> "$d/stderr.log"
       "$DCB" checkpoint --table-url "$BASE/$name" > "$d/checkpoint.jsonl" 2>> "$d/stderr.log"
       "$DCB" read --table-url "$BASE/$name" --repeat 5 > "$d/read-after.jsonl" 2>> "$d/stderr.log"
+    done ;;
+  findings)
+    # Checkpoint stall under a current-thread commit runtime, against the default multi-thread runtime.
+    for rt in current multi; do
+      DUR=60 cell "runtime-$rt-ck50" --rate 8 --pacing group --idempotency txn --checkpoint-every 50 --commit-runtime "$rt"
     done ;;
   *) echo "unknown phase $phase" >&2; exit 2 ;;
 esac; done
