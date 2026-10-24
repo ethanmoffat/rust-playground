@@ -7,6 +7,10 @@ set -uo pipefail
 # THREADS (1): commit runtime worker threads.
 # WAL_ROOT: where per-cell WALs go (default: the cell dir). Use /dev/shm to take WAL fsyncs out of the
 # measurement (finding F13); the WAL is removed after the check.
+# F14 knobs: EXEC (worker|blocking) checkpoint placement, MAX_OPS and MAX_CKPT caps (0 = none),
+# JITTER_MS producer start spread, CKPT_EVERY (50).
+# STALL (300): seconds without a new commit record before the cell is declared deadlocked; a gdb
+# dump of all threads is saved and the process killed.
 # Each table holds WAL files and connections open; 5000 tables exceed the default 1024 fds.
 ulimit -n 65536
 
@@ -29,8 +33,26 @@ for n in $COUNTS; do
   # object_store logs each internal retry (throttling included) at info.
   RUST_LOG=warn,object_store=info "$DCB" run --table-base "$BASE/$name" --tables "$n" --create --app-id "$RUN" \
     --wal-dir "$w" --out "$d/run.jsonl" --duration "$DUR" --rate "$RATE" --encoders 1 --pacing group \
-    --idempotency txn --commit-threads "${THREADS:-1}" --checkpoint-every 50 2> "$d/stderr.log"
-  echo "exit=$?" >> "$d/stderr.log"
+    --idempotency txn --commit-threads "${THREADS:-1}" --checkpoint-every "${CKPT_EVERY:-50}" \
+    --checkpoint-exec "${EXEC:-worker}" --max-ops "${MAX_OPS:-0}" --max-checkpoints "${MAX_CKPT:-0}" \
+    --start-jitter-ms "${JITTER_MS:-0}" 2> "$d/stderr.log" &
+  pid=$!; last=-1; since=$(date +%s); stalled=0
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 15
+    c=$(grep -c '"kind":"commit"' "$d/run.jsonl" 2>/dev/null); c=${c:-0}
+    if [ "$c" != "$last" ]; then last=$c; since=$(date +%s)
+    elif [ $(( $(date +%s) - since )) -ge "${STALL:-300}" ]; then
+      echo "$(date -u +%FT%TZ) stall $name: no commit record for ${STALL:-300}s at $c records" | tee -a "$OUT/progress.log"
+      sudo -n gdb -p "$pid" -batch -ex "thread apply all bt" 2>/dev/null | gzip > "$d/stall-gdb.txt.gz"
+      kill -9 "$pid"; stalled=1; break
+    fi
+  done
+  wait "$pid"; echo "exit=$?" >> "$d/stderr.log"
+  if [ "$stalled" = 1 ]; then
+    echo '{"stalled":true}' > "$d/check.json"
+    [ -n "${WAL_ROOT:-}" ] && rm -rf "$w"
+    continue
+  fi
   # Guarantees on a sample of tables: first, middle, last.
   for i in 0 $((n / 2)) $((n - 1)); do
     t=$(printf 't%05d' "$i")

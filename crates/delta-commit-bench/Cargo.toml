@@ -16,6 +16,8 @@ anyhow.workspace = true
 async-trait = "0.1"
 bytes = "1"
 clap.workspace = true
+# Same kernel delta-rs uses; the bench calls its checkpoint directly (--checkpoint-exec blocking).
+delta_kernel = { package = "buoyant_kernel", version = "=0.28.1", default-features = false }
 deltalake-core = { version = "=1.1.1", default-features = false, features = ["rustls", "cloud"] }
 futures = "0.3"
 hdrhistogram = "7"

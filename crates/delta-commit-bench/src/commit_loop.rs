@@ -11,7 +11,36 @@ use deltalake_core::protocol::{DeltaOperation, SaveMode};
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+
+/// Where the separate checkpoint's synchronous kernel call runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, clap::ValueEnum)]
+pub enum CheckpointExec {
+    /// `deltalake_core::checkpoints::create_checkpoint`: the kernel checkpoint write runs on the
+    /// async worker that polls the loop (finding F14).
+    Worker,
+    /// The same kernel calls inside one `spawn_blocking`.
+    Blocking,
+}
+
+/// Process-wide caps on concurrent Delta operations. Each held permit bounds the tokio blocking
+/// threads an operation can occupy.
+#[derive(Clone, Debug, Default)]
+pub struct Limits {
+    /// Table open and recovery, and each commit (pre-check, commit, post-commit snapshot update).
+    pub ops: Option<Arc<Semaphore>>,
+    /// Each separate checkpoint, including the snapshot reload after it.
+    pub checkpoints: Option<Arc<Semaphore>>,
+}
+
+/// Waits for a permit when `sem` is set. Returns the permit and the wait in ms.
+pub async fn acquire(sem: Option<&Arc<Semaphore>>) -> (Option<OwnedSemaphorePermit>, f64) {
+    let Some(sem) = sem else { return (None, 0.0) };
+    let started = Instant::now();
+    // The semaphores are never closed, so this is always a permit.
+    let permit = Arc::clone(sem).acquire_owned().await.ok();
+    (permit, ms(started.elapsed()))
+}
 
 /// When the loop cuts a batch.
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +79,8 @@ pub struct LoopConfig {
     pub reload_after_checkpoint: bool,
     /// Write a checkpoint after the commit is acknowledged, every N table versions.
     pub separate_checkpoint_every: Option<u64>,
+    pub checkpoint_exec: CheckpointExec,
+    pub limits: Limits,
     pub max_files_per_commit: usize,
     /// Log versions scanned back by [`Idempotency::ScanLog`].
     pub scan_window: u64,
@@ -69,6 +100,10 @@ pub struct CommitRecord {
     pub recovered: bool,
     /// Oldest file: upload done to commit start.
     pub queue_ms: f64,
+    /// Wait for an operation permit before the commit (included in visibility).
+    pub permit_wait_ms: f64,
+    /// Wait for a checkpoint permit (not included in this commit's visibility).
+    pub checkpoint_permit_wait_ms: Option<f64>,
     /// Manifest write time.
     pub manifest_ms: f64,
     /// Commit call(s) until success.
@@ -360,6 +395,8 @@ impl CommitLoop {
             rows: manifest.files.iter().map(|f| f.rows).sum(),
             recovered: true,
             queue_ms: 0.0,
+            permit_wait_ms: 0.0,
+            checkpoint_permit_wait_ms: None,
             manifest_ms: 0.0,
             commit_ms: 0.0,
             visible_oldest_ms: 0.0,
@@ -509,6 +546,8 @@ impl CommitLoop {
             rows: manifest.files.iter().map(|f| f.rows).sum(),
             recovered,
             queue_ms: 0.0,
+            permit_wait_ms: 0.0,
+            checkpoint_permit_wait_ms: None,
             manifest_ms: 0.0,
             commit_ms,
             #[allow(clippy::cast_precision_loss)]
@@ -525,31 +564,53 @@ impl CommitLoop {
         }
     }
 
-    /// Returns (checkpoint write ms, snapshot reload ms).
-    async fn maybe_checkpoint(&mut self) -> Option<(f64, Option<f64>)> {
+    /// The checkpoint write, by [`CheckpointExec`]. Both build a fresh snapshot at `version` and
+    /// write the checkpoint with the kernel, as `create_checkpoint` does.
+    async fn write_checkpoint(&self, version: u64) -> Result<()> {
+        match self.cfg.checkpoint_exec {
+            CheckpointExec::Worker => Ok(deltalake_core::checkpoints::create_checkpoint(&self.table, None).await?),
+            CheckpointExec::Blocking => {
+                let log_store = self.table.log_store();
+                let engine = log_store.engine(None);
+                let root = log_store.transaction_url(None)?;
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let snapshot =
+                        delta_kernel::Snapshot::builder_for(root).at_version(version).build(engine.as_ref())?;
+                    snapshot.checkpoint(engine.as_ref(), None)?;
+                    Ok(())
+                })
+                .await
+                .context("checkpoint task")?
+            }
+        }
+    }
+
+    /// Returns (checkpoint write ms, snapshot reload ms, permit wait ms).
+    async fn maybe_checkpoint(&mut self) -> Option<(f64, Option<f64>, f64)> {
         let every = self.cfg.separate_checkpoint_every?;
         let version = self.table.version()?;
         if version == 0 || version % every != 0 {
             return None;
         }
+        let (_permit, wait_ms) = acquire(self.cfg.limits.checkpoints.as_ref()).await;
         let started = Instant::now();
-        match deltalake_core::checkpoints::create_checkpoint(&self.table, None).await {
+        match self.write_checkpoint(version).await {
             Ok(()) => {
                 let write_ms = ms(started.elapsed());
                 // An incremental snapshot update carries every earlier file batch forward and adds
                 // one per commit; batches are never compacted, so per-commit work and memory grow
                 // with the version. A fresh load from the checkpoint resets both.
                 if !self.cfg.reload_after_checkpoint {
-                    return Some((write_ms, None));
+                    return Some((write_ms, None, wait_ms));
                 }
                 let started = Instant::now();
                 let previous = self.table.state.take();
                 match self.table.update_incremental(Some(version)).await {
-                    Ok(()) => Some((write_ms, Some(ms(started.elapsed())))),
+                    Ok(()) => Some((write_ms, Some(ms(started.elapsed())), wait_ms)),
                     Err(error) => {
                         tracing::warn!(%error, "snapshot reload after checkpoint failed");
                         self.table.state = previous;
-                        Some((write_ms, None))
+                        Some((write_ms, None, wait_ms))
                     }
                 }
             }
@@ -598,8 +659,11 @@ impl CommitLoop {
             self.next_version += 1;
             self.wal.write(&manifest)?;
             let manifest_ms = ms(manifest_started.elapsed());
+            let (permit, permit_wait_ms) = acquire(self.cfg.limits.ops.as_ref()).await;
             let mut record = self.commit_manifest(&manifest, false).await;
+            drop(permit);
             record.manifest_ms = manifest_ms;
+            record.permit_wait_ms = permit_wait_ms;
             #[allow(clippy::cast_precision_loss)]
             {
                 record.queue_ms =
@@ -610,9 +674,10 @@ impl CommitLoop {
                 anyhow::bail!("commit of txn version {} did not complete", manifest.version);
             }
             self.wal.release(manifest.version)?;
-            if let Some((write_ms, reload_ms)) = self.maybe_checkpoint().await {
+            if let Some((write_ms, reload_ms, wait_ms)) = self.maybe_checkpoint().await {
                 record.checkpoint_ms = Some(write_ms);
                 record.checkpoint_reload_ms = reload_ms;
+                record.checkpoint_permit_wait_ms = Some(wait_ms);
             }
             let _ = self.out.send(record);
         }

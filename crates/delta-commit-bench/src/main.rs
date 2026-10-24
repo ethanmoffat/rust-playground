@@ -10,7 +10,7 @@ mod wal;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use commit_loop::{Adopt, CommitLoop, CommitRecord, Idempotency, LoopConfig, Pacing};
+use commit_loop::{Adopt, CheckpointExec, CommitLoop, CommitRecord, Idempotency, Limits, LoopConfig, Pacing};
 use deltalake_core::kernel::transaction::{CommitBuilder, CommitProperties};
 use deltalake_core::kernel::{Action, Add, Remove};
 use deltalake_core::protocol::DeltaOperation;
@@ -204,6 +204,19 @@ struct RunArgs {
     commit_threads: usize,
     #[arg(long, value_enum, default_value_t = CommitRuntime::Multi)]
     commit_runtime: CommitRuntime,
+    /// Where the separate checkpoint's kernel write runs (finding F14).
+    #[arg(long, value_enum, default_value_t = CheckpointExec::Worker)]
+    checkpoint_exec: CheckpointExec,
+    /// Process-wide cap on concurrent table opens and commits. 0 = no cap.
+    #[arg(long, default_value_t = 0)]
+    max_ops: usize,
+    /// Process-wide cap on concurrent separate checkpoints. 0 = no cap.
+    #[arg(long, default_value_t = 0)]
+    max_checkpoints: usize,
+    /// Spread producer starts evenly over this many ms so tables reach checkpoint versions at
+    /// different times. 0 = all start together.
+    #[arg(long, default_value_t = 0)]
+    start_jitter_ms: u64,
     /// Expired-log cleanup in the delta-rs post-commit hook. `default` follows the table property
     /// `delta.enableExpiredLogCleanup` (true unless set). The cleanup lists all of `_delta_log` on
     /// every commit, so it is off here; log cleanup belongs to table maintenance.
@@ -282,6 +295,11 @@ fn parse_pacing(s: &str) -> Result<Pacing> {
     Ok(Pacing::Interval(duration))
 }
 
+async fn delayed<F: std::future::Future>(delay: Duration, f: F) -> F::Output {
+    tokio::time::sleep(delay).await;
+    f.await
+}
+
 fn table_name(url: &Url) -> String {
     url.path_segments().and_then(|mut s| s.next_back().map(str::to_owned)).unwrap_or_default()
 }
@@ -295,6 +313,8 @@ struct Sample {
     kind: &'static str,
     ts_ms: i64,
     cpu_secs: BTreeMap<String, f64>,
+    /// Live threads by the same name groups as `cpu_secs`.
+    threads: BTreeMap<String, usize>,
     rss_mb: f64,
     producer_storage: store::CounterSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -303,8 +323,14 @@ struct Sample {
 
 /// CPU seconds by thread-name group from /proc (Linux only; empty elsewhere).
 fn thread_cpu() -> BTreeMap<String, f64> {
+    thread_stats().0
+}
+
+/// CPU seconds and live thread count by thread-name group.
+fn thread_stats() -> (BTreeMap<String, f64>, BTreeMap<String, usize>) {
     let mut out = BTreeMap::new();
-    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else { return out };
+    let mut counts = BTreeMap::new();
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else { return (out, counts) };
     for task in tasks.flatten() {
         let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else { continue };
         let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else { continue };
@@ -324,8 +350,9 @@ fn thread_cpu() -> BTreeMap<String, f64> {
             "other"
         };
         *out.entry(group.to_owned()).or_insert(0.0) += ticks / 100.0;
+        *counts.entry(group.to_owned()).or_insert(0) += 1;
     }
-    out
+    (out, counts)
 }
 
 fn rss_mb() -> f64 {
@@ -447,10 +474,16 @@ async fn run(args: RunArgs) -> Result<()> {
     }
     let mut adopt = args.adopt_from.clone();
 
+    let limits = Limits {
+        ops: (args.max_ops > 0).then(|| Arc::new(tokio::sync::Semaphore::new(args.max_ops))),
+        checkpoints: (args.max_checkpoints > 0).then(|| Arc::new(tokio::sync::Semaphore::new(args.max_checkpoints))),
+    };
     let mut loops = Vec::new();
     let mut producers = Vec::new();
     let started = Instant::now();
-    for url in &urls {
+    for (index, url) in urls.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation)]
+        let start_delay = Duration::from_millis(args.start_jitter_ms * index as u64 / urls.len() as u64);
         let name = table_name(url);
         let app_id = format!("{}/{name}", args.app_id);
         let (tx, rx) = mpsc::channel(100_000);
@@ -469,6 +502,8 @@ async fn run(args: RunArgs) -> Result<()> {
             },
             reload_after_checkpoint: args.reload_after_checkpoint,
             separate_checkpoint_every: matches!(args.checkpoint, CheckpointMode::Separate).then_some(args.checkpoint_every),
+            checkpoint_exec: args.checkpoint_exec,
+            limits: limits.clone(),
             max_files_per_commit: args.max_files_per_commit,
             scan_window: args.scan_window,
         };
@@ -484,13 +519,16 @@ async fn run(args: RunArgs) -> Result<()> {
             let mut attempt = 0;
             let lp = loop {
                 attempt += 1;
+                let (permit, _) = commit_loop::acquire(cfg.limits.ops.as_ref()).await;
                 let bench = table::open_with_retry(&url_c, Arc::clone(&root_c), Arc::clone(&faults_c)).await?;
                 let wal = wal::Wal::open(&wal_dir, &cfg.app_id)?;
                 let old = adopt_app_id
                     .as_ref()
                     .map(|id| Ok::<_, anyhow::Error>(Adopt { wal: wal::Wal::open(&wal_dir, id)?, app_id: id.clone() }))
                     .transpose()?;
-                match CommitLoop::start(bench, wal, cfg.clone(), old, record_tx.clone()).await {
+                let started = CommitLoop::start(bench, wal, cfg.clone(), old, record_tx.clone()).await;
+                drop(permit);
+                match started {
                     Ok(lp) => break lp,
                     Err(error) if attempt < 30 => {
                         tracing::warn!(%error, attempt, "recovery failed; retrying");
@@ -514,14 +552,17 @@ async fn run(args: RunArgs) -> Result<()> {
                 part_bytes: (args.part_mb << 20).max(1),
                 upload_concurrency: args.upload_concurrency,
             };
-            producers.push(tokio::spawn(arrow_producer::produce(
-                Arc::clone(&producer_store),
-                table_root(url)?,
-                acfg,
-                Arc::clone(pool),
-                tx,
-                Some(Arc::clone(&sent)),
-                Arc::clone(stats),
+            producers.push(tokio::spawn(delayed(
+                start_delay,
+                arrow_producer::produce(
+                    Arc::clone(&producer_store),
+                    table_root(url)?,
+                    acfg,
+                    Arc::clone(pool),
+                    tx,
+                    Some(Arc::clone(&sent)),
+                    Arc::clone(stats),
+                ),
             )));
             continue;
         }
@@ -533,12 +574,9 @@ async fn run(args: RunArgs) -> Result<()> {
             multipart: args.multipart,
             duration: Duration::from_secs(args.duration),
         };
-        producers.push(tokio::spawn(producer::produce(
-            Arc::clone(&producer_store),
-            table_root(url)?,
-            pcfg,
-            tx,
-            Some(Arc::clone(&sent)),
+        producers.push(tokio::spawn(delayed(
+            start_delay,
+            producer::produce(Arc::clone(&producer_store), table_root(url)?, pcfg, tx, Some(Arc::clone(&sent))),
         )));
     }
     drop(record_tx);
@@ -553,11 +591,13 @@ async fn run(args: RunArgs) -> Result<()> {
             let mut tick = tokio::time::interval(period);
             loop {
                 tick.tick().await;
+                let (cpu_secs, threads) = thread_stats();
                 if sample_tx
                     .send(Sample {
                         kind: "sample",
                         ts_ms: now_millis(),
-                        cpu_secs: thread_cpu(),
+                        cpu_secs,
+                        threads,
                         rss_mb: rss_mb(),
                         producer_storage: counters.snapshot(),
                         producer: producer_stats.as_ref().map(|s| s.snapshot()),
