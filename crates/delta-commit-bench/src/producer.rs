@@ -49,7 +49,9 @@ pub async fn produce(
             let period = Duration::from_secs_f64(cfg.encoders as f64 / cfg.rate);
             let phase = period.mul_f64(rand::random::<f64>());
             let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + phase, period);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Skip keeps each encoder's random phase. Delay re-bases the schedule on the late tick,
+            // so one runtime stall longer than a period aligns every encoder for the rest of the run.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let name = format!("{}-e{encoder}", cfg.table_name);
             let mut produced = 0u64;
             loop {
