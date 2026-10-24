@@ -1,0 +1,66 @@
+{
+  "accepted_files": 120,
+  "dangling_files": [],
+  "dangling_files_count": 0,
+  "duplicate_paths": [
+    [
+      "data/1792799204-ambiguous-conflict-scan-log-e0-00000001-5bf7489a-17f9-47ad-b557-cb079524d398.parquet",
+      [
+        9,
+        10
+      ]
+    ],
+    [
+      "data/1792799204-ambiguous-conflict-scan-log-e0-00000015-22f429cb-16ae-4b0c-ad22-af61ab363096.parquet",
+      [
+        77,
+        78
+      ]
+    ],
+    [
+      "data/1792799204-ambiguous-conflict-scan-log-e0-00000020-c44e9563-bfa1-4c4c-a424-4d9df636bde4.parquet",
+      [
+        101,
+        102
+      ]
+    ],
+    [
+      "data/1792799204-ambiguous-conflict-scan-log-e0-00000021-60fa1f6e-2d43-4839-b4ff-746b1f87b8ca.parquet",
+      [
+        107,
+        108
+      ]
+    ],
+    [
+      "data/1792799204-ambiguous-conflict-scan-log-e0-00000028-b6e16655-cb3b-4f30-8ffc-c09f1fb48f56.parquet",
+      [
+        145,
+        146,
+        147
+      ]
+    ]
+  ],
+  "duplicate_paths_count": 30,
+  "g1_no_loss": true,
+  "g2_no_duplicates": false,
+  "g3_atomic": true,
+  "g4_valid": true,
+  "latest_version": 154,
+  "log_add_actions": 154,
+  "log_commits": 155,
+  "log_removed_paths": 0,
+  "log_unique_added_paths": 120,
+  "manifests": 120,
+  "manifests_pending": 0,
+  "missing_accepted": [],
+  "missing_accepted_count": 0,
+  "sent_files": 120,
+  "sent_not_accepted": 0,
+  "snapshot_error": null,
+  "snapshot_files": 120,
+  "snapshot_load_ms": 35.901087,
+  "split_manifests": [],
+  "split_manifests_count": 0,
+  "table": "file:///tmp/faults2/t/1792799204-ambiguous-conflict-scan-log",
+  "txn_app_ids": {}
+}

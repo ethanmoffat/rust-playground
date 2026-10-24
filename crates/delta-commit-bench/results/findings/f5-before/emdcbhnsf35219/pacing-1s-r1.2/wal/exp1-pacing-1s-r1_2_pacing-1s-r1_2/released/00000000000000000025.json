@@ -1,0 +1,1 @@
+{"app_id":"exp1-pacing-1s-r1.2/pacing-1s-r1.2","version":25,"created_ms":1792798408419,"files":[{"path":"data/pacing-1s-r1.2-e1-00000008-d89c4458-fd48-44b8-a0a4-4d84cab574b8.parquet","size":1734,"rows":100,"encoder":"pacing-1s-r1.2-e1","upload_start_ms":1792798408211,"upload_done_ms":1792798408234}]}
