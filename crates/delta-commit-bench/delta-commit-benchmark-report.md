@@ -47,6 +47,39 @@ guarantee or a measured cost.
 | Multi-thread commit runtime | See finding F6. |
 | Fresh snapshot load after each checkpoint | See finding F9. `--reload-after-checkpoint false` reproduces the old behavior. |
 
+## Ownership moves: graceful and failure
+
+There are two kinds of ownership move. Each needs a different mechanism.
+
+**Graceful move.** The old owner X is alive and cooperative, for example during a rebalance or a rolling
+deploy. A DFE ack/nack handshake is enough:
+
+1. Routing marks the table as moving. New files for the table go to the new owner Y.
+2. X stops taking files, commits its pending batches, and acks "drained".
+3. Y waits for the ack, then starts committing. X's WAL holds nothing, so Y has nothing to adopt.
+
+The fence still runs here. It costs one commit and makes the move safe even if step 2 is wrong.
+
+**Failure move.** X is paused (GC, VM freeze), partitioned from routing, or crashed. Ack/nack can't help:
+
+| Problem | Why ack/nack fails | What the fence does |
+|---|---|---|
+| X never sees the nack | X is partitioned from DFE and still reaches storage | Storage rejects X's next commit |
+| X has a commit PUT in flight | A nack can't recall a request already sent | The PUT either lands before the fence, and Y's adopt check finds it, or it loses the version race |
+| X resumes after a pause | X thinks it still owns the table | X's next commit fails with ConcurrentTransaction |
+| Y must wait for X | A timeout guesses that X is dead | Y needs no wait. The fence makes X dead for this table. |
+
+The fence turns "the old owner must be dead" from a timeout guess into a storage-enforced fact. Any
+commit X makes after the fence version fails.
+
+**What causes harm.** Two writers with different appIds and disjoint files are safe. They only cause
+library retries (exp 5). Duplicates need Y to adopt X's pending files while X still commits them. The
+fence prevents this. Losses need nobody to adopt X's pending files. Adoption prevents this, but only if
+Y can read X's WAL (see WAL locality under risks).
+
+**Core moves inside one pod** never create a second writer. All files for a table fan in to its one
+commit loop, regardless of which core encoded them.
+
 ## Hypotheses
 
 | Hypothesis | Verdict | Evidence |
@@ -95,6 +128,9 @@ Pending.
 - Scan-log idempotency duplicates under the library's default retries. It is safe only with library
   retries off, and it cannot be fenced.
 - An identity change without adoption loses data.
+- WAL locality: adoption needs the new owner to read the old owner's WAL. If the WAL is on a pod's local
+  disk and the pod dies, its pending batches are lost. The WAL must be on shared storage, or the
+  uploaded files must be recoverable another way.
 - Orphan blobs: files uploaded but never committed (aborted uploads, fenced zombies) need cleanup.
 - appId expiry (exp 8) pending.
 

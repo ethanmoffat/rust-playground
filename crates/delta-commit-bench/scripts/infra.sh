@@ -77,23 +77,32 @@ up() {
   done
 
   [ -f "$SSH_KEY" ] || ssh-keygen -q -t ed25519 -N "" -C dcb-bench -f "$SSH_KEY"
-  az vmss create -g "$RG" -n "$P-vmss" --orchestration-mode Flexible --vm-sku "$VM_SKU" \
-    --instance-count "$VM_COUNT" --image Ubuntu2204 --security-type TrustedLaunch --enable-secure-boot true \
-    --enable-vtpm true --admin-username azureuser --ssh-key-values "$SSH_KEY.pub" \
-    --vnet-name "$P-vnet" --subnet bench --nsg "$P-nsg" --lb "" \
-    --platform-fault-domain-count 1 --accelerated-networking true --assign-identity "$identity_id" \
-    --tags "${TAGS[@]}" azsecpack=nonprod -o none
+  vmss "$P-vmss" "$VM_SKU" "$VM_COUNT"
 
   echo "storage: $SA_HNS (HNS), $SA_FLAT (flat); identity client id: $(az identity show -g "$RG" -n "$P-id" --query clientId -o tsv)"
   vm_ids
 }
 
+vmss() { # vmss <name> <sku> <count>
+  local identity_id
+  identity_id=$(az identity show -g "$RG" -n "$P-id" --query id -o tsv)
+  az vmss create -g "$RG" -n "$1" --orchestration-mode Flexible --vm-sku "$2" \
+    --instance-count "$3" --image Ubuntu2204 --security-type TrustedLaunch --enable-secure-boot true \
+    --enable-vtpm true --admin-username azureuser --ssh-key-values "$SSH_KEY.pub" \
+    --vnet-name "$P-vnet" --subnet bench --nsg "$P-nsg" --lb "" \
+    --platform-fault-domain-count 1 --accelerated-networking true --assign-identity "$identity_id" \
+    --tags "${TAGS[@]}" azsecpack=nonprod -o none
+}
+
 sa_id() { az storage account show -g "$RG" -n "$1" --query id -o tsv; }
-vm_ids() { az vm list -g "$RG" --query "[?contains(name,'$P-vmss')].{name:name,id:id}" -o tsv | sort; }
+# The main VMSS sorts first (vm1..3); extra scale sets from `addvmss` are named $P-xl* and follow.
+vm_ids() { az vm list -g "$RG" --query "[?contains(name,'$P-vmss') || contains(name,'$P-xl')].{name:name,id:id}" -o tsv | sort; }
 vm_id() { vm_ids | sed -n "${1}p" | cut -f2; }
 
 case ${1:-} in
   up) up ;;
+  # Extra one-VM scale set with another size, e.g. addvmss xl32 Standard_D32ds_v5 (becomes vm4).
+  addvmss) vmss "$P-$2" "$3" 1; vm_ids ;;
   ssh) shift; n=$1; shift
        command az network bastion ssh --subscription "$SUB" -g "$RG" -n "$P-bastion" --target-resource-id "$(vm_id "$n")" \
          --auth-type ssh-key --username azureuser --ssh-key "$SSH_KEY" -- "$@" ;;
@@ -107,8 +116,8 @@ case ${1:-} in
         o=(-q -r -i "$SSH_KEY" -P "$port" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
         if [ "$op" = push ]; then scp "${o[@]}" "$@" azureuser@127.0.0.1:
         else scp "${o[@]}" "azureuser@127.0.0.1:$1" "$2"; fi ;;
-  stop) az vmss deallocate -g "$RG" -n "$P-vmss" -o none ;;
-  start) az vmss start -g "$RG" -n "$P-vmss" -o none ;;
+  stop) for s in $(az vmss list -g "$RG" --query "[].name" -o tsv); do az vmss deallocate -g "$RG" -n "$s" -o none; done ;;
+  start) for s in $(az vmss list -g "$RG" --query "[].name" -o tsv); do az vmss start -g "$RG" -n "$s" -o none; done ;;
   down) az group delete -n "$RG" --yes ;;
-  *) echo "usage: $0 up|ssh <n> [ssh args] cmd|tunnel <n> <port>|push <n> files...|pull <n> src dst|stop|start|down" >&2; exit 2 ;;
+  *) echo "usage: $0 up|addvmss <name> <sku>|ssh <n> [ssh args] cmd|tunnel <n> <port>|push <n> files...|pull <n> src dst|stop|start|down" >&2; exit 2 ;;
 esac
