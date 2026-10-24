@@ -1,0 +1,31 @@
+{
+  "accepted_files": 18000,
+  "dangling_files": [],
+  "dangling_files_count": 0,
+  "duplicate_paths": [],
+  "duplicate_paths_count": 0,
+  "g1_no_loss": true,
+  "g2_no_duplicates": true,
+  "g3_atomic": true,
+  "g4_valid": true,
+  "latest_version": 2323,
+  "log_add_actions": 18000,
+  "log_commits": 2324,
+  "log_removed_paths": 0,
+  "log_unique_added_paths": 18000,
+  "manifests": 2323,
+  "manifests_pending": 0,
+  "missing_accepted": [],
+  "missing_accepted_count": 0,
+  "sent_files": 18000,
+  "sent_not_accepted": 0,
+  "snapshot_error": null,
+  "snapshot_files": 18000,
+  "snapshot_load_ms": 150.827316,
+  "split_manifests": [],
+  "split_manifests_count": 0,
+  "table": "abfss://bench@emdcbflatf35219.dfs.core.windows.net/exp1-v3/ceiling-group-r100",
+  "txn_app_ids": {
+    "exp1-v3-ceiling-group-r100/ceiling-group-r100": 2322
+  }
+}

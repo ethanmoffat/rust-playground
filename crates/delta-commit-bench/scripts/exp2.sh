@@ -4,6 +4,11 @@
 # Each table gets one encoder at RATE files/s. The commit runtime has one worker thread; its blocking
 # pool (used by delta-rs for snapshot work) shares the "commit" thread name, so commit CPU can exceed 1 core.
 set -uo pipefail
+# THREADS (1): commit runtime worker threads.
+# WAL_ROOT: where per-cell WALs go (default: the cell dir). Use /dev/shm to take WAL fsyncs out of the
+# measurement (finding F13); the WAL is removed after the check.
+# Each table holds WAL files and connections open; 5000 tables exceed the default 1024 fds.
+ulimit -n 65536
 
 ACCT=$1; shift
 COUNTS=${*:-1 100 1000 5000}
@@ -18,23 +23,25 @@ mkdir -p "$OUT"
 for n in $COUNTS; do
   name=tables-$n; d=$OUT/$name
   [ -f "$d/check.json" ] && { echo "skip $name"; continue; }
-  mkdir -p "$d"; rm -rf "$d/wal"
+  w=${WAL_ROOT:+$WAL_ROOT/$RUN/$ACCT/$name}; w=${w:-$d/wal}
+  mkdir -p "$d"; rm -rf "$w"; echo "$w" > "$d/wal_dir.txt"
   echo "$(date -u +%FT%TZ) start $name" | tee -a "$OUT/progress.log"
   # object_store logs each internal retry (throttling included) at info.
   RUST_LOG=warn,object_store=info "$DCB" run --table-base "$BASE/$name" --tables "$n" --create --app-id "$RUN" \
-    --wal-dir "$d/wal" --out "$d/run.jsonl" --duration "$DUR" --rate "$RATE" --encoders 1 --pacing group \
-    --idempotency txn --commit-threads 1 --checkpoint-every 50 2> "$d/stderr.log"
+    --wal-dir "$w" --out "$d/run.jsonl" --duration "$DUR" --rate "$RATE" --encoders 1 --pacing group \
+    --idempotency txn --commit-threads "${THREADS:-1}" --checkpoint-every 50 2> "$d/stderr.log"
   echo "exit=$?" >> "$d/stderr.log"
   # Guarantees on a sample of tables: first, middle, last.
   for i in 0 $((n / 2)) $((n - 1)); do
     t=$(printf 't%05d' "$i")
-    "$DCB" check --table-url "$BASE/$name/$t" --wal-dir "$d/wal/${RUN}_$t" > "$d/check-$t.json" 2>> "$d/stderr.log"
+    "$DCB" check --table-url "$BASE/$name/$t" --wal-dir "$w/${RUN}_$t" > "$d/check-$t.json" 2>> "$d/stderr.log"
   done
   python3 - "$d" > "$d/check.json" <<'PY'
 import json,glob,sys
 c=[json.load(open(f)) for f in sorted(glob.glob(sys.argv[1]+"/check-t*.json"))]
 print(json.dumps({k:all(x[k] for x in c) for k in ("g1_no_loss","g2_no_duplicates","g3_atomic","g4_valid")}|{"tables_checked":len(c)}))
 PY
+  [ -n "${WAL_ROOT:-}" ] && rm -rf "$w"
   echo "$(date -u +%FT%TZ) done $name" | tee -a "$OUT/progress.log"
 done
 echo "$(date -u +%FT%TZ) all done" | tee -a "$OUT/progress.log"

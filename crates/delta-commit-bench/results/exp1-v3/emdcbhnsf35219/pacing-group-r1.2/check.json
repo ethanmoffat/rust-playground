@@ -1,0 +1,31 @@
+{
+  "accepted_files": 216,
+  "dangling_files": [],
+  "dangling_files_count": 0,
+  "duplicate_paths": [],
+  "duplicate_paths_count": 0,
+  "g1_no_loss": true,
+  "g2_no_duplicates": true,
+  "g3_atomic": true,
+  "g4_valid": true,
+  "latest_version": 214,
+  "log_add_actions": 216,
+  "log_commits": 215,
+  "log_removed_paths": 0,
+  "log_unique_added_paths": 216,
+  "manifests": 214,
+  "manifests_pending": 0,
+  "missing_accepted": [],
+  "missing_accepted_count": 0,
+  "sent_files": 216,
+  "sent_not_accepted": 0,
+  "snapshot_error": null,
+  "snapshot_files": 216,
+  "snapshot_load_ms": 140.184913,
+  "split_manifests": [],
+  "split_manifests_count": 0,
+  "table": "abfss://bench@emdcbhnsf35219.dfs.core.windows.net/exp1-v3/pacing-group-r1.2",
+  "txn_app_ids": {
+    "exp1-v3-pacing-group-r1.2/pacing-group-r1.2": 213
+  }
+}
