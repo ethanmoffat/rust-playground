@@ -112,6 +112,13 @@ enum CommitRuntime {
     Current,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, clap::ValueEnum)]
+enum LogCleanup {
+    Default,
+    On,
+    Off,
+}
+
 #[derive(Args, Serialize)]
 struct RunArgs {
     #[command(flatten)]
@@ -168,6 +175,14 @@ struct RunArgs {
     commit_threads: usize,
     #[arg(long, value_enum, default_value_t = CommitRuntime::Multi)]
     commit_runtime: CommitRuntime,
+    /// Expired-log cleanup in the delta-rs post-commit hook. `default` follows the table property
+    /// `delta.enableExpiredLogCleanup` (true unless set). The cleanup lists all of `_delta_log`.
+    #[arg(long, value_enum, default_value_t = LogCleanup::Default)]
+    log_cleanup: LogCleanup,
+    /// Rebuild the in-memory snapshot from each checkpoint the loop writes. `false` reproduces
+    /// commit latency growing with total log length.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    reload_after_checkpoint: bool,
     /// JSONL output.
     #[arg(long)]
     out: PathBuf,
@@ -397,6 +412,12 @@ async fn run(args: RunArgs) -> Result<()> {
             library_max_retries: args.library_max_retries,
             loop_max_attempts: args.loop_max_attempts,
             inline_checkpoint: matches!(args.checkpoint, CheckpointMode::Inline),
+            cleanup_expired_logs: match args.log_cleanup {
+                LogCleanup::Default => None,
+                LogCleanup::On => Some(true),
+                LogCleanup::Off => Some(false),
+            },
+            reload_after_checkpoint: args.reload_after_checkpoint,
             separate_checkpoint_every: matches!(args.checkpoint, CheckpointMode::Separate).then_some(args.checkpoint_every),
             max_files_per_commit: args.max_files_per_commit,
             scan_window: args.scan_window,

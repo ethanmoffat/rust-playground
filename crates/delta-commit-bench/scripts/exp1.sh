@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Experiment 1: one commit loop, one table. Runs on a bench VM inside tmux; results under ~/results/exp1/<account>.
-# Usage: exp1.sh <storage-account> [phase...]   phases: pacing scanlog ceiling loglen findings (default: all)
+# Usage: exp1.sh <storage-account> [phase...]   phases: pacing scanlog ceiling loglen findings logcleanup
+#   (default: all but logcleanup)
 set -uo pipefail
 
 ACCT=$1; shift
 PHASES=${*:-pacing scanlog ceiling loglen findings}
 DUR=${DUR:-180}
-BASE=abfss://bench@$ACCT.dfs.core.windows.net/exp1
-OUT=$HOME/results/exp1/$ACCT
+# TAG separates reruns: tables under exp1-<TAG>/, results under ~/results/exp1-<TAG>/.
+RUN=exp1${TAG:+-$TAG}
+BASE=abfss://bench@$ACCT.dfs.core.windows.net/$RUN
+OUT=$HOME/results/$RUN/$ACCT
 DCB=$HOME/dcb
 mkdir -p "$OUT"
 
@@ -17,7 +20,7 @@ cell() { # cell <name> <run args...>
   [ -f "$d/check.json" ] && { echo "skip $name"; return; }
   mkdir -p "$d"; rm -rf "$d/wal"
   echo "$(date -u +%FT%TZ) start $name: $*" | tee -a "$OUT/progress.log"
-  "$DCB" run --table-url "$BASE/$name" --create --app-id "exp1-$name" --wal-dir "$d/wal" \
+  "$DCB" run --table-url "$BASE/$name" --create --app-id "$RUN-$name" --wal-dir "$d/wal" \
     --out "$d/run.jsonl" --duration "$DUR" "$@" 2> "$d/stderr.log"
   echo "exit=$?" >> "$d/stderr.log"
   "$DCB" check --table-url "$BASE/$name" --wal-dir "$d/wal" --sent "$d/run.sent.jsonl" > "$d/check.json" 2>> "$d/stderr.log"
@@ -54,6 +57,11 @@ for phase in $PHASES; do case $phase in
     # Checkpoint stall under a current-thread commit runtime, against the default multi-thread runtime.
     for rt in current multi; do
       DUR=60 cell "runtime-$rt-ck50" --rate 8 --pacing group --idempotency txn --checkpoint-every 50 --commit-runtime "$rt"
+    done ;;
+  logcleanup)
+    # Commit latency against log length, with the post-commit expired-log cleanup (a full _delta_log LIST) on and off.
+    for lc in on off; do
+      cell "logcleanup-$lc-r25" --rate 25 --encoders 16 --pacing group --idempotency txn --log-cleanup "$lc"
     done ;;
   *) echo "unknown phase $phase" >&2; exit 2 ;;
 esac; done

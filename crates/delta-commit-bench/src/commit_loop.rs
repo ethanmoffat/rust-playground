@@ -44,6 +44,10 @@ pub struct LoopConfig {
     pub loop_max_attempts: u32,
     /// Let delta-rs write checkpoints inside the commit call.
     pub inline_checkpoint: bool,
+    /// Post-commit expired-log cleanup. `None` follows `delta.enableExpiredLogCleanup`.
+    pub cleanup_expired_logs: Option<bool>,
+    /// Rebuild the snapshot from each checkpoint the loop writes.
+    pub reload_after_checkpoint: bool,
     /// Write a checkpoint after the commit is acknowledged, every N table versions.
     pub separate_checkpoint_every: Option<u64>,
     pub max_files_per_commit: usize,
@@ -79,6 +83,8 @@ pub struct CommitRecord {
     pub errors: Vec<String>,
     pub storage: CounterSnapshot,
     pub checkpoint_ms: Option<f64>,
+    /// Time to rebuild the in-memory snapshot from the new checkpoint.
+    pub checkpoint_reload_ms: Option<f64>,
 }
 
 fn ms(d: Duration) -> f64 {
@@ -364,6 +370,7 @@ impl CommitLoop {
             errors: Vec::new(),
             storage: CounterSnapshot::default(),
             checkpoint_ms: None,
+            checkpoint_reload_ms: None,
         });
     }
 
@@ -431,6 +438,7 @@ impl CommitLoop {
             }
             let mut props = CommitProperties::default()
                 .with_create_checkpoint(self.cfg.inline_checkpoint)
+                .with_cleanup_expired_logs(self.cfg.cleanup_expired_logs)
                 .with_max_retries(self.cfg.library_max_retries);
             if self.cfg.idempotency == Idempotency::Txn {
                 props = props.with_application_transaction(Transaction::new_with_last_update(
@@ -513,10 +521,12 @@ impl CommitLoop {
             errors,
             storage: self.counters.snapshot().since(&before),
             checkpoint_ms: None,
+            checkpoint_reload_ms: None,
         }
     }
 
-    async fn maybe_checkpoint(&mut self) -> Option<f64> {
+    /// Returns (checkpoint write ms, snapshot reload ms).
+    async fn maybe_checkpoint(&mut self) -> Option<(f64, Option<f64>)> {
         let every = self.cfg.separate_checkpoint_every?;
         let version = self.table.version()?;
         if version == 0 || version % every != 0 {
@@ -524,7 +534,25 @@ impl CommitLoop {
         }
         let started = Instant::now();
         match deltalake_core::checkpoints::create_checkpoint(&self.table, None).await {
-            Ok(()) => Some(ms(started.elapsed())),
+            Ok(()) => {
+                let write_ms = ms(started.elapsed());
+                // An incremental snapshot update carries every earlier file batch forward and adds
+                // one per commit; batches are never compacted, so per-commit work and memory grow
+                // with the version. A fresh load from the checkpoint resets both.
+                if !self.cfg.reload_after_checkpoint {
+                    return Some((write_ms, None));
+                }
+                let started = Instant::now();
+                let previous = self.table.state.take();
+                match self.table.update_incremental(Some(version)).await {
+                    Ok(()) => Some((write_ms, Some(ms(started.elapsed())))),
+                    Err(error) => {
+                        tracing::warn!(%error, "snapshot reload after checkpoint failed");
+                        self.table.state = previous;
+                        Some((write_ms, None))
+                    }
+                }
+            }
             Err(error) => {
                 tracing::warn!(%error, "checkpoint failed");
                 None
@@ -582,7 +610,10 @@ impl CommitLoop {
                 anyhow::bail!("commit of txn version {} did not complete", manifest.version);
             }
             self.wal.release(manifest.version)?;
-            record.checkpoint_ms = self.maybe_checkpoint().await;
+            if let Some((write_ms, reload_ms)) = self.maybe_checkpoint().await {
+                record.checkpoint_ms = Some(write_ms);
+                record.checkpoint_reload_ms = reload_ms;
+            }
             let _ = self.out.send(record);
         }
         Ok(())
