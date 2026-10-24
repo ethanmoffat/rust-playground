@@ -120,7 +120,16 @@ import json,glob,sys,os,urllib.parse
 t,d=sys.argv[1],sys.argv[2]
 log=urllib.parse.urlparse(t).path+"/_delta_log"
 fence=None; after=[]
-for f in sorted(glob.glob(log+"/*.json")):
+if not t.startswith("file://"):
+    # Remote table: fence version from inst-b's log, inst-a's landed versions from its commit records.
+    import re
+    err=re.sub(r"\x1b\[[0-9;]*m","",open(d+"/r2.err").read())
+    m=re.search(r"fence_version=Some\((\d+)\)",err)
+    fence=int(m.group(1)) if m else None
+    if fence is not None:
+        after=[r["delta_version"] for r in map(json.loads,open(d+"/r1.jsonl")) if r.get("kind")=="commit"
+               and r["outcome"] in ("ok","ok_after_loop_retry","landed_after_error") and r["delta_version"]>fence]
+for f in (sorted(glob.glob(log+"/*.json")) if t.startswith("file://") else []):
     v=int(os.path.basename(f)[:20])
     for l in open(f):
         a=json.loads(l)

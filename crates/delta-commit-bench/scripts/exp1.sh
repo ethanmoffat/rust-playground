@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Experiment 1: one commit loop, one table. Runs on a bench VM inside tmux; results under ~/results/exp1/<account>.
 # Usage: exp1.sh <storage-account> [phase...]   phases: pacing scanlog ceiling loglen findings logcleanup
-#   (default: all but logcleanup)
+#   (default: pacing ceiling)
 set -uo pipefail
 
 ACCT=$1; shift
-PHASES=${*:-pacing scanlog ceiling loglen findings}
+PHASES=${*:-pacing ceiling}
 DUR=${DUR:-180}
 # TAG separates reruns: tables under exp1-<TAG>/, results under ~/results/exp1-<TAG>/.
 RUN=exp1${TAG:+-$TAG}
@@ -40,9 +40,11 @@ for phase in $PHASES; do case $phase in
     for rate in 25 50 100 200; do
       cell "ceiling-group-r$rate" --rate "$rate" --encoders 16 --pacing group --idempotency txn
     done
-    cell "ceiling-1file-txn-r100" --rate 100 --encoders 16 --pacing group --idempotency txn --max-files-per-commit 1
-    cell "ceiling-1file-scanlog-r100" --rate 100 --encoders 16 --pacing group --idempotency scan-log \
-      --library-max-retries 0 --max-files-per-commit 1 ;;
+    # Fresh-reader cost on the longest table (checkpoints every 100 versions).
+    d=$OUT/ceiling-group-r200
+    [ -f "$d/read.jsonl" ] || "$DCB" read --table-url "$BASE/ceiling-group-r200" --repeat 5 > "$d/read.jsonl" 2>> "$d/stderr.log"
+    # One file per commit gives the commits/s ceiling. 60 s bounds the backlog drain.
+    DUR=60 cell "ceiling-1file-txn-r100" --rate 100 --encoders 16 --pacing group --idempotency txn --max-files-per-commit 1 ;;
   loglen)
     # Uncheckpointed logs of increasing length; time a fresh reader, write a checkpoint, time it again.
     for secs in 60 300 1200; do

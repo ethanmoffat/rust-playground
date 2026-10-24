@@ -176,8 +176,9 @@ struct RunArgs {
     #[arg(long, value_enum, default_value_t = CommitRuntime::Multi)]
     commit_runtime: CommitRuntime,
     /// Expired-log cleanup in the delta-rs post-commit hook. `default` follows the table property
-    /// `delta.enableExpiredLogCleanup` (true unless set). The cleanup lists all of `_delta_log`.
-    #[arg(long, value_enum, default_value_t = LogCleanup::Default)]
+    /// `delta.enableExpiredLogCleanup` (true unless set). The cleanup lists all of `_delta_log` on
+    /// every commit, so it is off here; log cleanup belongs to table maintenance.
+    #[arg(long, value_enum, default_value_t = LogCleanup::Off)]
     log_cleanup: LogCleanup,
     /// Rebuild the in-memory snapshot from each checkpoint the loop writes. `false` reproduces
     /// commit latency growing with total log length.

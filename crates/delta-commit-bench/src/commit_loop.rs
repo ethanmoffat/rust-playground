@@ -221,7 +221,7 @@ impl CommitLoop {
             match result {
                 Ok(finalized) => {
                     self.table.state = Some(finalized.snapshot());
-                    tracing::info!(old_app_id, last = ?raw, "fenced");
+                    tracing::warn!(old_app_id, last = ?raw, fence_version = ?self.table.version(), "fenced old owner");
                 }
                 Err(error) => {
                     tracing::warn!(%error, attempt, "fence commit failed; re-reading");
