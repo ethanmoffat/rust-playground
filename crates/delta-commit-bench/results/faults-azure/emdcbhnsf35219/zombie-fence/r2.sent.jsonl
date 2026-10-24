@@ -1,0 +1,3 @@
+{"path":"data/1792807005-zombie-fence-e0-00000000-3d66cd4c-9696-4e63-a775-02b6842e30cb.parquet","size":1790,"rows":100,"encoder":"1792807005-zombie-fence-e0","upload_start_ms":1792807134899,"upload_done_ms":1792807134948}
+{"path":"data/1792807005-zombie-fence-e0-00000001-60fd7599-3101-44d3-b4df-a5f5560760f9.parquet","size":1815,"rows":100,"encoder":"1792807005-zombie-fence-e0","upload_start_ms":1792807135899,"upload_done_ms":1792807135918}
+{"path":"data/1792807005-zombie-fence-e0-00000002-7f40edcb-5255-4673-a7db-238f10dec375.parquet","size":1846,"rows":100,"encoder":"1792807005-zombie-fence-e0","upload_start_ms":1792807136898,"upload_done_ms":1792807136918}

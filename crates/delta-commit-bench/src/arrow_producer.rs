@@ -347,7 +347,8 @@ pub struct StatsSnapshot {
     /// CPU of encoder threads that have exited (live threads appear in the `encoder` CPU group).
     pub encoder_cpu_exited_s: f64,
     pub upload_errors: u64,
-    /// Bytes sent by all non-loopback interfaces since boot (/proc/net/dev).
+    /// Bytes sent by all non-loopback interfaces since boot (/proc/net/dev). Interfaces enslaved to another
+    /// (the Azure accelerated-networking VF under eth0) are skipped: their bytes are also counted on the master.
     pub nic_tx_bytes: Option<u64>,
 }
 
@@ -374,7 +375,8 @@ fn nic_tx_bytes() -> Option<u64> {
     let mut total = 0;
     for line in dev.lines().skip(2) {
         let (iface, rest) = line.split_once(':')?;
-        if iface.trim() == "lo" {
+        let iface = iface.trim();
+        if iface == "lo" || std::path::Path::new(&format!("/sys/class/net/{iface}/master")).exists() {
             continue;
         }
         total += rest.split_whitespace().nth(8)?.parse::<u64>().ok()?;

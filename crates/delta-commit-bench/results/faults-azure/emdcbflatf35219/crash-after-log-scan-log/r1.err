@@ -1,0 +1,2 @@
+[2m2026-10-24T01:56:44.290349Z[0m [31mERROR[0m [2mbuoyant_kernel::snapshot::builder[0m[2m:[0m [3merror[0m[2m=[0mGeneric delta kernel error: No files in log segment
+fault: aborting after log write faults/1792806998-crash-after-log-scan-log/_delta_log/00000000000000000020.json

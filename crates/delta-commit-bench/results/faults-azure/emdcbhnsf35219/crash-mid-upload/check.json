@@ -1,0 +1,31 @@
+{
+  "accepted_files": 32,
+  "dangling_files": [],
+  "dangling_files_count": 0,
+  "duplicate_paths": [],
+  "duplicate_paths_count": 0,
+  "g1_no_loss": true,
+  "g2_no_duplicates": true,
+  "g3_atomic": true,
+  "g4_valid": true,
+  "latest_version": 32,
+  "log_add_actions": 32,
+  "log_commits": 33,
+  "log_removed_paths": 0,
+  "log_unique_added_paths": 32,
+  "manifests": 32,
+  "manifests_pending": 0,
+  "missing_accepted": [],
+  "missing_accepted_count": 0,
+  "sent_files": 32,
+  "sent_not_accepted": 0,
+  "snapshot_error": null,
+  "snapshot_files": 32,
+  "snapshot_load_ms": 113.691652,
+  "split_manifests": [],
+  "split_manifests_count": 0,
+  "table": "abfss://bench@emdcbhnsf35219.dfs.core.windows.net/faults/1792807005-crash-mid-upload",
+  "txn_app_ids": {
+    "inst-a/1792807005-crash-mid-upload": 31
+  }
+}

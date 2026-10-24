@@ -1,0 +1,2 @@
+[2m2026-10-24T01:58:27.727641Z[0m [33m WARN[0m [2mdcb::commit_loop[0m[2m:[0m fenced old owner [3mold_app_id[0m[2m=[0m"inst-a/1792806998-identity-change-adopt-crash-after" [3mlast[0m[2m=[0mSome(19) [3mfence_version[0m[2m=[0mSome(21)
+done: 3 files in 3.1s, loop errors: 0

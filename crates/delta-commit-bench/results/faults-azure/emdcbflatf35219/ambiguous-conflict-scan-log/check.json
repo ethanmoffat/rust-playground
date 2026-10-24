@@ -1,0 +1,66 @@
+{
+  "accepted_files": 120,
+  "dangling_files": [],
+  "dangling_files_count": 0,
+  "duplicate_paths": [
+    [
+      "data/1792806998-ambiguous-conflict-scan-log-e0-00000000-3ee65654-4274-41b4-bb0d-e6a90297b7c5.parquet",
+      [
+        3,
+        4
+      ]
+    ],
+    [
+      "data/1792806998-ambiguous-conflict-scan-log-e0-00000012-b8dd7234-b3c9-4baf-880e-1681765900d8.parquet",
+      [
+        51,
+        52
+      ]
+    ],
+    [
+      "data/1792806998-ambiguous-conflict-scan-log-e0-00000013-3a909098-dad9-46ad-8222-a7019a5699bf.parquet",
+      [
+        54,
+        55
+      ]
+    ],
+    [
+      "data/1792806998-ambiguous-conflict-scan-log-e0-00000014-7aed76ba-365e-4d62-85e5-6f2e26149fea.parquet",
+      [
+        58,
+        59,
+        60
+      ]
+    ],
+    [
+      "data/1792806998-ambiguous-conflict-scan-log-e0-00000019-2d08af82-6a18-4b76-93d8-1d4906324d39.parquet",
+      [
+        79,
+        80
+      ]
+    ]
+  ],
+  "duplicate_paths_count": 28,
+  "g1_no_loss": true,
+  "g2_no_duplicates": false,
+  "g3_atomic": true,
+  "g4_valid": true,
+  "latest_version": 113,
+  "log_add_actions": 155,
+  "log_commits": 114,
+  "log_removed_paths": 0,
+  "log_unique_added_paths": 120,
+  "manifests": 88,
+  "manifests_pending": 0,
+  "missing_accepted": [],
+  "missing_accepted_count": 0,
+  "sent_files": 120,
+  "sent_not_accepted": 0,
+  "snapshot_error": null,
+  "snapshot_files": 120,
+  "snapshot_load_ms": 110.50892800000001,
+  "split_manifests": [],
+  "split_manifests_count": 0,
+  "table": "abfss://bench@emdcbflatf35219.dfs.core.windows.net/faults/1792806998-ambiguous-conflict-scan-log",
+  "txn_app_ids": {}
+}

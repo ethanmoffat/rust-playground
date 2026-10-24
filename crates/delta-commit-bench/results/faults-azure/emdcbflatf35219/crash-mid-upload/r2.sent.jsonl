@@ -1,0 +1,3 @@
+{"path":"data/1792806998-crash-mid-upload-e0-00000000-76fa7340-3980-4612-ac80-1ba7ff3a9ae6.parquet","size":1810,"rows":100,"encoder":"1792806998-crash-mid-upload-e0","upload_start_ms":1792807133241,"upload_done_ms":1792807133247}
+{"path":"data/1792806998-crash-mid-upload-e0-00000001-4b8a12c9-0d21-427e-b0bb-ed6453ee4b4c.parquet","size":1835,"rows":100,"encoder":"1792806998-crash-mid-upload-e0","upload_start_ms":1792807134241,"upload_done_ms":1792807134247}
+{"path":"data/1792806998-crash-mid-upload-e0-00000002-869bbf3a-2b91-42b2-b53e-4b9b4574b120.parquet","size":1866,"rows":100,"encoder":"1792806998-crash-mid-upload-e0","upload_start_ms":1792807135241,"upload_done_ms":1792807135247}

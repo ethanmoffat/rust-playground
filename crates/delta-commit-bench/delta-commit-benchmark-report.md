@@ -84,8 +84,8 @@ commit loop, regardless of which core encoded them.
 
 | Hypothesis | Verdict | Evidence |
 |---|---|---|
-| No fencing service | Refuted as stated. A fence is required. It needs no separate service: the fence is a Delta commit. | Exp 7 zombie-fence, identity-change. Exp 4 pending. |
-| Concurrency safety | Pending exp 4 and 5 on Azure. Holds locally for blind appends. | Exp 7 concurrent-optimize. |
+| No fencing service | Refuted as stated. A fence is required. It needs no separate service: the fence is a Delta commit. | Exp 7 zombie-fence and identity-change, local and on both Azure accounts. |
+| Concurrency safety | Holds for blind appends with distinct appIds. Contention costs latency and fairness. | Exp 5 (2 and 5 writers, both accounts). Exp 7 concurrent-optimize. |
 
 ## Experiment 7: failure injection (local, file://)
 
@@ -110,6 +110,50 @@ Repro: `scripts/faults.sh file:///tmp/f/t /tmp/f/w 10 12`.
 | zombie-fence | pass | pass | pass | pass | Zombie fenced by ConcurrentTransaction. No zombie commits after the fence. 8 orphan files (uploaded, never committed). |
 | crash-mid-upload | pass | pass | pass | pass | |
 | concurrent-optimize | pass | pass | pass | pass | 1 library retry |
+
+## Experiment 7 on Azure: failure injection
+
+The same suite ran against both accounts from VM3. Raw results: `results/faults-azure/`.
+Repro: `scripts/faults.sh abfss://bench@<acct>.dfs.core.windows.net/faults/t ~/results/faults/<acct> 10 12`.
+
+The verdicts match the local run on both accounts. Every scenario passes G1 to G4 except the two
+expected failures:
+
+| Scenario | Flat | HNS |
+|---|---|---|
+| ambiguous-conflict-scan-log | G2 fails, 28 duplicates | G2 fails, 27 duplicates |
+| identity-change-no-adopt-crash-before | G1 fails, 2 lost | G1 fails, 1 lost |
+| zombie-fence | pass. Fence at version 9. 0 zombie commits after it. | pass. Fence at version 9. 0 zombie commits after it. |
+| errors-503-log | pass. 255 injected 503s. | pass. 191 injected 503s. |
+
+On real storage, the fenced zombie's next commit failed with `ConcurrentTransaction` and its loop
+stopped. The checker found no inst-a commit above the fence version.
+
+## Experiment 5: multiple writers on one table
+
+Reduced to 2 and 5 writers, for evidence only. Each writer is a separate process with its own appId and
+disjoint files. Rate is per writer, 4 encoders each, group pacing, 180 s. Raw results:
+`results/exp5/<account>/<cell>/`. Repro: `scripts/exp5.sh <account>`.
+
+| Account | Cell | Offered files/s | G1 to G4 | Commits | p50 / p99 commit ms | Library retries per commit | Per-writer commits/s | Worst visibility ms |
+|---|---|---|---|---|---|---|---|---|
+| Flat | 2 x 1.2 | 2.4 | pass | 433 | 61 / 167 | 0.12 | 1.22, 1.22 | 1161 |
+| Flat | 2 x 12 | 24 | pass | 2420 | 42 / 1012 | 0.37 | 2.36, 11.08 | 11316 |
+| Flat | 5 x 1.2 | 6 | pass | 1081 | 117 / 417 | 0.37 | 1.20 to 1.21 | 762 |
+| Flat | 5 x 12 | 60 | pass | 3005 | 66 / 6011 | 1.27 | 1.88 to 5.30 | 16560 |
+| HNS | 2 x 1.2 | 2.4 | pass | 426 | 80 / 265 | 0.00 | 1.19, 1.20 | 1260 |
+| HNS | 2 x 12 | 24 | pass | 1610 | 81 / 1434 | 0.39 | 6.47, 2.47 | 22823 |
+| HNS | 5 x 1.2 | 6 | pass | 1054 | 194 / 685 | 0.64 | 1.07 to 1.21 | 1325 |
+| HNS | 5 x 12 | 60 | pass | 1995 | 75 / 9960 | 0.75 | 0.98 to 3.66 | 65257 |
+
+- Correctness holds. Concurrent blind appends with distinct appIds never lost or duplicated a file.
+- At low rates every writer keeps up, but p50 commit latency doubles at 5 writers.
+- At high rates the writers starve each other. One writer can win most races while another falls
+  behind. p99 commit latency reaches 6 to 16 s and visibility reaches 11 to 65 s.
+- Total commits/s at 5 writers (17 flat, 11 HNS) is no better than one loop (exp 1). Adding writers
+  adds contention and no throughput.
+
+This supports option C. A table should have one writer.
 
 ## Experiment 1: commit loop characterization
 

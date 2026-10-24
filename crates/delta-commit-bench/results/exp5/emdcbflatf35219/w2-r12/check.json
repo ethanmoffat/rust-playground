@@ -1,0 +1,32 @@
+{
+  "accepted_files": 4320,
+  "dangling_files": [],
+  "dangling_files_count": 0,
+  "duplicate_paths": [],
+  "duplicate_paths_count": 0,
+  "g1_no_loss": true,
+  "g2_no_duplicates": true,
+  "g3_atomic": true,
+  "g4_valid": true,
+  "latest_version": 2419,
+  "log_add_actions": 4320,
+  "log_commits": 2420,
+  "log_removed_paths": 0,
+  "log_unique_added_paths": 4320,
+  "manifests": 2419,
+  "manifests_pending": 0,
+  "missing_accepted": [],
+  "missing_accepted_count": 0,
+  "sent_files": 4320,
+  "sent_not_accepted": 0,
+  "snapshot_error": null,
+  "snapshot_files": 4320,
+  "snapshot_load_ms": 108.817081,
+  "split_manifests": [],
+  "split_manifests_count": 0,
+  "table": "abfss://bench@emdcbflatf35219.dfs.core.windows.net/exp5/w2-r12",
+  "txn_app_ids": {
+    "exp5-w2-r12-w1/w2-r12": 425,
+    "exp5-w2-r12-w2/w2-r12": 1992
+  }
+}

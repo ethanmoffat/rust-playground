@@ -1,0 +1,9 @@
+[2m2026-10-24T01:58:37.011159Z[0m [31mERROR[0m [2mbuoyant_kernel::snapshot::builder[0m[2m:[0m [3merror[0m[2m=[0mGeneric delta kernel error: No files in log segment
+[2m2026-10-24T01:58:45.653496Z[0m [33m WARN[0m [2mdeltalake_core::kernel::transaction[0m[2m:[0m version already exists, will retry [3mversion[0m[2m=[0m9 [3mattempt[0m[2m=[0m1
+[2m2026-10-24T01:58:45.666010Z[0m [33m WARN[0m [2mdeltalake_core::kernel::transaction[0m[2m:[0m table updated during transaction, checking for conflicts [3mbase_version[0m[2m=[0m8 [3mlatest_version[0m[2m=[0m13 [3mversions_behind[0m[2m=[0m5
+[2m2026-10-24T01:58:45.821962Z[0m [31mERROR[0m [2mdeltalake_core::kernel::transaction[0m[2m:[0m conflict detected, aborting transaction [3mconflicts_checked[0m[2m=[0m1 [3merror[0m[2m=[0mConcurrent transaction failed.
+done: 60 files in 9.6s, loop errors: 1
+[
+    "commit of txn version 8 did not complete",
+]
+Error: 1 commit loop(s) failed

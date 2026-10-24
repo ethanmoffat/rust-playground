@@ -1,0 +1,35 @@
+{
+  "accepted_files": 30,
+  "dangling_files": [],
+  "dangling_files_count": 0,
+  "duplicate_paths": [],
+  "duplicate_paths_count": 0,
+  "g1_no_loss": false,
+  "g2_no_duplicates": true,
+  "g3_atomic": true,
+  "g4_valid": true,
+  "latest_version": 22,
+  "log_add_actions": 28,
+  "log_commits": 23,
+  "log_removed_paths": 0,
+  "log_unique_added_paths": 28,
+  "manifests": 23,
+  "manifests_pending": 1,
+  "missing_accepted": [
+    "data/1792806998-identity-change-no-adopt-crash-before-e0-00000006-5ce91c77-ec11-40e6-a0de-aff809a8b431.parquet",
+    "data/1792806998-identity-change-no-adopt-crash-before-e2-00000006-5950571e-ffa2-4758-9c43-460405bf414f.parquet"
+  ],
+  "missing_accepted_count": 2,
+  "sent_files": 30,
+  "sent_not_accepted": 0,
+  "snapshot_error": null,
+  "snapshot_files": 28,
+  "snapshot_load_ms": 42.925605999999995,
+  "split_manifests": [],
+  "split_manifests_count": 0,
+  "table": "abfss://bench@emdcbflatf35219.dfs.core.windows.net/faults/1792806998-identity-change-no-adopt-crash-before",
+  "txn_app_ids": {
+    "inst-a/1792806998-identity-change-no-adopt-crash-before": 18,
+    "inst-b/1792806998-identity-change-no-adopt-crash-before": 2
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "accepted_files": 60,
+  "dangling_files": [],
+  "dangling_files_count": 0,
+  "duplicate_paths": [],
+  "duplicate_paths_count": 0,
+  "g1_no_loss": true,
+  "g2_no_duplicates": true,
+  "g3_atomic": true,
+  "g4_valid": true,
+  "latest_version": 15,
+  "log_add_actions": 60,
+  "log_commits": 16,
+  "log_removed_paths": 0,
+  "log_unique_added_paths": 60,
+  "manifests": 15,
+  "manifests_pending": 0,
+  "missing_accepted": [],
+  "missing_accepted_count": 0,
+  "sent_files": 71,
+  "sent_not_accepted": 11,
+  "snapshot_error": null,
+  "snapshot_files": 60,
+  "snapshot_load_ms": 44.243464,
+  "split_manifests": [],
+  "split_manifests_count": 0,
+  "table": "abfss://bench@emdcbhnsf35219.dfs.core.windows.net/faults/1792807005-zombie-fence",
+  "txn_app_ids": {
+    "inst-a/1792807005-zombie-fence": 4611686018427387912,
+    "inst-b/1792807005-zombie-fence": 5
+  }
+}
