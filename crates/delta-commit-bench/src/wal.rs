@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Metadata an encoder sends to the commit loop after a data file is fully uploaded.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FileReady {
     /// Path relative to the table root.
     pub path: String,
@@ -17,6 +17,18 @@ pub struct FileReady {
     pub encoder: String,
     pub upload_start_ms: i64,
     pub upload_done_ms: i64,
+    /// Arrow producer only: logical Arrow buffer bytes encoded into the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_groups: Option<i64>,
+    /// Arrow producer only: wall time from first batch to the Parquet footer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encode_ms: Option<f64>,
+    /// Arrow producer only: time the encoder blocked on upload backpressure, including the
+    /// final wait for outstanding parts and the multipart complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_wait_ms: Option<f64>,
 }
 
 /// One batch with its assigned txn version.

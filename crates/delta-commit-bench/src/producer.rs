@@ -88,6 +88,7 @@ pub async fn produce(
                     encoder: name.clone(),
                     upload_start_ms: start,
                     upload_done_ms: now_millis(),
+                    ..FileReady::default()
                 };
                 if let Some(sent) = &sent
                     && let Ok(line) = serde_json::to_string(&file)

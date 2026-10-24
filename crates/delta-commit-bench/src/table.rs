@@ -120,8 +120,23 @@ pub fn arrow_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Column set of a benchmark table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TableSchema {
+    /// [`arrow_schema`], written by the small-file producer.
+    #[default]
+    Small,
+    /// [`crate::arrow_producer::logs_schema`], written by the Arrow producer.
+    Logs,
+}
+
 /// Create an append-only table with the benchmark schema and `properties`.
-pub async fn create(url: &Url, root: Arc<dyn ObjectStore>, properties: &[(String, String)]) -> Result<u64> {
+pub async fn create(
+    url: &Url,
+    root: Arc<dyn ObjectStore>,
+    properties: &[(String, String)],
+    schema: TableSchema,
+) -> Result<u64> {
     if url.scheme() == "file" {
         std::fs::create_dir_all(url.path())?;
     }
@@ -129,14 +144,20 @@ pub async fn create(url: &Url, root: Arc<dyn ObjectStore>, properties: &[(String
     if bench.table.version().is_some() {
         bail!("table already exists at {url}");
     }
-    let table = bench
-        .table
-        .create()
-        .with_table_name("bench")
-        .with_column("id", DataType::Primitive(PrimitiveType::Long), false, None)
-        .with_column("ts", DataType::Primitive(PrimitiveType::Timestamp), false, None)
-        .with_column("encoder", DataType::Primitive(PrimitiveType::String), false, None)
-        .with_column("payload", DataType::Primitive(PrimitiveType::String), false, None)
+    let columns: Vec<(&str, PrimitiveType)> = match schema {
+        TableSchema::Small => vec![
+            ("id", PrimitiveType::Long),
+            ("ts", PrimitiveType::Timestamp),
+            ("encoder", PrimitiveType::String),
+            ("payload", PrimitiveType::String),
+        ],
+        TableSchema::Logs => crate::arrow_producer::delta_columns(),
+    };
+    let mut builder = bench.table.create().with_table_name("bench");
+    for (name, ty) in columns {
+        builder = builder.with_column(name, DataType::Primitive(ty), false, None);
+    }
+    let table = builder
         .with_configuration(properties.iter().map(|(k, v)| (k.clone(), Some(v.clone()))))
         .await?;
     table.version().context("created table has no version")

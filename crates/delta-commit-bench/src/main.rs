@@ -1,5 +1,6 @@
 //! `dcb`: benchmark of the ArrowCol Delta commit path.
 
+mod arrow_producer;
 mod checker;
 mod commit_loop;
 mod producer;
@@ -119,6 +120,14 @@ enum LogCleanup {
     Off,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, clap::ValueEnum)]
+enum ProducerKind {
+    /// Tiny Parquet files encoded on tokio workers, paced by `--rate`.
+    Small,
+    /// Large Parquet files encoded from in-memory Arrow batches on `--encoders` dedicated threads.
+    Arrow,
+}
+
 #[derive(Args, Serialize)]
 struct RunArgs {
     #[command(flatten)]
@@ -139,12 +148,32 @@ struct RunArgs {
     /// its unlanded pending manifests from `--wal-dir` under this loop's appId.
     #[arg(long)]
     adopt_from: Option<String>,
-    /// Files per second per table.
+    #[arg(long, value_enum, default_value_t = ProducerKind::Small)]
+    producer: ProducerKind,
+    /// Files per second per table. With `--producer arrow`, 0 encodes continuously.
     #[arg(long, default_value_t = 1.2)]
     rate: f64,
-    /// Encoders per table.
+    /// Encoders per table (encoder threads with `--producer arrow`).
     #[arg(long, default_value_t = 4)]
     encoders: usize,
+    /// Arrow producer: target Parquet file size in MiB.
+    #[arg(long, default_value_t = 1024)]
+    file_mb: usize,
+    /// Arrow producer: flush a row group once its estimated encoded size reaches this many MiB.
+    #[arg(long, default_value_t = 256)]
+    row_group_mb: usize,
+    /// Arrow producer: multipart upload part size in MiB.
+    #[arg(long, default_value_t = 32)]
+    part_mb: usize,
+    /// Arrow producer: upload parts in flight per encoder.
+    #[arg(long, default_value_t = 4)]
+    upload_concurrency: usize,
+    /// Arrow producer: raw Arrow MiB of pre-generated batches shared by all encoders.
+    #[arg(long, default_value_t = 512)]
+    pool_mb: u64,
+    /// Arrow producer: rows per pre-generated batch.
+    #[arg(long, default_value_t = 32_768)]
+    batch_rows: usize,
     #[arg(long, default_value_t = 100)]
     rows: usize,
     /// Upload data files as two-part multipart uploads (needed for --fault-crash-mid-upload).
@@ -268,6 +297,8 @@ struct Sample {
     cpu_secs: BTreeMap<String, f64>,
     rss_mb: f64,
     producer_storage: store::CounterSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    producer: Option<arrow_producer::StatsSnapshot>,
 }
 
 /// CPU seconds by thread-name group from /proc (Linux only; empty elsewhere).
@@ -281,7 +312,9 @@ fn thread_cpu() -> BTreeMap<String, f64> {
         let fields: Vec<&str> = stat[close + 2..].split_whitespace().collect();
         let ticks: f64 = fields.get(11).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0)
             + fields.get(12).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-        let group = if comm.starts_with("commit-blk") {
+        let group = if comm.starts_with("encoder") {
+            "encoder"
+        } else if comm.starts_with("commit-blk") {
             "commit_blocking"
         } else if comm.starts_with("commit") {
             "commit"
@@ -306,14 +339,14 @@ fn rss_mb() -> f64 {
         .map_or(0.0, |kb| kb / 1024.0)
 }
 
-async fn create_tables(urls: &[Url], props: &[(String, String)]) -> Result<()> {
+async fn create_tables(urls: &[Url], props: &[(String, String)], schema: table::TableSchema) -> Result<()> {
     let root = table::root_store(&urls[0])?;
     let results: Vec<Result<()>> = futures::stream::iter(urls.iter().cloned())
         .map(|url| {
             let root = Arc::clone(&root);
             let props = props.to_vec();
             async move {
-                match table::create(&url, root, &props).await {
+                match table::create(&url, root, &props, schema).await {
                     Ok(_) => Ok(()),
                     Err(error) if error.to_string().contains("already exists") => Ok(()),
                     Err(error) => Err(error.context(format!("creating {url}"))),
@@ -330,7 +363,11 @@ async fn run(args: RunArgs) -> Result<()> {
     let urls = args.tables.urls()?;
     let props = parse_props(&args.props)?;
     if args.create {
-        create_tables(&urls, &props).await?;
+        let schema = match args.producer {
+            ProducerKind::Small => table::TableSchema::Small,
+            ProducerKind::Arrow => table::TableSchema::Logs,
+        };
+        create_tables(&urls, &props, schema).await?;
     }
     let pacing = parse_pacing(&args.pacing)?;
     let root = table::root_store(&urls[0])?;
@@ -344,9 +381,21 @@ async fn run(args: RunArgs) -> Result<()> {
         std::fs::OpenOptions::new().create(true).append(true).open(&sent_path)?,
     ));
 
+    let arrow = if args.producer == ProducerKind::Arrow {
+        let (pool, info) = arrow_producer::BatchPool::generate(args.pool_mb << 20, args.batch_rows.max(1))?;
+        eprintln!("batch pool: {info:?}");
+        Some((Arc::new(pool), info, Arc::new(arrow_producer::ProducerStats::default())))
+    } else {
+        None
+    };
+
     let (record_tx, mut record_rx) = mpsc::unbounded_channel::<CommitRecord>();
     let mut out = std::io::BufWriter::new(std::fs::OpenOptions::new().create(true).append(true).open(&args.out)?);
-    writeln!(out, "{}", serde_json::json!({"kind": "run", "ts_ms": now_millis(), "tables": urls.len(), "args": &args}))?;
+    let mut run_record = serde_json::json!({"kind": "run", "ts_ms": now_millis(), "tables": urls.len(), "args": &args});
+    if let Some((_, info, _)) = &arrow {
+        run_record["pool"] = serde_json::to_value(info)?;
+    }
+    writeln!(out, "{run_record}")?;
     out.flush()?;
     let (sample_tx, mut sample_rx) = mpsc::unbounded_channel::<Sample>();
     let writer = tokio::spawn(async move {
@@ -454,6 +503,28 @@ async fn run(args: RunArgs) -> Result<()> {
             drop(record_tx);
             lp.run(rx).await
         }));
+        if let Some((pool, _, stats)) = &arrow {
+            let acfg = arrow_producer::ArrowConfig {
+                table_name: name,
+                encoders: args.encoders,
+                rate: args.rate,
+                duration: Duration::from_secs(args.duration),
+                file_bytes: args.file_mb << 20,
+                row_group_bytes: args.row_group_mb << 20,
+                part_bytes: (args.part_mb << 20).max(1),
+                upload_concurrency: args.upload_concurrency,
+            };
+            producers.push(tokio::spawn(arrow_producer::produce(
+                Arc::clone(&producer_store),
+                table_root(url)?,
+                acfg,
+                Arc::clone(pool),
+                tx,
+                Some(Arc::clone(&sent)),
+                Arc::clone(stats),
+            )));
+            continue;
+        }
         let pcfg = producer::ProducerConfig {
             table_name: name,
             encoders: args.encoders,
@@ -472,8 +543,11 @@ async fn run(args: RunArgs) -> Result<()> {
     }
     drop(record_tx);
 
+    let producer_stats = arrow.as_ref().map(|(_, _, stats)| Arc::clone(stats));
+    let start_stats = producer_stats.as_ref().map(|s| s.snapshot());
     let sampler = {
         let counters = Arc::clone(&producer_counters);
+        let producer_stats = producer_stats.clone();
         let period = Duration::from_secs(args.sample_secs.max(1));
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(period);
@@ -486,6 +560,7 @@ async fn run(args: RunArgs) -> Result<()> {
                         cpu_secs: thread_cpu(),
                         rss_mb: rss_mb(),
                         producer_storage: counters.snapshot(),
+                        producer: producer_stats.as_ref().map(|s| s.snapshot()),
                     })
                     .is_err()
                 {
@@ -499,6 +574,7 @@ async fn run(args: RunArgs) -> Result<()> {
     for p in producers {
         produced += p.await??;
     }
+    let produce_s = started.elapsed().as_secs_f64();
     let mut loop_errors = Vec::new();
     for l in loops {
         if let Err(error) = l.await? {
@@ -511,15 +587,20 @@ async fn run(args: RunArgs) -> Result<()> {
     let _ = driver.join();
     let _ = writer.await;
     let mut out = std::fs::OpenOptions::new().append(true).open(&args.out)?;
-    writeln!(
-        out,
-        "{}",
-        serde_json::json!({
-            "kind": "end", "ts_ms": now_millis(), "elapsed_s": elapsed.as_secs_f64(),
-            "files_produced": produced, "loop_errors": loop_errors,
-            "cpu_secs": thread_cpu(), "rss_mb": rss_mb(),
-        })
-    )?;
+    let mut end = serde_json::json!({
+        "kind": "end", "ts_ms": now_millis(), "elapsed_s": elapsed.as_secs_f64(),
+        "files_produced": produced, "loop_errors": loop_errors,
+        "cpu_secs": thread_cpu(), "rss_mb": rss_mb(),
+    });
+    if let Some(stats) = &producer_stats {
+        let snap = stats.snapshot();
+        end["producer"] = serde_json::to_value(&snap)?;
+        end["producer"]["produce_s"] = produce_s.into();
+        end["producer"]["encoders"] = args.encoders.into();
+        end["producer"]["nic_tx_delta_bytes"] =
+            start_stats.and_then(|s| Some(snap.nic_tx_bytes? - s.nic_tx_bytes?)).into();
+    }
+    writeln!(out, "{end}")?;
     eprintln!("done: {produced} files in {:.1}s, loop errors: {}", elapsed.as_secs_f64(), loop_errors.len());
     if !loop_errors.is_empty() {
         eprintln!("{loop_errors:#?}");
@@ -654,7 +735,9 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     match Cli::parse().command {
-        Command::Create(args) => create_tables(&args.tables.urls()?, &parse_props(&args.props)?).await,
+        Command::Create(args) => {
+            create_tables(&args.tables.urls()?, &parse_props(&args.props)?, table::TableSchema::Small).await
+        }
         Command::Run(args) => run(*args).await,
         Command::Check(args) => {
             let report = checker::check(&args.table_url, &args.wal_dir, &args.sent).await?;

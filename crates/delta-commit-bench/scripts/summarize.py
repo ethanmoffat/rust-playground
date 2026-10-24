@@ -87,7 +87,47 @@ def cell(d):
     if ck:
         row["checkpoint_ms"] = round(ck[0]["ms"], 1)
         row["checkpoint_bytes"] = ck[0].get("bytes")
+    prod = end.get("producer")
+    if prod:
+        row.update(arrow_columns(d, recs, prod, end))
     return row
+
+
+def arrow_columns(d, recs, prod, end):
+    """Throughput and encoder CPU for `--producer arrow` cells (GB = 1e9 bytes)."""
+    secs = prod["produce_s"] or float("nan")
+    enc = prod["encoders"]
+    samples = [r for r in recs if r.get("kind") == "sample" and r.get("producer")]
+    # Steady-state raw rate: median over sample intervals, dropping the first and last interval.
+    rates = [(b["producer"]["raw_bytes"] - a["producer"]["raw_bytes"]) / ((b["ts_ms"] - a["ts_ms"]) / 1000)
+             for a, b in zip(samples, samples[1:]) if b["ts_ms"] > a["ts_ms"]]
+    steady = rates[1:-1] or rates
+    # Encoder threads have exited by the end record; their CPU is accumulated in the producer stats.
+    enc_cpu = prod["encoder_cpu_exited_s"]
+    cpu = dict(end.get("cpu_secs") or {})
+    cpu["encoder"] = enc_cpu
+    nic = prod.get("nic_tx_delta_bytes")
+    info = lambda name: open(os.path.join(d, name)).read().strip() if os.path.exists(os.path.join(d, name)) else ""
+    return {
+        "vm_size": info("vmsize.txt"),
+        "nproc": info("nproc.txt"),
+        "encoders": enc,
+        "raw_GBps": round(prod["raw_bytes"] / secs / 1e9, 3),
+        "raw_GBps_steady": round(pct(steady, 50) / 1e9, 3) if steady else "",
+        "parquet_GBps": round(prod["parquet_bytes"] / secs / 1e9, 3),
+        "ratio": round(prod["raw_bytes"] / max(prod["parquet_bytes"], 1), 2),
+        "raw_GB": round(prod["raw_bytes"] / 1e9, 1),
+        "parquet_files": prod["files"],
+        "mean_file_MB": round(prod["parquet_bytes"] / max(prod["files"], 1) / 1e6, 1),
+        "enc_cpu_s": round(enc_cpu, 1),
+        "enc_util": round(enc_cpu / (enc * secs), 3) if enc else "",
+        "raw_MBps_per_enc_core": round(prod["raw_bytes"] / max(enc_cpu, 1e-9) / 1e6, 1),
+        "upload_wait_frac": round(prod["upload_wait_s"] / (enc * secs), 3) if enc else "",
+        "upload_errors": prod.get("upload_errors", ""),
+        "cpu_s": ";".join(f"{k}={v:.1f}" for k, v in sorted(cpu.items())),
+        "rss_max_mb": round(max([r["rss_mb"] for r in samples] or [end.get("rss_mb") or 0])),
+        "nic_tx_GBps": round(nic / secs / 1e9, 3) if nic is not None else "",
+    }
 
 
 def main():
