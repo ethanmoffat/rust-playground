@@ -35,3 +35,5 @@ if ($up.IndexOf('initialize-vscode.ps1') -lt 0 -or
     throw 'Up must check VS Code before invoking WSL.'
 }
 Write-Output 'VS Code preflight regression cases passed.'
+# GitHub's PowerShell wrapper propagates LASTEXITCODE, including deliberate mock failures.
+$global:LASTEXITCODE = 0
