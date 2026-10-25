@@ -1,0 +1,7 @@
+tables-1
+tables-100
+tables-1000
+cell,commits,commits_per_s,files,files_per_commit,commit_p50,commit_p99,commit_p999,vis_p50,vis_p99,vis_p999,lib_retries,conflicts,log_get_pc,log_head_pc,log_list_pc,log_put_pc,checkpoints,checkpoint_p50,cpu_s,rss_mb,upload_failed,outcomes,G1,G2,G3,G4,sent_not_accepted
+tables-1,60,0.2,60,1.0,67.0,130.0,166.6,67.0,130.0,167.0,0,0,2.02,0.0,2.0,1.0,1,1776.1,commit=0.1;other=0.0;producer=0.1,38.00390625,0,ok=60,True,True,True,True,
+tables-100,6000,19.67,6000,1.0,63.7,129.8,200.7,64.0,130.0,201.0,0,0,2.02,0.0,2.0,1.0,100,198.6,commit=44.3;other=0.1;producer=3.2,492.6953125,0,ok=6000,True,True,True,True,
+tables-1000,49000,,,1.0,83.9,925.8,1033.7,84.0,1069.0,3351.0,0,0,2.02,0.0,2.0,1.0,0,,,,0,ok=49000,,,,,
