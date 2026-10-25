@@ -2753,6 +2753,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "buoyant_kernel",
  "bytes",
  "clap",
  "deltalake-core",
