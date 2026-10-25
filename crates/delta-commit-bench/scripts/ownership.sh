@@ -13,16 +13,28 @@ WORK=${2:?work dir}
 shift 2
 SCEN=${*:-crash-before crash-after pause-inflight two-holders drain-load misroute-5 misroute-30 misroute-120 flip}
 EPOCHS=${EPOCHS:-tenure}
+# XFENCE=off drops cross-identity fencing (--infer-fence, --fence-identity). Same-identity epoch
+# claims stay. Scenario names get a -nox suffix.
+XFENCE=${XFENCE:-on}
+XSUF=$([ "$XFENCE" = off ] && echo -nox)
 HOT=${HOT:-1.2}
 DCB=${DCB:-$(dirname "$0")/../../../target/release/dcb}
 RUN_ID=${RUN_ID:-$(date +%s)}
 mkdir -p "$WORK"
 
-scenario() { local name=$1-$EPOCHS; mkdir -p "$WORK/$name"; D=$WORK/$name; T=$BASE/$RUN_ID-$name; N=$name; }
+scenario() { local name=$1-$EPOCHS${XSUF}; mkdir -p "$WORK/$name"; D=$WORK/$name; T=$BASE/$RUN_ID-$name; N=$name; }
 route() { echo "$1" >"$D/route"; echo "$(date +%s%3N) $1" >>"$D/route.log"; }
 # In a background subshell, exec so that $! is the dcb process and SIGSTOP pauses it.
 x() { if [ "$BASHPID" != "$$" ]; then exec "$@"; else "$@"; fi; }
-dcb() { x "$DCB" run --epochs "$EPOCHS" --checkpoint-every 50 --encoders 2 --route-file "$D/route" "$@"; }
+dcb() {
+  local a=()
+  while [ $# -gt 0 ]; do
+    if [ "$XFENCE" = off ] && [ "$1" = --infer-fence ]; then shift; continue; fi
+    if [ "$XFENCE" = off ] && [ "$1" = --fence-identity ]; then shift 2; continue; fi
+    a+=("$1"); shift
+  done
+  x "$DCB" run --epochs "$EPOCHS" --checkpoint-every 50 --encoders 2 --route-file "$D/route" "${a[@]}"
+}
 # A backlog builder: one file per commit with slowed log writes, so pending manifests pile up.
 backlog() { echo --rate 20 --max-files-per-commit 1 --fault-delay-ms 150 --fault-scope log; }
 check() {

@@ -1,6 +1,7 @@
 # Delta commit benchmark report
 
-Status: complete for the design questions in scope. The findings log at the end records every result in
+Status: complete for the design questions in scope, including the follow-up questions Q1 to Q4 on ArrowCol
+ownership, appId lifetime and manifest durability. The findings log at the end records every result in
 the order it was found, including bench defects and their fixes.
 
 ## Design summary
@@ -8,13 +9,15 @@ the order it was found, including bench defects and their fixes.
 | Question | Answer | Evidence |
 |---|---|---|
 | One commit loop per table (option C) | Supported. One loop sustains about 12.5 commits/s on flat and 10 on HNS, and group commit absorbs 160 times the hot-table file rate. A second writer adds contention with no throughput gain. | Exp 1, exp 5 |
-| Guarantees G1 to G4 | Hold in every cell on both accounts, including faults, zombies and identity changes, with `txn` idempotency, resolve-before-recommit, the fence and adoption. | Exp 1, 2, 3, 5, 7 |
-| Ownership moves | The fence is required. It is a Delta commit and needs no separate service. Ack/nack covers graceful moves only. | Exp 7, "Ownership moves" |
+| Guarantees G1 to G4 | Hold in every cell on both accounts, including faults, zombies and identity changes, with `txn` idempotency, resolve-before-recommit, the fence and adoption. Self-drain with tenure epochs also holds them (follow-up). G2 fails only through `txn` retention expiry or table recreation. | Exp 1, 2, 3, 5, 7, Q1 to Q3 |
+| Ownership moves | The fence is required when a new owner adopts the old owner's WAL. It is a Delta commit and needs no separate service. Ack/nack covers graceful moves only. With ArrowCol's per-instance WAL (T1, T2), each identity drains its own WAL under epoch claims, and cross-identity fencing is not needed for G1 to G4. | Exp 7, "Ownership moves", Q1, Q2, F24 |
+| Ownership detection | No router signal is needed. Inferred fencing works only with tenure epochs, and does not guarantee one owner. | Q2, F17, F24 |
+| appId and fence lifetime | 10,000 appIds cost no commit latency. Only `txn` retention and table recreation remove a fence. Leave retention unset and check `metaData.id`. | Q3, F18 to F20 |
 | Many tables in one process | Works only with a process-wide cap on concurrent Delta operations. Without it, delta-rs deadlocks the tokio blocking pool at the first checkpoint round (F14). A cap of 32 to 128 removes the deadlock with no commit p50 cost. | Exp 2, F14 |
 | Checkpoint timing | Stagger checkpoints across tables. Aligned checkpoints push visibility p99 to about 23 s at 1000 tables; staggered, 0.6 s on HNS. | Exp 2 F14 follow-up |
 | Ingest throughput per VM | Encode CPU is the limit. About 330 to 360 MB/s of raw input per physical core, 210 to 260 MB/s per vCPU past the physical core count. The 6 cores per GB/s planning number holds. NIC and commit loop are far from their limits. | Exp 3 |
 | Flat vs HNS | Same guarantees and ingest throughput. Flat commits about 35 to 45% faster at p50. | Exp 1, 2, 3 |
-| Per-table WAL | Costs disk syncs on every commit and must be readable by a new owner. It needs a low-latency device and shared placement or another recovery path. | F13, risks |
+| Per-table WAL | Per-commit fsyncs saturate at 1000 tables on Premium SSD v2 and ZRS. One group sync across tables, off the async workers, removes the WAL as the bottleneck, and manifests can share the data WAL's syncs. With self-drain the WAL does not need to be readable by another instance. | F13, Q4, F23 |
 | Table growth | Writer memory and commit latency grow with active file count. Compaction must bound it. | F12 |
 
 ## Setup
@@ -63,7 +66,8 @@ guarantee or a measured cost.
 
 ## Ownership moves: graceful and failure
 
-There are two kinds of ownership move. Each needs a different mechanism.
+There are two kinds of ownership move. Each needs a different mechanism. This section assumes the new
+owner can read the old owner's WAL. The follow-up (Q1, Q2) covers ArrowCol's per-instance WAL.
 
 **Graceful move.** The old owner X is alive and cooperative, for example during a rebalance or a rolling
 deploy. A DFE ack/nack handshake is enough:
@@ -102,6 +106,9 @@ commit loop, regardless of which core encoded them.
 | Concurrency safety | Holds for blind appends with distinct appIds. Contention costs latency and fairness. | Exp 5 (2 and 5 writers, both accounts). Exp 7 concurrent-optimize. |
 | One process commits for many tables | Holds with a process-wide cap on concurrent Delta operations and staggered checkpoints. Fails without the cap (F14). | Exp 2 and the F14 follow-up. |
 | Encode throughput meets 6 cores per GB/s | Holds on synthetic data. | Exp 3 on 16, 32 and 64 vCPU. |
+| Self-drain replaces fence-and-adopt for per-instance WALs | Holds. G1 to G4 in every Q1 scenario, including two holders of one WAL. | Q1 on local, flat and HNS. |
+| Inferred fencing keeps commits flowing under routing noise | Holds with tenure epochs. Fails G1 with one owner appId per identity (F17). | Q2. |
+| Group sync removes the WAL as the commit bottleneck | Holds on Premium SSD v2 and ZRS at 1000 tables. | Q4. |
 
 ## Experiment 7: failure injection (local, file://)
 
@@ -252,7 +259,9 @@ cell after 300 s without a new commit and saves a gdb dump. Variants:
 The commit cap covers table open and each commit. The checkpoint cap covers each checkpoint and the
 snapshot reload after it.
 
-**1000 tables (200 files/s offered).** Every completed cell committed all 120000 files and passes G1 to G4.
+**1000 tables (200 files/s offered).** Every completed cell committed all 120000 files and passes G2 to G4.
+The checker's G1 result in exp 2 was vacuous (F21). The run records support G1: the committed file count
+equals the offered file count in every completed cell.
 Summary: `results/exp2-f14/summary.csv`. Script: `results/exp2-f14/f14sum.py`.
 
 | Variant | Account | Commits/s | Commit p50 / p99 ms | Visibility p50 / p99 ms | Checkpoint p50 / p99 ms | Checkpoint permit wait p99 ms | Commit permit wait p99 ms | Max commit-runtime threads |
@@ -332,18 +341,261 @@ Every point passes G1 to G4.
 Caveats: synthetic data with plain strings. Production decode (Flight or DFE) also costs CPU and is not
 included. Aggregate ingress limits of the storage account were not tested.
 
+## Follow-up: ArrowCol ownership, appId lifetime and manifest durability
+
+The follow-up tests four questions against ArrowCol's design, which differs from the bench model above:
+
+- Each instance writes its WAL to its own volume (T1 locally redundant, T2 zone redundant). Another
+  instance cannot read it. After a failure the volume re-attaches to the restarted pod or to an adopter
+  pod. T3 uses a remote WAL that any instance can read.
+- Manifests go into Quiver, which group-commits across tables per core with one sync.
+- The router pins a table to one instance and gives the server no ownership signal.
+- The appId is `(instance identity, table)`.
+
+**Setup changes.** 2 x Standard_D16s_v5 in zone 1 (Premium SSD v2 needs a zonal VM). Each VM has a
+Premium SSD v2 64 GiB disk (3000 IOPS, 125 MB/s baseline) at `/mnt/pv2` and a Premium SSD ZRS P30 1 TiB
+disk at `/mnt/pzrs`, both with host caching off and ext4. Added crate: chrono 0.4.45 (for zero-retention
+VACUUM). Q1 and Q2 ran local (file://) and on both accounts. Q3 fence lifetime ran local only; it tests
+log semantics, which do not depend on storage. Q3 accumulation and Q4 ran on the flat account.
+
+**Bench additions.**
+
+| Addition | Flag or script |
+|---|---|
+| Epoch modes. `drain`: the owner commits under `(X, T)`, and only a drain claims an epoch (the follow-up as written). `tenure`: every ownership tenure and every drain claims a new epoch appId `(X, T, e)`. | `--epochs off\|drain\|tenure` |
+| Epoch claim: one commit that bumps the counter `(X, T)#epoch` and fences `(X, T)` and `(X, T, e_last)` | built into drain and acquire |
+| Inferred fencing: on the first routed file, fence the previous owner-kind committer found in the last `--scan-window` log entries | `--infer-fence` |
+| Router simulation: produce only while a route file names this instance | `--route-file` |
+| Self-drain only, no producer | `--drain-only` |
+| Group WAL: one process-wide append log, one `fdatasync` per batch on a dedicated thread, optional synthetic data appends through the same syncs | `--wal-sync group`, `--group-sync-ms`, `--data-wal-mbps` |
+| Fence lifetime tools | `seed-txn`, `txn-probe`, `cleanup-log`, `vacuum` subcommands |
+| Scenario scripts and summaries | `scripts/ownership.sh`, `scripts/own_sum.py`, `scripts/fencelife.sh`, `scripts/txnacc.sh`, `scripts/txnacc_sum.py`, `scripts/q4sum.py` |
+
+### Q1: who commits a failed pod's pending files
+
+Self-drain: Y fences `(X, T)` and commits only new files. X, restarted or replaced by an adopter with
+X's volume, claims a new epoch, resolves each pending manifest against the log, and recommits only
+what did not land. Y never reads X's WAL. Each scenario ran in drain and tenure mode.
+
+Summaries: `results/followup/local/ownership-fencelife.md`, `results/followup/azure/ownership-flat.md`,
+`results/followup/azure/ownership-hns.md`.
+
+| Scenario | G1 to G4 (local, flat, HNS; both modes) | X drain ms, tenure (local / flat / HNS) | Y first commit after switch ms, tenure (local / flat / HNS) |
+|---|---|---|---|
+| X crashes before its log PUT, Y fences, X restarts and drains | pass | 20 / 62 / 114 | 93 / 552 / 1553 |
+| X crashes after its log PUT | pass | 2 / 1 / 2 | 994 / 1403 / 679 |
+| X drains a backlog while Y commits at 1.2 files/s | pass | 10 / 1 / 2 | 834 / 597 / 951 |
+| Same at 12 files/s | pass | 2 / 2 / 1 | 121 / 452 / 787 |
+| X paused with a backlog and a commit in flight, Y fences, X resumes | pass | 4799 / 4572 / 2941 | 267 / 982 / 1127 |
+| Two holders: X paused, adopter A drains X's WAL, X resumes and drains the same WAL (A log delay 0, 100, 300 ms) | pass | 1390 to 4807 / 5022 to 5697 / 3333 to 6550 | 462 to 1272 / 292 to 502 / 489 to 1336 |
+
+Drain ms is the time from X's first claim to its last pending manifest committed. The backlog scenarios
+slow X's log writes by 150 ms, so their drain time measures the backlog. "Y first commit" includes Y's
+process start, table load, fence and claim.
+
+- **Self-drain keeps G1 to G4 in every scenario,** on both accounts and in both modes. No duplicates.
+- **Two holders of one WAL are safe without volume exclusivity.** X and A both claim epochs through the
+  same counter appId, and each claim fences the previous epoch appId. The two claims conflict in the
+  delta-rs conflict checker, so at most one holder commits under any epoch. Each holder resolves every
+  manifest against the log before recommitting. This needs the claim to fence the previous epoch even
+  when that epoch has no commits yet (F16).
+- **Epoch rule.** Epochs are per identity and table, numbered by the counter `(X, T)#epoch`. A claim
+  reads the counter, then commits counter + 1 together with fences on `(X, T)` and `(X, T, e_last)`.
+  Only the same identity claims its own epochs. A cross-identity fence names the other identity's
+  current epoch appId.
+- **Fence-and-adopt is needed only for T3.** T1 and T2 need no adoption.
+- **Pending data waits** for X's restart or volume re-attach, plus a drain of milliseconds (crash) to a
+  few seconds (large backlog).
+
+### Q2: how a new owner knows it should fence, and what a misroute costs
+
+Inferred fencing, measured with misroutes (T goes to Y for 5, 30 or 120 s, then back to X) and a rapid flip
+(T alternates every 1 s for 60 s). A third run turned cross-identity fencing off (`XFENCE=off`): no
+`--infer-fence`, no `--fence-identity`. Same-identity epoch claims stay. This run followed F24.
+
+Summaries: as Q1, plus `results/followup/local/ownership-nofence.md` and
+`results/followup/azure/ownership-flat-nofence.md`.
+
+| Scenario | Mode | G1 (local, flat, HNS) | Accepted files never committed | appIds | Switch lag ms local / flat / HNS (to Y, back to X) |
+|---|---|---|---|---|---|
+| Misroute 5 s | drain | FAIL | 198 to 200 | 4 | |
+| Misroute 30 s | drain | FAIL | 198 to 199 | 4 | |
+| Misroute 120 s | drain | FAIL | 195 to 198 | 4 | |
+| Flip | drain | FAIL | 497 to 501 | 4 | |
+| Misroute 5 s | tenure | pass | 0 | 6 | 74, 150 / 711, 202 / 797, 399 |
+| Misroute 30 s | tenure | pass | 0 | 6 | 51, 81 / 583, 315 / 1039, 373 |
+| Misroute 120 s | tenure | pass | 0 | 6 | 87, 301 / 658, 449 / 1079, 919 |
+| Flip | tenure | pass | 0 | 122 / 90 / 10 | p50 102 max 218 / p50 191 max 567 / p50 314 max 908 |
+| Misroute 5 s | no cross fence | pass (local, flat) | 0 | 4 | 136, 71 / 1018, 516 |
+| Misroute 30 s | no cross fence | pass (local, flat) | 0 | 4 | 179, 267 / 1286, 1729 |
+| Misroute 120 s | no cross fence | pass (local, flat) | 0 | 4 | 91, 631 / 1081, 7007 |
+| Flip | no cross fence | pass (local, flat) | 0 | 4 | p50 145 max 228 / p50 227 max 1340 |
+
+G2, G3 and G4 pass in every row. Switch lag is the time from the route change to the new side's first
+successful commit.
+
+- **Drain mode (the follow-up as written) loses data under routing noise** (F17). When T returns to X,
+  X's owner appId `(X, T)` is already fenced, so X can never commit new files under it again. The
+  files routed to X after the return stay in its WAL.
+- **Tenure epochs fix it.** Each switch costs one fence by the new side and one claim. A misroute costs
+  2 fences and 4 claims. Neither side is blocked longer than the switch lag. Pending data is drained by
+  the side that wrote it.
+- **Fences do not pile up.** Each switch adds about 2 epoch appIds. 60 switches added 90 to 122 appIds
+  (Q3 shows 10,000 cost little).
+- **Inferred fencing does not converge to one owner** (F24). In the HNS flip run, a file delayed by
+  upload latency reached X after Y claimed but before Y committed data. X found itself as the latest
+  committer, claimed without fencing Y, and both stayed owners for the last 55 s. G1 to G4 still held.
+- **Cross-identity fencing is not needed for G1 to G4 on T1 and T2.** With it off, every Q1 and Q2
+  scenario passes locally and on flat. X and Y commit disjoint files under disjoint appIds, which delta-rs
+  never treats as a conflict (exp 5). The claim that fences a WAL's previous holder is still needed; it is
+  same-identity. Without cross fences an instance that sat idle commits from a stale snapshot and pays a
+  conflict check over every commit it missed: 6.8 s and 1229 log GETs after 120 s idle on flat (F25).
+- **Router minimum: none** for correctness. A hint header would cut epoch churn and is optional.
+  Signaled assignment buys nothing for G1 to G4 on T1 and T2. T3 adoption still needs a fence on the
+  adopted identity, which the adopter applies explicitly.
+
+### Q3: appId and fence lifetime (experiment 8)
+
+**Accumulation.** One table with 0 to 10,000 extra appIds seeded as `txn` entries, then 10 files/s for
+60 s with a checkpoint every 50 versions. Summaries: `results/followup/local/txnacc.md`,
+`results/followup/azure/txnacc-flat.md`.
+
+| appIds | Commit p50 / p99 ms (local / flat) | Checkpoint ms p50 (local / flat) | Checkpoint bytes | Reader load ms p50 (local / flat) | Writer RSS MB max (local / flat) |
+|---|---|---|---|---|---|
+| 0 | 14 / 26, 40 / 99 | 73 / 193 | 68,600 | 5 / 102 | 56 / 148 |
+| 100 | 14 / 26, 42 / 85 | 72 / 211 | 71,079 | 7 / 123 | 44 / 134 |
+| 1,000 | 13 / 26, 40 / 81 | 79 / 181 | 83,355 to 83,763 | 7 / 122 | 48 / 173 |
+| 10,000 | 14 / 26, 42 / 91 | 91 / 208 | 219,110 to 219,120 | 13 / 129 | 52 / 166 |
+
+- 10,000 appIds leave commit latency unchanged. Each appId adds about 15 bytes to the checkpoint. Reader
+  load grows by 8 ms locally and 27 ms on flat. RSS varies by run more than by appId count.
+
+**Fence lifetime.** X crashes right after a log write with its manifest still pending. Y fences X. Then one
+mechanism removes or hides entries, and X restarts (or resumes, for `inproc`). Local, retention 10 and
+20 s. Summary: `results/followup/local/ownership-fencelife.md`.
+
+| Mechanism | Fence survives | Result, epochs off | Result, tenure | Reader effect |
+|---|---|---|---|---|
+| Checkpoint, then log cleanup deletes all earlier commits | yes (checkpoint keeps `txn`) | pass | pass | none |
+| OPTIMIZE (remove N, add 1) and a checkpoint | yes | pass | pass | none |
+| X stays running while retention expires, then resumes | no | G1 fails, 1 file stranded (off mode needs adoption; this scenario has none) | pass | none |
+| Retention expires, X restarts | no | G2 fails: X recommits its landed batch, then commits new files under its formerly fenced appId | G2 fails: X reclaims epoch 1 (the fenced epoch) and recommits | Same path twice in the log. The snapshot keeps one add. No duplicate rows. |
+| Retention expires, then checkpoint and log cleanup, X restarts | no | X recommits as above. The checker passes because cleanup deleted the original commit. | same | none |
+| OPTIMIZE removes X's batch, retention expires, X restarts | no | G2 fails | G2 fails | X re-adds a compacted file. Readers see its rows twice. |
+| Same, then VACUUM deletes the removed files | no | G2 and G4 fail | G2 and G4 fail | The re-added file no longer exists. Reads fail. |
+| Table deleted and recreated at the same path | no | X commits 4 batches into the new table | 3 batches | Old data appears in the new table. |
+
+- **What removes a fence:** only `txn` retention and table recreation. Checkpoints, log cleanup, OPTIMIZE
+  and VACUUM keep `txn` entries.
+- **The stale owner that stays running is protected regardless of retention.** Its snapshot predates
+  the fence, and the conflict checker sees the fence in the winning commits.
+- **A restarted owner is not protected.** Expiry removes both the fence and X's own last `txn` version,
+  so resolve-before-recommit cannot tell that the batch landed (F19).
+- **Retention also expires the epoch counter** (F18). Its last update changes only on a claim. With
+  10 s retention a claim reused epoch 1.
+
+### Q4: manifest durability with group sync
+
+Exp 2 at 100 and 1000 tables, 0.2 files/s per table, 300 s, commit cap 64, checkpoint cap 8, checkpoints
+on the async worker, aligned starts. The WAL is on the data disk. Modes: `per-commit` (the F13 WAL, a file
+per manifest with 3 fsyncs on the commit task), `group` (one process-wide log, one `fdatasync` per batch
+on a dedicated thread, `--group-sync-ms 0`), and `group` plus 20 MB/s of synthetic data appended through
+the same log. Summary: `results/followup/azure/q4.csv`.
+
+| Disk | Mode | Tables | Commits/s (offered 20 / 200 files/s) | Commit p50 / p99 ms | Visibility p50 / p99 ms | Sync p50 / p99 ms | Syncs/s | Manifests per sync | Disk util % | Write await ms |
+|---|---|---|---|---|---|---|---|---|---|---|
+| PSSD v2 | per-commit | 100 | 20 | 36 / 87 | 40 / 93 | | | | 10.6 | 1.05 |
+| PSSD v2 | per-commit | 1000 | 125.5 | 502 / 677 | 13367 / 17968 | | | | 63.6 | 1.83 |
+| PSSD v2 | group | 100 | 20 | 37 / 86 | 39 / 89 | 2.4 / 104 | 20 | 1.0 | 4.7 | 0.82 |
+| PSSD v2 | group | 1000 | 185.2 | 52 / 385 | 57 / 22135 | 2.3 / 5.2 | 162 | 1.1 | 35.9 | 0.74 |
+| PSSD v2 | group + data | 100 | 20 | 34 / 81 | 36 / 88 | 2.6 / 5.0 | 120 | 0.2 | 29.9 | 0.81 |
+| PSSD v2 | group + data | 1000 | 189.6 | 46 / 365 | 50 / 15719 | 2.3 / 4.2 | 243 | 0.8 | 58.2 | 0.76 |
+| PSSD ZRS | per-commit | 100 | 20 | 53 / 139 | 66 / 153 | | | | 36.7 | 2.84 |
+| PSSD ZRS | per-commit | 1000 | 51.9 | 1253 / 1600 | 37010 / 40422 | | | | 88.6 | 4.47 |
+| PSSD ZRS | group | 100 | 20 | 36 / 92 | 45 / 103 | 8.4 / 41 | 20 | 1.0 | 17.3 | 2.9 |
+| PSSD ZRS | group | 1000 | 188.8 | 47 / 348 | 61 / 18501 | 8.1 / 26 | 98 | 1.9 | 81.1 | 2.75 |
+| PSSD ZRS | group + data | 100 | 20 | 35 / 84 | 48 / 100 | 8.6 / 15 | 108 | 0.2 | 92.4 | 2.85 |
+| PSSD ZRS | group + data | 1000 | 190 | 43 / 370 | 57 / 15197 | 7.9 / 22 | 118 | 1.6 | 96.1 | 2.7 |
+
+Every cell passes G1 to G4. Commits/s at 1000 tables is below 200 in group cells because some commits
+carry 2 files; all 60,000 files committed. Per-commit cells at 1000 tables did not keep up (F23).
+
+- **Group sync removes the WAL as the commit bottleneck.** At 1000 tables, group cells match the exp 2
+  tmpfs cap64 cell on flat (187 commits/s, commit p50 46 ms) on both disks. Per-commit saturates at
+  125.5 commits/s on PSSD v2 and 51.9 on ZRS.
+- **This comparison changes two things at once:** the sync count (3 fsyncs per commit against 1 per
+  batch) and where the sync runs (the commit task against a dedicated thread). The bench does not
+  separate them.
+- **A ZRS sync costs about 3.5 times a PSSD v2 sync** (8 ms against 2.3 ms p50). Group commit absorbs it:
+  ZRS batches more manifests per sync (1.9 against 1.1), and commit latency is the same.
+- **A manifest can share the data's sync.** With 20 MB/s of data through the same log, most syncs carry
+  data and manifests ride on them (0.8 and 1.6 manifests per sync). Commit p50 did not rise. The commit
+  loop needs only the ack of the sync that covers its manifest. A dedicated sync per commit is not needed.
+- **Visibility p99 of 15 to 22 s** comes from aligned checkpoints, as in exp 2. Staggering fixes it.
+- The handoff between a persist core and a commit core was a channel to one sync thread here. Quiver's
+  per-core logs and cross-core wakeup latency were not measured.
+
+### G2 failure paths under the recommended design
+
+The recommended design is self-drain with tenure epochs, resolve-before-recommit and `txn` idempotency.
+
+| Path | How often | Reader effect | Detection | What closes it |
+|---|---|---|---|---|
+| `txn` retention expires before a crashed owner restarts, then it recommits a landed batch (F19) | Only if `delta.setTransactionRetentionDuration` is set and shorter than the outage | None while the file stays in the table | The same path added twice in the log | Leave retention unset, or set it far above the longest outage |
+| Same, after OPTIMIZE removed the batch | As above, plus a compaction in the window | Duplicate rows | Same path re-added after a remove | As above |
+| Same, after VACUUM deleted the file | As above, plus VACUUM in the window | Reads fail (G4) | Add of a missing file | As above |
+| Table deleted and recreated at the same path (F20) | Operator action | Old batches in the new table | `metaData.id` differs from the one in the manifest | Record the table id in each manifest and verify it at claim and before commit |
+| Client resends after a lost ack | Outside the commit loop | Duplicate rows | Client session id and sequence in the data | Client-side idempotency keys, deduplicated at ingest |
+| Library 5xx retry recommits a landed commit | Closed by `txn` | None | | Already closed |
+
+### Rules for the ArrowCol design doc
+
+**Recovery after pod failure**
+
+1. Each identity drains its own WAL. The restarted pod or the adopter with the volume claims a new epoch
+   and recommits only manifests the log does not show as landed.
+2. An epoch claim is one commit: counter `(X, T)#epoch` + 1, a fence on `(X, T)` and a fence on
+   `(X, T, e_last)`, even if `e_last` has no commits.
+3. Two holders of one volume need no exclusivity. Epoch claims serialize them.
+4. Fence-and-adopt applies only to T3.
+
+**Ownership detection**
+
+5. No router signal is needed. An instance commits for any table it receives files for.
+6. Use tenure epochs: every ownership tenure claims a new epoch. Never reuse a fenced owner appId.
+7. Cross-identity fencing is optional on T1 and T2. If it is kept, it must fence the other identity's
+   current epoch appId, and it does not guarantee a single owner.
+8. Refresh the snapshot before the first commit after an idle period.
+
+**Fence and appId lifetime**
+
+9. Leave `delta.setTransactionRetentionDuration` unset. If it must be set, make it far longer than the
+   longest outage plus the longest tenure.
+10. If retention is set, refresh the epoch counter on owner commits, or epochs get reused.
+11. Checkpoints, log cleanup, OPTIMIZE and VACUUM are safe for fences.
+12. Record `metaData.id` in each manifest. Verify it at claim and before each commit.
+13. Epoch appIds accumulate at about 2 per ownership switch. 10,000 cost about 150 KB of checkpoint and
+    no commit latency. Accept the growth, or retire them with a long retention.
+
+**Manifest durability**
+
+14. Group-sync manifests with the data WAL. One sync per batch, on a thread off the async workers.
+15. The commit loop waits for the ack of the sync that covers its manifest, then commits.
+16. Premium SSD v2 and Premium SSD ZRS both sustain 1000 tables with group sync. ZRS syncs take 3.5 times
+    longer and batch more.
+
 ## Experiments not run
 
 | Experiment | Reason |
 |---|---|
 | 4 (zombie writer) | Covered by the fence tests in exp 7 on both accounts. |
 | 6 | Out of scope for the design questions. |
-| 8 (appId expiry) | Implementation detail. Listed under open questions. |
 
 ## Recommendation
 
 1. **Adopt option C:** one commit loop per table, group commit, `txn` idempotency with
-   resolve-before-recommit, the fence on every ownership change, and adoption of the old owner's WAL.
+   resolve-before-recommit. For per-instance WALs (T1, T2), recover by self-drain with tenure epochs
+   (Q1, Q2). For T3, fence the old owner and adopt its WAL.
 2. **Cap concurrent Delta operations per process.** Size the commit cap with Little's law (commits/s
    times commit time, with headroom). 64 covers about 1000 commits/s at 50 ms. Use a separate small
    checkpoint cap. Keep the sum far below the tokio blocking pool limit (512 by default).
@@ -353,11 +605,14 @@ included. Aggregate ingress limits of the storage account were not tested.
    the cap in place this is not required for correctness.
 5. **Keep expired-log cleanup out of the commit path** (F8). Run it with table maintenance.
 6. **Bound the active file count with compaction** (F12).
-7. **Place the WAL on a low-latency device, sync off the async workers, and make it readable by a new
-   owner** (F13, WAL locality).
+7. **Group-sync manifests with the data WAL on a low-latency device, off the async workers** (F13, Q4).
 8. **Plan ingest at about 300 MB/s of raw input per physical core** plus decode cost. The commit loop and
    NIC are not the limits.
 9. **Choose the account type on product needs.** Both meet the guarantees. Flat commits faster.
+10. **Leave `delta.setTransactionRetentionDuration` unset and record `metaData.id` in each manifest**
+    (Q3, F19, F20).
+11. **Refresh the snapshot before committing after an idle period** (F25).
+12. **Follow the ArrowCol rules list** in the follow-up section.
 
 ## Repro
 
@@ -372,6 +627,11 @@ All scripts run on a bench VM with `~/dcb` and `~/scripts` from `scripts/infra.s
 | Exp 3 | `scripts/exp3.sh <account> <encoder counts...>` |
 | Exp 5 | `scripts/exp5.sh <account>` |
 | Exp 7 | `scripts/faults.sh <table-base-url> <work-dir> [rate] [duration]`, with an `abfss://` base (Azure) or a `file://` base (local) |
+| WAL data disks | `scripts/infra.sh disks`, then `scripts/infra.sh mountdisks <n>` |
+| Q1, Q2 | `EPOCHS=drain\|tenure [XFENCE=off] scripts/ownership.sh <table-base-url> <work-dir> [scenario...]`, then `python3 scripts/own_sum.py <work-dir>` |
+| Q3 fence lifetime | `EPOCHS=off\|tenure RET=10 scripts/fencelife.sh file:///tmp/fl /tmp/fl-work [scenario...]` |
+| Q3 accumulation | `scripts/txnacc.sh <table-base-url> <work-dir>`, then `python3 scripts/txnacc_sum.py <work-dir>` |
+| Q4 | `TAG=q4-<disk>-<mode> DUR=300 RATE=0.2 MAX_OPS=64 MAX_CKPT=8 EXEC=worker WAL_ROOT=/mnt/<disk> WAL_ARGS='--wal-sync group [--data-wal-mbps 20]' scripts/exp2.sh <account> 100 1000`, then `python3 scripts/q4sum.py results` |
 
 Raw run logs (`run.jsonl`) are not committed. Committed results are per-cell summaries, guarantee checks,
 progress logs and thread dumps.
@@ -381,13 +641,20 @@ progress logs and thread dumps.
 - Scan-log idempotency duplicates under the library's default retries. It is safe only with library
   retries off, and it cannot be fenced.
 - An identity change without adoption loses data.
-- WAL locality: adoption needs the new owner to read the old owner's WAL. If the WAL is on a pod's local
-  disk and the pod dies, its pending batches are lost. The WAL must be on shared storage, or the
-  uploaded files must be recoverable another way.
+- WAL locality: adoption needs the new owner to read the old owner's WAL. Self-drain (Q1) removes this
+  need for T1 and T2. Pending data then waits for the pod restart or volume re-attach. If the volume is
+  lost, its pending batches are lost.
 - Commit-loop cost grows with active file count (F12). Compaction must keep the hot table's file count
   bounded, or the writer's memory and commit latency grow without limit.
 - Orphan blobs: files uploaded but never committed (aborted uploads, fenced zombies) need cleanup.
-- appId expiry (exp 8): `txn` entries for retired appIds accumulate in the snapshot. Not measured.
+- appId accumulation (exp 8, Q3): 10,000 appIds cost no commit latency and about 150 KB of checkpoint.
+  Growth past that is not measured.
+- `txn` retention: anyone who sets `delta.setTransactionRetentionDuration` on a table reopens the G2 paths
+  in Q3. Treat it as a guarded table property.
+- Persist-core to commit-core handoff latency in Quiver is not measured (Q4).
+- Fence lifetime ran on file:// only. The log semantics it tests do not depend on storage.
+- Fresh ext4 data disks initialize inode tables in the background for a while after mount. It added about
+  45 MB/s of writes to the first ZRS per-commit cells (F26).
 - Process ceiling: one process with 1 commit worker delivered about 330 commits/s at 5000 tables. The
   limit's cause and how it scales with worker threads are not measured.
 - Blocking pool via DNS: new connections resolve DNS on a blocking thread. With the cap in place the pool
@@ -416,3 +683,14 @@ Each entry: what was observed, the evidence, and what changed.
 | F13 | The bench WAL makes 3 fsyncs per commit: manifest file, pending directory, and the directory again after release. It calls them synchronously inside the commit runtime's async tasks. On the 30 GB Premium SSD OS disk each fsync takes about 4 ms. With 1 commit thread, 1000 tables saturated at 68 commits/s (offered 200) with commit p50 14.6 s, while the process used about a third of a core. With 4 threads: 116 commits/s, and the disk sat at 95% utilization, about 1030 writes/s with 3.6 ms await. | Exp 2 on flat, WAL on the OS disk: `results/findings/f13-wal-disk/t1-osdisk/` (1 thread; the 5000-table cell also hit the 1024 fd limit) and `t4-osdisk/` (4 threads). `top -H` showed commit threads in D state. `iostat -dx` on VM4. Code: `src/wal.rs` `write` and `release`. | Exp 2 reruns with the WAL on tmpfs to measure the commit loop alone. Design implication: a durable per-table WAL costs disk syncs on every commit. Across many tables, the WAL device's sync latency and IOPS limit commits per pod before CPU does. The production WAL needs a low-latency device, sync calls off the async workers, and probably one group sync across tables. Where the WAL lives also decides whether a new owner can adopt it. |
 | F14 | Exp 2 at 1000 tables (flat, WAL on tmpfs, 1 commit worker) deadlocked permanently. Every table stopped at version 49, the commit just before its first checkpoint (`--checkpoint-every 50`). Mechanism, proven from the thread dump and source: (1) the commit runtime's blocking pool holds at most 512 + 1 threads (`max_blocking_threads` plus workers, tokio `builder.rs:2014`); (2) delta-rs runs each kernel snapshot build or update on a blocking thread, and inside it the kernel waits synchronously (`block_in_place` + channel `recv`) for async storage work on the runtime; (3) `create_checkpoint` calls the kernel's synchronous `Snapshot::checkpoint` directly on an async worker (`checkpoints.rs:43`); (4) blocking on a worker makes tokio hand that worker's scheduler to a new pool thread (`worker.rs:489`); (5) with the pool full, the handoff queues forever, no task on the runtime is polled again, and every blocked thread waits on a future that never runs. Request timeouts cannot fire because the same stalled scheduler owns them. Raising `max_blocking_threads` moves the threshold without removing it, because nothing in delta-rs bounds concurrent operations. | `results/findings/f14-blocking-pool-deadlock/`: gdb of all threads on VM4 after 12 hours. 513 `commit` threads, all in `block_in_place`; 24 of them are async workers inside `Snapshot::checkpoint`; the rest are pool threads in kernel snapshot builds (list, last-checkpoint hint, JSON reads). Commit-thread CPU frozen at 374.3 s from 02:55 to 15:07 UTC; stderr silent after 02:55:24 despite 30 s request timeouts. At 100 tables the pool never filled and the cell completed. An earlier DNS theory (connections queued behind the pool) is not supported: no thread was resolving. | Added `--max-ops`, `--max-checkpoints`, `--checkpoint-exec` and `--start-jitter-ms`, plus a stall watchdog in `exp2.sh`. The follow-up (exp 2) reproduced the deadlock on both accounts, showed that a cap of 32 to 128 alone prevents it at no commit p50 cost, and that `spawn_blocking` checkpoints alone avoid it but stall commits for about 60 s per checkpoint round. Design implication: a process-wide cap on concurrent Delta operations is required, and checkpoints should be staggered. |
 | F15 | Exp 3 NIC throughput was double counted. With accelerated networking, the VF interface (`enP*`) is enslaved to `eth0`, and both report the same bytes. | `/sys/class/net/<if>/master` exists for the VF. Halved NIC numbers match the Parquet output rate (1.96 GB/s at 64 vCPU). | `nic_tx_bytes` skips enslaved interfaces. Exp 3 ran with the old binary, so the report halves its NIC column. |
+| F16 | An epoch claim that skips fencing an empty previous epoch lets two holders of one WAL commit under the same epoch. Holder A claims e2 and has not committed yet. Holder X reads the counter, sees e2 has no `txn`, and claims e3 without naming e2. A's first commit under e2 then does not conflict with X's claim. | Local two-holders runs during development. The pre-fix runs were not kept. | A claim always fences `(X, T)` and `(X, T, e_last)`, even when `e_last` has no commits. Naming the appId makes A's commit and X's claim conflict in the delta-rs checker. |
+| F17 | With one owner appId per identity (drain mode, the follow-up as written), inferred fencing loses data under routing noise. Y fences `(X, T)`. When T's traffic returns to X, X cannot commit under its fenced owner appId, and drains claim epochs only for pending data. New files routed to X stay in its WAL. | Q2, local and both accounts: G1 fails in every misroute and flip run with 195 to 501 files stranded. Tenure mode passes every run. | Tenure epochs: every ownership tenure claims a new epoch appId. |
+| F18 | `txn` retention also expires the epoch counter. Its last update changes only on a claim. After expiry the next claim starts again at epoch 1 and reuses a fenced epoch appId. | Q3 `restart-ret-tenure` at retention 10 s: the end probe shows `#e1` unfenced at version 18 and the counter back at epoch 1. | Leave retention unset, or refresh the counter on owner commits. |
+| F19 | When `txn` retention expires before a crashed owner restarts, the fence and the owner's own last `txn` version are both gone. Resolve-before-recommit cannot see that the pending batch landed, and the owner recommits it. Same path: readers see no duplicate. After OPTIMIZE removed the batch, the re-add duplicates rows. After VACUUM deleted it, the table points at a missing file. In epochs-off mode the restarted owner also commits new files under its formerly fenced appId. | Q3 fencelife `restart-ret`, `restart-ret-optimize`, `restart-ret-vacuum`, `restart-cleanup-ret` in both modes. A stale owner that stays running is protected: its snapshot predates the fence, and the conflict checker sees the fence in the winning commits (`inproc-ret-tenure` passes). | Rule: leave `delta.setTransactionRetentionDuration` unset. |
+| F20 | Deleting and recreating a table at the same path erases every fence. A restarted owner then commits its old pending batches into the new table. | Q3 `recreate`: 4 commits (off) and 3 (tenure) by the restarted owner into the new table. | Rule: record `metaData.id` in each manifest and verify it at claim and before commit. |
+| F21 | Checker defects. (1) In exp 2 the checker found no manifests under the per-table WAL directories, so its accepted set was empty and G1 passed vacuously. (2) After log cleanup deleted early commits, active files had no surviving add and counted as missing. | exp2.sh passes each table's own WAL directory. The checker treated it as a root of per-appId directories and looked one level too deep, so it read no manifests. The committed exp 2 check files hold only the aggregate verdicts. Q3 cleanup scenarios showed (2). | Fixed in 9abe348. The checker reads per-appId and group WALs, and counts snapshot-only paths as committed when the log is truncated (duplicates among deleted commits stay invisible). Exp 2 G1 rests on run-record file counts. Q4 check files have non-zero manifests. |
+| F22 | `kill -STOP $X` in the scenario scripts paused the bash subshell, which left dcb running. Early pause scenarios therefore tested nothing. | In the scripts, `$!` was the PID of the bash subshell that ran dcb. After the fix it is the dcb PID. | Scripts exec dcb inside the background subshell, so `$!` is the dcb process. Pause-inflight, two-holders and inproc-ret were rerun. |
+| F23 | The per-commit WAL (F13) saturates at 1000 tables on data disks as well as the OS disk. 125.5 commits/s on Premium SSD v2 and 51.9 on Premium SSD ZRS, against 200 files/s offered, with commit p50 of 0.5 and 1.25 s. | Q4 per-commit cells. | Group sync: 185 to 190 commits/s on both disks with commit p50 43 to 52 ms. |
+| F24 | Inferred fencing does not converge to one owner. If a file delayed by upload latency reaches X after Y claims but before Y commits data, X finds itself as the latest committer and claims without fencing Y. Neither side is fenced again, because fencing happens only on acquire. G1 to G4 still hold: X and Y commit disjoint files under disjoint appIds. | HNS flip-tenure: 10 appIds against 90 on flat; both sides committed about 40 times per 10 s for the last 55 s with no fence. A run with cross-identity fencing off passes every Q1 and Q2 scenario locally and on flat. | Cross-identity fencing is optional on T1 and T2. The same-identity epoch claim stays required. |
+| F25 | A commit loop that sat idle commits from a stale snapshot. delta-rs then conflict-checks every commit since its base version, one log GET each. | Q2 misroute-120 with cross-identity fencing off, flat: X's first commit after 120 s idle was 1142 versions behind, made 1229 log GETs and took 6.8 s. With fencing, acquire refreshes the snapshot first and the same switch took 0.45 s. | Rule: refresh the snapshot before the first commit after an idle period. |
+| F26 | A freshly formatted ext4 data disk initializes inode tables in the background after mount. On the 1 TiB ZRS disk this added about 45 MB/s of writes during the first Q4 cells. | Q4 ZRS per-commit at 100 tables: 45.8 MB/s written and 46% utilization for 20 commits/s. The rerun: 1.8 MB/s and 37%. At 1000 tables the rerun changed commits/s from 48.1 to 51.9. | Report uses the rerun. Format bench disks with `lazy_itable_init=0` or wait for init to finish. |
