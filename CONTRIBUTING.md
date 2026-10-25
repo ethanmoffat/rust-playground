@@ -47,6 +47,12 @@ CI uses the same development environment.
    run `task --taskfile dev/bootstrap-dev-env.yaml up` instead; it keeps WSL
    and reopens the devcontainer.
 
+   Both paths verify the VS Code CLI and required extensions before changing
+   WSL or Docker. CLI and extension failures stop the bootstrap immediately.
+   Repair or reinstall VS Code if this preflight fails; when using
+   repo-bootstrapper, its prerequisite step automatically repairs a broken CLI
+   before invoking this Taskfile.
+
    The devcontainer initialization creates the host credential directories
    used for the read/write mounts at `~/.azure` and `~/.config/gh`.
    Repository dependencies are installed inside the container by its
@@ -69,6 +75,13 @@ CI uses the same development environment.
    credential directories. Never copy either directory into the repository.
 
 ## Verify changes
+
+The Windows bootstrap preflight has non-destructive regression checks that
+mock the VS Code CLI. Run them on the Windows host with PowerShell 7:
+
+```powershell
+pwsh -NoProfile -NonInteractive -File dev/initialize-vscode.Tests.ps1
+```
 
 Run checks inside the devcontainer:
 

@@ -17,6 +17,7 @@ tasks:
     desc: Bootstrap the existing WSL clone, start its devcontainer, and open VS Code (use after a restart)
     platforms: [windows]
     cmds:
+      - pwsh -NoProfile -NonInteractive -File initialize-vscode.ps1
       - wsl -d {{.DISTRO}} --cd {{.REPO}} --exec ./dev/bootstrap-dev-env.sh
       - wsl -d {{.DISTRO}} --cd {{.REPO}} --exec npm ci
       # These labels match the ones VS Code uses, so VS Code attaches to this container instead of creating another.
