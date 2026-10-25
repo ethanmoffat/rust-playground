@@ -18,19 +18,7 @@ param(
     [string]$LinuxUser = ($env:USERNAME.ToLower() -replace '[^a-z0-9_-]', '')
 )
 
-$BLOCKLISTED_SLOW_PERF_EXTENSIONS = @(
-    "Microsoft.wavework"
-)
-$installedExtensions = @(code --list-extensions)
-foreach ($extension in $BLOCKLISTED_SLOW_PERF_EXTENSIONS) {
-    if ($extension -in $installedExtensions) {
-        Write-Host "Uninstalling blocklisted VS Code extension: $extension"
-        code --uninstall-extension $extension
-    }
-}
-
-code --install-extension ms-vscode-remote.remote-wsl
-code --install-extension ms-vscode-remote.remote-containers
+. (Join-Path $PSScriptRoot 'initialize-vscode.ps1')
 
 if ($PSVersionTable.PSVersion.Major -lt 7) {
     Write-Error "This script requires PowerShell 7+. You are running PowerShell $($PSVersionTable.PSVersion).`nTo launch PowerShell 7 as Administrator:`n  Start Menu > search 'pwsh' > right-click 'PowerShell 7' > 'Run as administrator'"

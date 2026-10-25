@@ -15,6 +15,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  bootstrap-preflight:
+    name: Windows bootstrap preflight
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify VS Code failures stop bootstrap
+        shell: pwsh
+        run: ./dev/initialize-vscode.Tests.ps1
+
   plan:
     name: Discover independent Nx checks
     runs-on: ubuntu-24.04
@@ -249,7 +260,7 @@ jobs:
 
   verify:
     name: Verify in source devcontainer
-    needs: [plan, environment, node, images, rust, reader, e2e]
+    needs: [bootstrap-preflight, plan, environment, node, images, rust, reader, e2e]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
