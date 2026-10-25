@@ -2755,6 +2755,7 @@ dependencies = [
  "async-trait",
  "buoyant_kernel",
  "bytes",
+ "chrono",
  "clap",
  "deltalake-core",
  "futures",

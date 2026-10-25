@@ -25,6 +25,10 @@ pub struct CheckReport {
     pub log_add_actions: u64,
     pub log_unique_added_paths: usize,
     pub log_removed_paths: usize,
+    /// Commit JSON before the oldest checkpoint was deleted. Active paths with no surviving add
+    /// count as committed for G1; duplicates among deleted commits cannot be seen.
+    pub log_truncated: bool,
+    pub snapshot_only_paths: usize,
     pub txn_app_ids: BTreeMap<String, i64>,
     pub manifests: usize,
     pub manifests_pending: usize,
@@ -53,11 +57,18 @@ fn parse_version(path: &Path) -> Option<u64> {
 }
 
 /// Run the checker. `wal_roots` hold manifests of every committer; `sent_logs` hold sent files.
-pub async fn check(url: &Url, wal_roots: &[std::path::PathBuf], sent_logs: &[std::path::PathBuf]) -> Result<CheckReport> {
+pub async fn check(
+    url: &Url,
+    wal_roots: &[std::path::PathBuf],
+    sent_logs: &[std::path::PathBuf],
+) -> Result<CheckReport> {
     let root = table::root_store(url)?;
     let prefix = Path::from_url_path(url.path())?;
     let log_prefix = Path::from(format!("{}/_delta_log", prefix.as_ref()));
-    let mut report = CheckReport { table: url.to_string(), ..CheckReport::default() };
+    let mut report = CheckReport {
+        table: url.to_string(),
+        ..CheckReport::default()
+    };
 
     let commits: Vec<(u64, Path)> = root
         .list(Some(&log_prefix))
@@ -65,6 +76,7 @@ pub async fn check(url: &Url, wal_roots: &[std::path::PathBuf], sent_logs: &[std
         .try_collect()
         .await?;
     report.log_commits = commits.len() as u64;
+    report.log_truncated = !commits.iter().any(|(v, _)| *v == 0);
     let bodies: Vec<(u64, bytes::Bytes)> = futures::stream::iter(commits)
         .map(|(version, path)| {
             let root = Arc::clone(&root);
@@ -117,6 +129,14 @@ pub async fn check(url: &Url, wal_roots: &[std::path::PathBuf], sent_logs: &[std
             match table::active_paths(&bench.table) {
                 Ok(active) => {
                     report.snapshot_files = active.len();
+                    if report.log_truncated {
+                        for path in &active {
+                            if !adds.contains_key(path) {
+                                report.snapshot_only_paths += 1;
+                                adds.insert(path.clone(), vec![u64::MAX]);
+                            }
+                        }
+                    }
                     let missing: Vec<String> = futures::stream::iter(active)
                         .map(|rel| {
                             let root = Arc::clone(&root);
@@ -138,11 +158,19 @@ pub async fn check(url: &Url, wal_roots: &[std::path::PathBuf], sent_logs: &[std
     let mut manifests: Vec<Manifest> = Vec::new();
     for root in wal_roots {
         manifests.extend(all_manifests(root)?);
+        report.manifests_pending += crate::wal::group_pending(root)?;
         if let Ok(entries) = std::fs::read_dir(root) {
             for entry in entries.flatten() {
-                let pending = entry.path().join("pending");
+                let pending = if entry.file_name() == "pending" {
+                    entry.path()
+                } else {
+                    entry.path().join("pending")
+                };
                 if let Ok(p) = std::fs::read_dir(pending) {
-                    report.manifests_pending += p.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "json")).count();
+                    report.manifests_pending += p
+                        .flatten()
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                        .count();
                 }
             }
         }
@@ -150,10 +178,15 @@ pub async fn check(url: &Url, wal_roots: &[std::path::PathBuf], sent_logs: &[std
     report.manifests = manifests.len();
     let mut accepted: BTreeSet<String> = BTreeSet::new();
     for manifest in &manifests {
-        let versions: BTreeSet<Option<u64>> =
-            manifest.files.iter().map(|f| adds.get(&f.path).and_then(|v| v.first().copied())).collect();
+        let versions: BTreeSet<Option<u64>> = manifest
+            .files
+            .iter()
+            .map(|f| adds.get(&f.path).and_then(|v| v.first().copied()))
+            .collect();
         if versions.len() > 1 {
-            report.split_manifests.push(format!("{}@{}: {versions:?}", manifest.app_id, manifest.version));
+            report
+                .split_manifests
+                .push(format!("{}@{}: {versions:?}", manifest.app_id, manifest.version));
         }
         accepted.extend(manifest.files.iter().map(|f| f.path.clone()));
     }

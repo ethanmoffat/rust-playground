@@ -53,7 +53,11 @@ pub struct ArrowConfig {
 pub fn logs_schema() -> SchemaRef {
     let utf8 = |name: &str| Field::new(name, DataType::Utf8, false);
     Arc::new(Schema::new(vec![
-        Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
         utf8("service"),
         utf8("host"),
         utf8("region"),
@@ -116,17 +120,19 @@ impl BatchPool {
         let mut batches: Vec<(usize, RecordBatch, u64)> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..threads)
                 .map(|_| {
-                    std::thread::Builder::new().name("pool-gen".to_owned()).spawn_scoped(s, || {
-                        let mut out = Vec::new();
-                        while total.load(Ordering::Relaxed) < target_bytes {
-                            let i = seq.fetch_add(1, Ordering::Relaxed);
-                            let batch = log_batch(i as u64, batch_rows, base_us)?;
-                            let raw = raw_bytes(&batch);
-                            total.fetch_add(raw, Ordering::Relaxed);
-                            out.push((i, batch, raw));
-                        }
-                        Ok::<_, anyhow::Error>(out)
-                    })
+                    std::thread::Builder::new()
+                        .name("pool-gen".to_owned())
+                        .spawn_scoped(s, || {
+                            let mut out = Vec::new();
+                            while total.load(Ordering::Relaxed) < target_bytes {
+                                let i = seq.fetch_add(1, Ordering::Relaxed);
+                                let batch = log_batch(i as u64, batch_rows, base_us)?;
+                                let raw = raw_bytes(&batch);
+                                total.fetch_add(raw, Ordering::Relaxed);
+                                out.push((i, batch, raw));
+                            }
+                            Ok::<_, anyhow::Error>(out)
+                        })
                 })
                 .collect::<std::io::Result<_>>()?;
             let mut all = Vec::new();
@@ -143,7 +149,12 @@ impl BatchPool {
             allocated_bytes: batches.iter().map(|(_, b, _)| b.get_array_memory_size() as u64).sum(),
             generate_s: started.elapsed().as_secs_f64(),
         };
-        Ok((Self { batches: batches.into_iter().map(|(_, b, r)| (b, r)).collect() }, info))
+        Ok((
+            Self {
+                batches: batches.into_iter().map(|(_, b, r)| (b, r)).collect(),
+            },
+            info,
+        ))
     }
 
     fn get(&self, i: usize) -> &(RecordBatch, u64) {
@@ -152,23 +163,60 @@ impl BatchPool {
 }
 
 fn raw_bytes(batch: &RecordBatch) -> u64 {
-    batch.columns().iter().map(|c| c.to_data().get_slice_memory_size().unwrap_or(0) as u64).sum()
+    batch
+        .columns()
+        .iter()
+        .map(|c| c.to_data().get_slice_memory_size().unwrap_or(0) as u64)
+        .sum()
 }
 
 const SERVICES: &[&str] = &[
-    "checkout-api", "cart-svc", "payments", "auth-gateway", "search-query", "ingest-worker", "billing",
-    "inventory", "shipping", "notifications", "user-profile", "recommendations", "ads-serving", "media-transcode",
-    "edge-proxy", "metrics-agent", "scheduler", "kv-store", "feature-flags", "audit-log",
+    "checkout-api",
+    "cart-svc",
+    "payments",
+    "auth-gateway",
+    "search-query",
+    "ingest-worker",
+    "billing",
+    "inventory",
+    "shipping",
+    "notifications",
+    "user-profile",
+    "recommendations",
+    "ads-serving",
+    "media-transcode",
+    "edge-proxy",
+    "metrics-agent",
+    "scheduler",
+    "kv-store",
+    "feature-flags",
+    "audit-log",
 ];
 const REGIONS: &[&str] = &[
-    "eastus", "eastus2", "westus2", "westus3", "centralus", "northeurope", "westeurope", "uksouth", "japaneast",
+    "eastus",
+    "eastus2",
+    "westus2",
+    "westus3",
+    "centralus",
+    "northeurope",
+    "westeurope",
+    "uksouth",
+    "japaneast",
     "southeastasia",
 ];
 const LEVELS: &[(&str, u32)] = &[("INFO", 80), ("DEBUG", 10), ("WARN", 6), ("ERROR", 3), ("TRACE", 1)];
 const STATUS: &[(i32, u32)] = &[(200, 82), (201, 5), (204, 4), (400, 3), (404, 3), (500, 2), (503, 1)];
 const ROUTES: &[&str] = &[
-    "/api/v1/orders", "/api/v1/cart", "/api/v2/search", "/api/v1/users", "/healthz", "/api/v1/payments",
-    "/api/v1/items", "/internal/flush", "/api/v3/recommend", "/api/v1/session",
+    "/api/v1/orders",
+    "/api/v1/cart",
+    "/api/v2/search",
+    "/api/v1/users",
+    "/healthz",
+    "/api/v1/payments",
+    "/api/v1/items",
+    "/internal/flush",
+    "/api/v3/recommend",
+    "/api/v1/session",
 ];
 const METHODS: &[&str] = &["GET", "GET", "GET", "POST", "PUT", "DELETE"];
 const TIERS: &[&str] = &["free", "basic", "gold", "platinum"];
@@ -188,7 +236,11 @@ fn weighted<T: Copy>(rng: &mut StdRng, items: &[(T, u32)]) -> T {
 /// Index skewed towards small values, like real per-service traffic.
 fn skewed(rng: &mut StdRng, n: usize) -> usize {
     let u: f64 = rng.random();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     let i = (u * u * n as f64) as usize;
     i.min(n - 1)
 }
@@ -221,7 +273,12 @@ fn log_batch(seed: u64, rows: usize, base_us: i64) -> Result<RecordBatch> {
         service.append_value(svc);
         let region_i = skewed(&mut rng, REGIONS.len());
         line.clear();
-        write!(line, "{svc}-{:04x}.{}.prod.internal", rng.random_range(0..50u32), REGIONS[region_i])?;
+        write!(
+            line,
+            "{svc}-{:04x}.{}.prod.internal",
+            rng.random_range(0..50u32),
+            REGIONS[region_i]
+        )?;
         host.append_value(&line);
         region.append_value(REGIONS[region_i]);
         let lvl = weighted(&mut rng, LEVELS);
@@ -386,7 +443,9 @@ fn nic_tx_bytes() -> Option<u64> {
 
 /// CPU seconds of the calling thread (Linux only).
 fn own_thread_cpu_s() -> f64 {
-    let Ok(stat) = std::fs::read_to_string("/proc/thread-self/stat") else { return 0.0 };
+    let Ok(stat) = std::fs::read_to_string("/proc/thread-self/stat") else {
+        return 0.0;
+    };
     let Some(close) = stat.rfind(')') else { return 0.0 };
     let fields: Vec<&str> = stat[close + 2..].split_whitespace().collect();
     let ticks = |i: usize| fields.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
@@ -560,7 +619,11 @@ impl Encoder {
         let finish_start = Instant::now();
         let (mut upload, uploaded) = self.handle.block_on(uploader).context("uploader task")?;
         let completed = match (encode_error, uploaded) {
-            (None, Ok(())) => self.handle.block_on(upload.complete()).map(|_| ()).map_err(anyhow::Error::from),
+            (None, Ok(())) => self
+                .handle
+                .block_on(upload.complete())
+                .map(|_| ())
+                .map_err(anyhow::Error::from),
             (_, Err(error)) => Err(error.into()),
             (Some(error), Ok(())) => Err(error.context("encode failed")),
         };
@@ -570,7 +633,9 @@ impl Encoder {
         }
         wait += finish_start.elapsed();
         self.stats.files.fetch_add(1, Ordering::Relaxed);
-        self.stats.upload_wait_us.fetch_add(u64::try_from(wait.as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        self.stats
+            .upload_wait_us
+            .fetch_add(u64::try_from(wait.as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
         Ok(FileReady {
             path: rel,
             size: i64::try_from(size)?,
@@ -622,46 +687,50 @@ pub async fn produce(
         };
         let tx = tx.clone();
         let sent = sent.clone();
-        threads.push(std::thread::Builder::new().name(format!("encoder-{index}")).spawn(move || {
-            let cpu_start = own_thread_cpu_s();
-            let period = (encoder.cfg.rate > 0.0)
-                .then(|| Duration::from_secs_f64(encoder.cfg.encoders as f64 / encoder.cfg.rate));
-            let mut next = Instant::now() + period.map_or(Duration::ZERO, |p| p.mul_f64(rand::random::<f64>()));
-            let mut produced = 0u64;
-            let mut seq = 0u64;
-            loop {
-                if let Some(period) = period {
-                    std::thread::sleep(next.saturating_duration_since(Instant::now()));
-                    next += period;
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
-                seq += 1;
-                let file = match encoder.encode_file(seq, deadline) {
-                    Ok(file) => file,
-                    Err(error) => {
-                        encoder.stats.upload_errors.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(%error, "upload failed");
-                        continue;
+        threads.push(
+            std::thread::Builder::new()
+                .name(format!("encoder-{index}"))
+                .spawn(move || {
+                    let cpu_start = own_thread_cpu_s();
+                    let period = (encoder.cfg.rate > 0.0)
+                        .then(|| Duration::from_secs_f64(encoder.cfg.encoders as f64 / encoder.cfg.rate));
+                    let mut next = Instant::now() + period.map_or(Duration::ZERO, |p| p.mul_f64(rand::random::<f64>()));
+                    let mut produced = 0u64;
+                    let mut seq = 0u64;
+                    loop {
+                        if let Some(period) = period {
+                            std::thread::sleep(next.saturating_duration_since(Instant::now()));
+                            next += period;
+                        }
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        seq += 1;
+                        let file = match encoder.encode_file(seq, deadline) {
+                            Ok(file) => file,
+                            Err(error) => {
+                                encoder.stats.upload_errors.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(%error, "upload failed");
+                                continue;
+                            }
+                        };
+                        if let Some(sent) = &sent
+                            && let Ok(line) = serde_json::to_string(&file)
+                            && let Ok(mut f) = sent.lock()
+                        {
+                            let _ = writeln!(f, "{line}");
+                        }
+                        if tx.blocking_send(file).is_err() {
+                            break;
+                        }
+                        produced += 1;
                     }
-                };
-                if let Some(sent) = &sent
-                    && let Ok(line) = serde_json::to_string(&file)
-                    && let Ok(mut f) = sent.lock()
-                {
-                    let _ = writeln!(f, "{line}");
-                }
-                if tx.blocking_send(file).is_err() {
-                    break;
-                }
-                produced += 1;
-            }
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let cpu_ms = ((own_thread_cpu_s() - cpu_start) * 1000.0) as u64;
-            encoder.stats.encoder_cpu_ms.fetch_add(cpu_ms, Ordering::Relaxed);
-            produced
-        })?);
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let cpu_ms = ((own_thread_cpu_s() - cpu_start) * 1000.0) as u64;
+                    encoder.stats.encoder_cpu_ms.fetch_add(cpu_ms, Ordering::Relaxed);
+                    produced
+                })?,
+        );
     }
     drop(tx);
     tokio::task::spawn_blocking(move || {

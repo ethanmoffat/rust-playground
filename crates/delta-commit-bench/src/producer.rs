@@ -21,6 +21,12 @@ pub struct ProducerConfig {
     pub rows: usize,
     pub multipart: bool,
     pub duration: Duration,
+    /// Router simulation: produce only while the file at `.0` contains `.1`.
+    pub route: Option<(std::path::PathBuf, String)>,
+}
+
+fn routed_here(route: Option<&(std::path::PathBuf, String)>) -> bool {
+    route.is_none_or(|(file, id)| std::fs::read_to_string(file).is_ok_and(|s| s.trim() == id))
 }
 
 /// Shared log of every file-ready message sent (input to the checker).
@@ -58,6 +64,9 @@ pub async fn produce(
                 interval.tick().await;
                 if tokio::time::Instant::now() >= deadline {
                     break;
+                }
+                if !routed_here(cfg.route.as_ref()) {
+                    continue;
                 }
                 let rows = i64::try_from(cfg.rows).unwrap_or(0);
                 let first = NEXT_ID.fetch_add(rows, Ordering::Relaxed);

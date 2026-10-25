@@ -89,7 +89,12 @@ pub async fn open(url: &Url, root: Arc<dyn ObjectStore>, faults: Arc<FaultPlan>)
 
 /// Active data file paths relative to the table root.
 pub fn active_paths(table: &DeltaTable) -> Result<Vec<String>> {
-    Ok(table.snapshot()?.log_data().into_iter().map(|f| f.object_store_path().to_string()).collect())
+    Ok(table
+        .snapshot()?
+        .log_data()
+        .into_iter()
+        .map(|f| f.object_store_path().to_string())
+        .collect())
 }
 
 /// Open with retries, for loops that must survive transient storage errors at startup.
@@ -114,7 +119,11 @@ pub async fn open_with_retry(url: &Url, root: Arc<dyn ObjectStore>, faults: Arc<
 pub fn arrow_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", ArrowType::Int64, false),
-        Field::new("ts", ArrowType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+        Field::new(
+            "ts",
+            ArrowType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
         Field::new("encoder", ArrowType::Utf8, false),
         Field::new("payload", ArrowType::Utf8, false),
     ]))

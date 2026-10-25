@@ -130,7 +130,9 @@ impl CounterSnapshot {
             log_head: self.log_head.saturating_sub(earlier.log_head),
             log_list: self.log_list.saturating_sub(earlier.log_list),
             log_put_create: self.log_put_create.saturating_sub(earlier.log_put_create),
-            log_put_create_conflict: self.log_put_create_conflict.saturating_sub(earlier.log_put_create_conflict),
+            log_put_create_conflict: self
+                .log_put_create_conflict
+                .saturating_sub(earlier.log_put_create_conflict),
             log_put_other: self.log_put_other.saturating_sub(earlier.log_put_other),
             data_get: self.data_get.saturating_sub(earlier.data_get),
             data_head: self.data_head.saturating_sub(earlier.data_head),
@@ -142,7 +144,6 @@ impl CounterSnapshot {
             injected_ambiguous: self.injected_ambiguous.saturating_sub(earlier.injected_ambiguous),
         }
     }
-
 }
 
 impl Counters {
@@ -177,7 +178,10 @@ fn is_log(path: &Path) -> bool {
 }
 
 fn injected(message: &str) -> object_store::Error {
-    object_store::Error::Generic { store: "fault", source: message.to_owned().into() }
+    object_store::Error::Generic {
+        store: "fault",
+        source: message.to_owned().into(),
+    }
 }
 
 /// Counting and fault-injecting wrapper around an [`ObjectStore`].
@@ -190,7 +194,11 @@ pub struct InstrumentedStore {
 impl InstrumentedStore {
     /// Wrap `inner`, recording into `counters` and applying `faults`.
     pub fn new(inner: Arc<dyn ObjectStore>, counters: Arc<Counters>, faults: Arc<FaultPlan>) -> Self {
-        Self { inner, counters, faults }
+        Self {
+            inner,
+            counters,
+            faults,
+        }
     }
 
     async fn before(&self, is_log: bool) -> Result<()> {
@@ -227,7 +235,11 @@ impl ObjectStore for InstrumentedStore {
         let create = matches!(opts.mode, PutMode::Create);
         self.before(log).await?;
         if log && create {
-            let n = self.counters.log_put_create_attempt_total.fetch_add(1, Ordering::SeqCst) + 1;
+            let n = self
+                .counters
+                .log_put_create_attempt_total
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
             if self.faults.fault_crash_before_log_put == Some(n) {
                 eprintln!("fault: aborting before log write {location}");
                 std::process::abort();
@@ -248,7 +260,9 @@ impl ObjectStore for InstrumentedStore {
                         eprintln!("fault: aborting after log write {location}");
                         std::process::abort();
                     }
-                    if self.faults.fault_ambiguous_rate > 0.0 && rand::random::<f64>() < self.faults.fault_ambiguous_rate {
+                    if self.faults.fault_ambiguous_rate > 0.0
+                        && rand::random::<f64>() < self.faults.fault_ambiguous_rate
+                    {
                         bump(&self.counters.injected_ambiguous);
                         return Err(match self.faults.fault_ambiguous_kind {
                             AmbiguousKind::Timeout => injected("operation timed out (injected after write)"),
@@ -297,7 +311,11 @@ impl ObjectStore for InstrumentedStore {
         let log = is_log(location);
         tracing::trace!(target: "dcb::store", path = %location, "get_ranges");
         self.before(log).await?;
-        bump(if log { &self.counters.log_get } else { &self.counters.data_get });
+        bump(if log {
+            &self.counters.log_get
+        } else {
+            &self.counters.data_get
+        });
         self.inner.get_ranges(location, ranges).await
     }
 
@@ -308,7 +326,11 @@ impl ObjectStore for InstrumentedStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         let log = prefix.is_some_and(is_log);
-        bump(if log { &self.counters.log_list } else { &self.counters.data_list });
+        bump(if log {
+            &self.counters.log_list
+        } else {
+            &self.counters.data_list
+        });
         let faults = Arc::clone(&self.faults);
         let counters = Arc::clone(&self.counters);
         let inner = self.inner.list(prefix);
@@ -332,14 +354,22 @@ impl ObjectStore for InstrumentedStore {
 
     fn list_with_offset(&self, prefix: Option<&Path>, offset: &Path) -> BoxStream<'static, Result<ObjectMeta>> {
         let log = prefix.is_some_and(is_log);
-        bump(if log { &self.counters.log_list } else { &self.counters.data_list });
+        bump(if log {
+            &self.counters.log_list
+        } else {
+            &self.counters.data_list
+        });
         self.inner.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         let log = prefix.is_some_and(is_log);
         self.before(log).await?;
-        bump(if log { &self.counters.log_list } else { &self.counters.data_list });
+        bump(if log {
+            &self.counters.log_list
+        } else {
+            &self.counters.data_list
+        });
         self.inner.list_with_delimiter(prefix).await
     }
 

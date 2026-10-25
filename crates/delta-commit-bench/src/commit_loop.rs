@@ -42,6 +42,58 @@ pub async fn acquire(sem: Option<&Arc<Semaphore>>) -> (Option<OwnedSemaphorePerm
     (permit, ms(started.elapsed()))
 }
 
+/// How appIds map to ownership (follow-up Q1 and Q2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, clap::ValueEnum)]
+pub enum EpochMode {
+    /// One appId `<id>/<table>` for everything; a fenced loop stops (report model).
+    Off,
+    /// Owner commits under `<id>/<table>`; a fenced owner drains its pending manifests under a
+    /// fresh epoch appId `<id>/<table>#e<n>` (follow-up doc as written).
+    Drain,
+    /// Every ownership tenure and every drain claims a fresh epoch appId.
+    Tenure,
+}
+
+/// Which appIds a loop fences when it takes ownership.
+#[derive(Clone, Debug, Default)]
+pub enum FenceOn {
+    #[default]
+    None,
+    /// Signaled: fence the current appId of each listed identity.
+    Explicit(Vec<String>),
+    /// Inferred: fence the most recent other identity that committed data to the table.
+    Inferred,
+}
+
+/// Commit-info key that marks what a commit is for (`owner`, `drain`, `fence`, `claim`).
+pub const KIND_KEY: &str = "dcbKind";
+
+fn epoch_app_id(base: &str, epoch: i64) -> String {
+    format!("{base}#e{epoch}")
+}
+
+fn epoch_counter_id(base: &str) -> String {
+    format!("{base}#epoch")
+}
+
+/// The `<id>/<table>` part of an appId.
+fn base_of(app_id: &str) -> &str {
+    app_id.split_once('#').map_or(app_id, |(base, _)| base)
+}
+
+/// The epoch counter's `txn` version packs the latest claimed epoch and the identity's
+/// committed floor at claim time: `epoch << 40 | (floor + 1)`. Claims are serialized because
+/// every claim writes this same appId.
+const CLAIM_SHIFT: u32 = 40;
+
+fn encode_claim(epoch: i64, floor: i64) -> i64 {
+    (epoch << CLAIM_SHIFT) | (floor + 1)
+}
+
+fn decode_claim(raw: i64) -> (i64, i64) {
+    (raw >> CLAIM_SHIFT, (raw & ((1 << CLAIM_SHIFT) - 1)) - 1)
+}
+
 /// When the loop cuts a batch.
 #[derive(Clone, Copy, Debug)]
 pub enum Pacing {
@@ -82,8 +134,12 @@ pub struct LoopConfig {
     pub checkpoint_exec: CheckpointExec,
     pub limits: Limits,
     pub max_files_per_commit: usize,
-    /// Log versions scanned back by [`Idempotency::ScanLog`].
+    /// Log versions scanned back by [`Idempotency::ScanLog`] and by inferred fencing.
     pub scan_window: u64,
+    pub epochs: EpochMode,
+    pub fence_on: FenceOn,
+    /// Only commit this identity's pending manifests, then stop.
+    pub drain_only: bool,
 }
 
 /// One JSONL record per commit attempt sequence.
@@ -120,6 +176,9 @@ pub struct CommitRecord {
     pub checkpoint_ms: Option<f64>,
     /// Time to rebuild the in-memory snapshot from the new checkpoint.
     pub checkpoint_reload_ms: Option<f64>,
+    /// Ownership events (`fence`, `claim`, `lost`, `locked_out`, `drain_done`): what happened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 fn ms(d: Duration) -> f64 {
@@ -173,6 +232,13 @@ pub struct CommitLoop {
     counters: Arc<Counters>,
     wal: Wal,
     cfg: LoopConfig,
+    /// appId of the current tenure or drain. Equals `cfg.app_id` unless epochs are in use.
+    app_id: String,
+    /// Highest version this identity committed under any earlier appId, frozen by the claim
+    /// that fenced those appIds. Manifests at or below it already landed.
+    own_floor: Option<i64>,
+    /// Whether this loop may commit new data (owner) or only drain.
+    owner: bool,
     next_version: i64,
     /// Last `txn` version this loop knows it committed. Used to detect fencing and expiry.
     last_committed: Option<i64>,
@@ -196,27 +262,394 @@ impl CommitLoop {
         adopt: Option<Adopt>,
         out: mpsc::UnboundedSender<CommitRecord>,
     ) -> Result<Self> {
+        let app_id = cfg.app_id.clone();
         let mut this = Self {
             table: bench.table,
             counters: bench.counters,
             wal,
             cfg,
+            app_id,
+            own_floor: None,
+            owner: false,
             next_version: 0,
             last_committed: None,
             verified_through: None,
             out,
         };
-        this.recover(adopt).await?;
+        if this.cfg.drain_only {
+            this.drain().await?;
+            return Ok(this);
+        }
+        match (this.cfg.epochs, &this.cfg.fence_on) {
+            (EpochMode::Off, FenceOn::Inferred) => {
+                this.recover(adopt).await?;
+                return Ok(this);
+            }
+            (_, FenceOn::Inferred) => {
+                // Ownership starts with the first file routed here. Pending work from a previous
+                // life is drained now.
+                if !this.wal.pending()?.is_empty() {
+                    this.drain().await?;
+                }
+                return Ok(this);
+            }
+            (EpochMode::Tenure, _) => {
+                this.fence_others().await?;
+                this.claim("owner").await?;
+                this.owner = true;
+                if !this.recommit_pending().await? {
+                    anyhow::bail!("fenced during startup replay");
+                }
+            }
+            _ => {
+                this.fence_others().await?;
+                this.recover(adopt).await?;
+            }
+        }
+        this.owner = true;
         Ok(this)
     }
 
+    fn event(&self, kind: &'static str, outcome: &'static str, started: Instant, detail: String) {
+        let mut record = self.blank_record(kind, outcome);
+        record.commit_ms = ms(started.elapsed());
+        record.detail = Some(detail);
+        let _ = self.out.send(record);
+    }
+
+    fn blank_record(&self, kind: &'static str, outcome: &'static str) -> CommitRecord {
+        CommitRecord {
+            kind,
+            ts_ms: now_millis(),
+            table: self.cfg.table_name.clone(),
+            app_id: self.app_id.clone(),
+            txn_version: -1,
+            delta_version: self.table.version(),
+            files: 0,
+            rows: 0,
+            recovered: false,
+            queue_ms: 0.0,
+            permit_wait_ms: 0.0,
+            checkpoint_permit_wait_ms: None,
+            manifest_ms: 0.0,
+            commit_ms: 0.0,
+            visible_oldest_ms: 0.0,
+            visible_newest_ms: 0.0,
+            library_retries: 0,
+            loop_attempts: 0,
+            outcome,
+            errors: Vec::new(),
+            storage: CounterSnapshot::default(),
+            checkpoint_ms: None,
+            checkpoint_reload_ms: None,
+            detail: None,
+        }
+    }
+
+    /// Commit `txns` with no data, tagged with `kind`.
+    async fn commit_txns(&mut self, txns: Vec<Transaction>, kind: &str) -> Result<()> {
+        let props = CommitProperties::default()
+            .with_application_transactions(txns)
+            .with_metadata([(KIND_KEY.to_owned(), serde_json::Value::from(kind))]);
+        let state = self.table.snapshot()?;
+        let finalized = CommitBuilder::from(props)
+            .with_actions(Vec::new())
+            .build(
+                Some(state),
+                self.table.log_store(),
+                DeltaOperation::Write {
+                    mode: SaveMode::Append,
+                    partition_by: None,
+                    predicate: None,
+                },
+            )
+            .await?;
+        self.table.state = Some(finalized.snapshot());
+        Ok(())
+    }
+
+    /// Claim the next epoch appId for this identity. One commit fences the identity's previous
+    /// appIds and advances its epoch counter, so concurrent claims (two holders of one WAL)
+    /// conflict and serialize. Afterwards no earlier appId of this identity can commit, and
+    /// `own_floor` is the highest version any of them committed.
+    async fn claim(&mut self, kind: &'static str) -> Result<()> {
+        let started = Instant::now();
+        let base = self.cfg.app_id.clone();
+        let counter = epoch_counter_id(&base);
+        let mut delay = Duration::from_millis(100);
+        for attempt in 1..=30 {
+            self.refresh().await?;
+            let (last_epoch, mut floor) = self.txn_version_of(&counter).await?.map_or((0, -1), decode_claim);
+            let mut txns = Vec::new();
+            let mut previous = vec![base.clone()];
+            if last_epoch > 0 {
+                previous.push(epoch_app_id(&base, last_epoch));
+            }
+            for app in previous {
+                match self.txn_version_of(&app).await? {
+                    // An empty appId must still be fenced: another holder may have claimed it and
+                    // be about to commit. Naming it here makes that commit and this claim conflict.
+                    None if app != base || self.cfg.epochs == EpochMode::Drain => {
+                        txns.push(Transaction::new_with_last_update(
+                            &app,
+                            FENCE_OFFSET,
+                            Some(now_millis()),
+                        ));
+                    }
+                    None => {}
+                    Some(v) if v >= FENCE_OFFSET => floor = floor.max(decode_fence(v).unwrap_or(-1)),
+                    Some(v) => {
+                        floor = floor.max(v);
+                        txns.push(Transaction::new_with_last_update(
+                            &app,
+                            FENCE_OFFSET + v + 1,
+                            Some(now_millis()),
+                        ));
+                    }
+                }
+            }
+            let epoch = last_epoch + 1;
+            txns.push(Transaction::new_with_last_update(
+                &counter,
+                encode_claim(epoch, floor),
+                Some(now_millis()),
+            ));
+            match self.commit_txns(txns, "claim").await {
+                Ok(()) => {
+                    self.app_id = epoch_app_id(&base, epoch);
+                    self.own_floor = (floor >= 0).then_some(floor);
+                    self.last_committed = None;
+                    self.verified_through = None;
+                    let wal_max = self.wal.max_version()?.unwrap_or(-1);
+                    self.next_version = self.next_version.max(floor + 1).max(wal_max + 1);
+                    self.event(
+                        "claim",
+                        "ok",
+                        started,
+                        format!("{kind} epoch={epoch} floor={floor} attempts={attempt}"),
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::warn!(%error, attempt, "epoch claim failed; re-reading");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(5));
+                }
+            }
+        }
+        anyhow::bail!("could not claim an epoch for {base}")
+    }
+
+    /// The appId an identity base currently commits under.
+    async fn current_app_id_of(&self, base: &str) -> Result<String> {
+        if self.cfg.epochs != EpochMode::Tenure {
+            return Ok(base.to_owned());
+        }
+        let epoch = self
+            .txn_version_of(&epoch_counter_id(base))
+            .await?
+            .map_or(0, |raw| decode_claim(raw).0);
+        Ok(if epoch > 0 {
+            epoch_app_id(base, epoch)
+        } else {
+            base.to_owned()
+        })
+    }
+
+    /// The appId of the most recent data commit by an owner with another identity, searching
+    /// back `scan_window` versions and stopping at this identity's own owner commits.
+    async fn previous_owner(&self) -> Result<Option<String>> {
+        let latest = self.table.version().unwrap_or(0);
+        let from = latest.saturating_sub(self.cfg.scan_window);
+        let log_store = self.table.log_store();
+        let mine = base_of(&self.cfg.app_id).to_owned();
+        for version in (from..=latest).rev() {
+            let Some(bytes) = log_store.read_commit_entry(version).await? else {
+                continue;
+            };
+            let mut kind = None;
+            let mut apps = Vec::new();
+            for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+                let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if let Some(k) = value
+                    .pointer(&format!("/commitInfo/{KIND_KEY}"))
+                    .and_then(|v| v.as_str())
+                {
+                    kind = Some(k.to_owned());
+                }
+                if let (Some(app), Some(v)) = (
+                    value.pointer("/txn/appId").and_then(|v| v.as_str()),
+                    value.pointer("/txn/version").and_then(serde_json::Value::as_i64),
+                ) && v < FENCE_OFFSET
+                {
+                    apps.push(app.to_owned());
+                }
+            }
+            if kind.as_deref() != Some("owner") {
+                continue;
+            }
+            if let Some(app) = apps.into_iter().next() {
+                return Ok((base_of(&app) != mine).then_some(app));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Fence other owners per `fence_on`.
+    async fn fence_others(&mut self) -> Result<()> {
+        let targets = match &self.cfg.fence_on {
+            FenceOn::None => return Ok(()),
+            FenceOn::Explicit(ids) => {
+                let mut targets = Vec::new();
+                for id in ids.clone() {
+                    targets.push(self.current_app_id_of(&format!("{id}/{}", self.cfg.table_name)).await?);
+                }
+                targets
+            }
+            FenceOn::Inferred => {
+                self.refresh().await?;
+                self.previous_owner().await?.into_iter().collect()
+            }
+        };
+        for target in targets {
+            let started = Instant::now();
+            let last = self.fence(&target).await?;
+            self.event("fence", "ok", started, format!("target={target} last={last:?}"));
+        }
+        Ok(())
+    }
+
+    /// Commit pending manifests under the current appId, in version order. `Ok(false)` means
+    /// the appId was fenced part way.
+    async fn recommit_pending(&mut self) -> Result<bool> {
+        for manifest in self.wal.pending()? {
+            match self.landed(&manifest).await? {
+                Landed::Yes => {
+                    self.wal.release(manifest.version)?;
+                    self.emit_replay(&manifest, "replay_already_landed");
+                }
+                Landed::No => {
+                    let record = self.commit_manifest(&manifest, true).await;
+                    let outcome = record.outcome;
+                    let _ = self.out.send(record);
+                    match outcome {
+                        "fenced" => return Ok(false),
+                        "failed" | "unresolved" => {
+                            anyhow::bail!("replay of txn version {} did not complete: {outcome}", manifest.version)
+                        }
+                        _ => self.wal.release(manifest.version)?,
+                    }
+                }
+                Landed::Fenced => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Self-drain: claim a drain epoch and commit this identity's pending manifests. A drain
+    /// that is itself fenced (another holder of the same WAL claimed) starts over.
+    async fn drain(&mut self) -> Result<()> {
+        let started = Instant::now();
+        let pending = self.wal.pending()?.len();
+        for round in 1..=20 {
+            self.claim("drain").await?;
+            let mut fenced = false;
+            let mut committed = 0;
+            for manifest in self.wal.pending()? {
+                match self.landed(&manifest).await? {
+                    Landed::Yes => {
+                        self.wal.release(manifest.version)?;
+                        self.emit_replay(&manifest, "drain_already_landed");
+                    }
+                    Landed::Fenced => {
+                        fenced = true;
+                        break;
+                    }
+                    Landed::No => {
+                        let mut record = self.commit_manifest(&manifest, true).await;
+                        record.detail = Some("drain".to_owned());
+                        let outcome = record.outcome;
+                        let _ = self.out.send(record);
+                        match outcome {
+                            "fenced" => {
+                                fenced = true;
+                                break;
+                            }
+                            "failed" | "unresolved" => {
+                                anyhow::bail!("drain of txn version {} did not complete: {outcome}", manifest.version)
+                            }
+                            _ => {
+                                committed += 1;
+                                self.wal.release(manifest.version)?;
+                            }
+                        }
+                    }
+                }
+            }
+            if !fenced {
+                self.event(
+                    "drain_done",
+                    "ok",
+                    started,
+                    format!("pending={pending} committed={committed} rounds={round}"),
+                );
+                return Ok(());
+            }
+        }
+        anyhow::bail!("drain fenced 20 times")
+    }
+
+    /// Take ownership when a file arrives while not the owner. `Ok(false)` means this identity's
+    /// owner appId is fenced and cannot be reused (epochs off or drain-only).
+    async fn acquire_owner(&mut self) -> Result<bool> {
+        let started = Instant::now();
+        if self.cfg.epochs == EpochMode::Tenure {
+            // Another owner can fence the new epoch before its replay finishes; take it again.
+            for attempt in 1..=10 {
+                self.fence_others().await?;
+                self.claim("owner").await?;
+                self.owner = true;
+                if self.recommit_pending().await? {
+                    self.event("acquire", "ok", started, format!("attempts={attempt}"));
+                    return Ok(true);
+                }
+                self.owner = false;
+            }
+            anyhow::bail!("could not take ownership in 10 attempts");
+        } else {
+            self.refresh().await?;
+            self.app_id = self.cfg.app_id.clone();
+            self.own_floor = None;
+            self.last_committed = None;
+            self.verified_through = None;
+            if self.committed_txn_version().await?.is_some_and(|v| v >= FENCE_OFFSET) {
+                return Ok(false);
+            }
+            self.fence_others().await?;
+            self.last_committed = self.committed_txn_version().await?;
+        }
+        self.owner = true;
+        if !self.recommit_pending().await? {
+            self.owner = false;
+            return Ok(false);
+        }
+        self.event("acquire", "ok", started, String::new());
+        Ok(true)
+    }
+
     async fn txn_version_of(&self, app_id: &str) -> Result<Option<i64>> {
-        let Ok(state) = self.table.snapshot() else { return Ok(None) };
-        Ok(state.transaction_version(self.table.log_store().as_ref(), app_id).await?)
+        let Ok(state) = self.table.snapshot() else {
+            return Ok(None);
+        };
+        Ok(state
+            .transaction_version(self.table.log_store().as_ref(), app_id)
+            .await?)
     }
 
     async fn committed_txn_version(&self) -> Result<Option<i64>> {
-        self.txn_version_of(&self.cfg.app_id).await
+        self.txn_version_of(&self.app_id).await
     }
 
     /// Commit a `txn`-only entry that fences `old_app_id`, retrying until it lands or the appId
@@ -235,11 +668,13 @@ impl CommitLoop {
                 return Ok(decode_fence(raw));
             }
             let marker = FENCE_OFFSET + raw.unwrap_or(-1) + 1;
-            let props = CommitProperties::default().with_application_transaction(Transaction::new_with_last_update(
-                old_app_id,
-                marker,
-                Some(now_millis()),
-            ));
+            let props = CommitProperties::default()
+                .with_application_transaction(Transaction::new_with_last_update(
+                    old_app_id,
+                    marker,
+                    Some(now_millis()),
+                ))
+                .with_metadata([(KIND_KEY.to_owned(), serde_json::Value::from("fence"))]);
             let result = match self.table.snapshot() {
                 Ok(state) => {
                     CommitBuilder::from(props)
@@ -247,7 +682,11 @@ impl CommitLoop {
                         .build(
                             Some(state),
                             self.table.log_store(),
-                            DeltaOperation::Write { mode: SaveMode::Append, partition_by: None, predicate: None },
+                            DeltaOperation::Write {
+                                mode: SaveMode::Append,
+                                partition_by: None,
+                                predicate: None,
+                            },
                         )
                         .await
                 }
@@ -280,7 +719,10 @@ impl CommitLoop {
                 }
             }
         }
-        self.table.update_incremental(None).await.context("refresh after retries")
+        self.table
+            .update_incremental(None)
+            .await
+            .context("refresh after retries")
     }
 
     async fn scan_log_for(&self, path: &str) -> Result<bool> {
@@ -301,6 +743,9 @@ impl CommitLoop {
     async fn landed(&self, manifest: &Manifest) -> Result<Landed> {
         match self.cfg.idempotency {
             Idempotency::Txn => {
+                if self.own_floor.is_some_and(|floor| manifest.version <= floor) {
+                    return Ok(Landed::Yes);
+                }
                 let raw = self.committed_txn_version().await?;
                 Ok(match raw {
                     Some(v) if v >= FENCE_OFFSET => {
@@ -318,7 +763,11 @@ impl CommitLoop {
                 })
             }
             Idempotency::ScanLog => match manifest.files.first() {
-                Some(file) => Ok(if self.scan_log_for(&file.path).await? { Landed::Yes } else { Landed::No }),
+                Some(file) => Ok(if self.scan_log_for(&file.path).await? {
+                    Landed::Yes
+                } else {
+                    Landed::No
+                }),
                 None => Ok(Landed::Yes),
             },
         }
@@ -327,7 +776,10 @@ impl CommitLoop {
     async fn recover(&mut self, adopt: Option<Adopt>) -> Result<()> {
         let raw = self.committed_txn_version().await?;
         if raw.is_some_and(|v| v >= FENCE_OFFSET) {
-            anyhow::bail!("fenced: appId {} was taken over; pending manifests belong to the new owner", self.cfg.app_id);
+            anyhow::bail!(
+                "fenced: appId {} was taken over; pending manifests belong to the new owner",
+                self.app_id
+            );
         }
         self.last_committed = raw;
         let wal_max = self.wal.max_version()?.unwrap_or(-1);
@@ -342,7 +794,11 @@ impl CommitLoop {
                 Landed::Fenced => anyhow::bail!("fenced during replay of txn version {}", manifest.version),
             }
         }
-        if let Some(Adopt { wal: old_wal, app_id: old_app_id }) = adopt {
+        if let Some(Adopt {
+            wal: old_wal,
+            app_id: old_app_id,
+        }) = adopt
+        {
             let old_last = self.fence(&old_app_id).await?;
             // A restart in the middle of adoption may find a batch in both WALs.
             let mine: std::collections::HashSet<String> = self
@@ -363,9 +819,13 @@ impl CommitLoop {
                     }
                     continue;
                 }
-                let manifest = Manifest { app_id: self.cfg.app_id.clone(), version: self.next_version, ..old };
+                let manifest = Manifest {
+                    app_id: self.app_id.clone(),
+                    version: self.next_version,
+                    ..old
+                };
                 self.next_version += 1;
-                self.wal.write(&manifest)?;
+                self.wal.write(&manifest).await?;
                 old_wal.release(old_version)?;
                 self.commit_recovered(&manifest).await?;
             }
@@ -384,31 +844,12 @@ impl CommitLoop {
     }
 
     fn emit_replay(&self, manifest: &Manifest, outcome: &'static str) {
-        let _ = self.out.send(CommitRecord {
-            kind: "commit",
-            ts_ms: now_millis(),
-            table: self.cfg.table_name.clone(),
-            app_id: self.cfg.app_id.clone(),
-            txn_version: manifest.version,
-            delta_version: self.table.version(),
-            files: manifest.files.len(),
-            rows: manifest.files.iter().map(|f| f.rows).sum(),
-            recovered: true,
-            queue_ms: 0.0,
-            permit_wait_ms: 0.0,
-            checkpoint_permit_wait_ms: None,
-            manifest_ms: 0.0,
-            commit_ms: 0.0,
-            visible_oldest_ms: 0.0,
-            visible_newest_ms: 0.0,
-            library_retries: 0,
-            loop_attempts: 0,
-            outcome,
-            errors: Vec::new(),
-            storage: CounterSnapshot::default(),
-            checkpoint_ms: None,
-            checkpoint_reload_ms: None,
-        });
+        let mut record = self.blank_record("commit", outcome);
+        record.txn_version = manifest.version;
+        record.files = manifest.files.len();
+        record.rows = manifest.files.iter().map(|f| f.rows).sum();
+        record.recovered = true;
+        let _ = self.out.send(record);
     }
 
     /// After a failed commit, decide whether the batch landed. Only a fresh snapshot and a
@@ -443,7 +884,11 @@ impl CommitLoop {
             // The conflict checker only sees commits after our snapshot. A fence already inside
             // the snapshot must be caught here, unless the snapshot is already verified.
             let verified = self.verified_through.is_some() && self.verified_through == self.table.version();
-            let pre_check = if verified { Ok(Landed::No) } else { self.landed(manifest).await };
+            let pre_check = if verified {
+                Ok(Landed::No)
+            } else {
+                self.landed(manifest).await
+            };
             match pre_check {
                 Ok(Landed::No) => self.verified_through = self.table.version(),
                 Ok(Landed::Yes) => {
@@ -479,11 +924,13 @@ impl CommitLoop {
                 .with_max_retries(self.cfg.library_max_retries);
             if self.cfg.idempotency == Idempotency::Txn {
                 props = props.with_application_transaction(Transaction::new_with_last_update(
-                    &self.cfg.app_id,
+                    &self.app_id,
                     manifest.version,
                     Some(now_millis()),
                 ));
             }
+            let kind = if self.owner { "owner" } else { "drain" };
+            props = props.with_metadata([(KIND_KEY.to_owned(), serde_json::Value::from(kind))]);
             let actions = manifest.files.iter().map(add_action).collect();
             let result = match self.table.snapshot() {
                 Ok(state) => {
@@ -492,7 +939,11 @@ impl CommitLoop {
                         .build(
                             Some(state),
                             self.table.log_store(),
-                            DeltaOperation::Write { mode: SaveMode::Append, partition_by: None, predicate: None },
+                            DeltaOperation::Write {
+                                mode: SaveMode::Append,
+                                partition_by: None,
+                                predicate: None,
+                            },
                         )
                         .await
                 }
@@ -529,7 +980,10 @@ impl CommitLoop {
             }
         }
         if matches!(outcome, "ok" | "ok_after_loop_retry" | "landed_after_error") {
-            self.last_committed = Some(self.last_committed.map_or(manifest.version, |v| v.max(manifest.version)));
+            self.last_committed = Some(
+                self.last_committed
+                    .map_or(manifest.version, |v| v.max(manifest.version)),
+            );
         }
         let commit_ms = ms(started.elapsed());
         let now = now_millis();
@@ -539,7 +993,7 @@ impl CommitLoop {
             kind: "commit",
             ts_ms: now,
             table: self.cfg.table_name.clone(),
-            app_id: self.cfg.app_id.clone(),
+            app_id: self.app_id.clone(),
             txn_version: manifest.version,
             delta_version: self.table.version(),
             files: manifest.files.len(),
@@ -561,6 +1015,7 @@ impl CommitLoop {
             storage: self.counters.snapshot().since(&before),
             checkpoint_ms: None,
             checkpoint_reload_ms: None,
+            detail: None,
         }
     }
 
@@ -574,8 +1029,9 @@ impl CommitLoop {
                 let engine = log_store.engine(None);
                 let root = log_store.transaction_url(None)?;
                 tokio::task::spawn_blocking(move || -> Result<()> {
-                    let snapshot =
-                        delta_kernel::Snapshot::builder_for(root).at_version(version).build(engine.as_ref())?;
+                    let snapshot = delta_kernel::Snapshot::builder_for(root)
+                        .at_version(version)
+                        .build(engine.as_ref())?;
                     snapshot.checkpoint(engine.as_ref(), None)?;
                     Ok(())
                 })
@@ -648,6 +1104,22 @@ impl CommitLoop {
             if batch.is_empty() {
                 continue;
             }
+            if !self.owner && !self.acquire_owner().await? {
+                // The owner appId is fenced for good. The files stay pending: nothing may commit them.
+                let manifest = Manifest {
+                    app_id: self.app_id.clone(),
+                    version: self.next_version,
+                    created_ms: now_millis(),
+                    files: batch,
+                };
+                self.next_version += 1;
+                self.wal.write(&manifest).await?;
+                let mut record = self.blank_record("locked_out", "locked_out");
+                record.txn_version = manifest.version;
+                record.files = manifest.files.len();
+                let _ = self.out.send(record);
+                continue;
+            }
             let commit_start = now_millis();
             let manifest_started = Instant::now();
             let manifest = Manifest {
@@ -657,7 +1129,7 @@ impl CommitLoop {
                 files: batch,
             };
             self.next_version += 1;
-            self.wal.write(&manifest)?;
+            self.wal.write(&manifest).await?;
             let manifest_ms = ms(manifest_started.elapsed());
             let (permit, permit_wait_ms) = acquire(self.cfg.limits.ops.as_ref()).await;
             let mut record = self.commit_manifest(&manifest, false).await;
@@ -666,8 +1138,37 @@ impl CommitLoop {
             record.permit_wait_ms = permit_wait_ms;
             #[allow(clippy::cast_precision_loss)]
             {
-                record.queue_ms =
-                    (commit_start - manifest.files.iter().map(|f| f.upload_done_ms).min().unwrap_or(commit_start)) as f64;
+                record.queue_ms = (commit_start
+                    - manifest
+                        .files
+                        .iter()
+                        .map(|f| f.upload_done_ms)
+                        .min()
+                        .unwrap_or(commit_start)) as f64;
+            }
+            if record.outcome == "fenced" && self.cfg.epochs != EpochMode::Off {
+                let _ = self.out.send(record);
+                // Ownership moved. Files already routed here are acked: write them to the WAL so
+                // the drain covers them, then drain and wait for traffic to return.
+                self.owner = false;
+                let lost = Instant::now();
+                let mut rest = Vec::new();
+                while let Ok(file) = rx.try_recv() {
+                    rest.push(file);
+                }
+                if !rest.is_empty() {
+                    let manifest = Manifest {
+                        app_id: self.app_id.clone(),
+                        version: self.next_version,
+                        created_ms: now_millis(),
+                        files: rest,
+                    };
+                    self.next_version += 1;
+                    self.wal.write(&manifest).await?;
+                }
+                self.event("lost", "fenced", lost, format!("pending={}", self.wal.pending()?.len()));
+                self.drain().await?;
+                continue;
             }
             if matches!(record.outcome, "failed" | "unresolved" | "fenced") {
                 let _ = self.out.send(record);

@@ -6,7 +6,11 @@
 #   no public IPs, NSG with no inbound rules, SSH only through Azure Bastion tunnelling.
 # - Public IPs (Bastion, NAT) carry the FirstPartyUsage=/NonProd IP tag required by policy.
 #
-# Usage: scripts/infra.sh up|ssh <n>|tunnel <n> <port>|stop|start|down
+# - WAL data disks (follow-up Q4): Premium SSD v2 needs a zonal VM, so VMs go in zone $ZONE. `disks`
+#   attaches a PSSD v2 64 GiB (3000 IOPS, 125 MB/s baseline) at LUN 0 and a Premium SSD ZRS P30 (5000
+#   IOPS) at LUN 1 to each main VM, host caching None; `mountdisks <n>` mounts them at /mnt/pv2 and /mnt/pzrs.
+#
+# Usage: scripts/infra.sh up|disks|mountdisks <n>|ssh <n>|tunnel <n> <port>|stop|start|down
 set -euo pipefail
 
 SUB=${SUB:-3afca1ee-abcc-4e4b-be8c-d3a273db45d3}
@@ -15,7 +19,8 @@ LOC=${LOC:-westus2}
 RG=${RG:-ethanmoffat-arrowcol-delta-bench}
 P=${P:-ethanmoffat-dcb}
 VM_SKU=${VM_SKU:-Standard_D16s_v5}
-VM_COUNT=${VM_COUNT:-3}
+VM_COUNT=${VM_COUNT:-2}
+ZONE=${ZONE:-1}
 SSH_KEY=${SSH_KEY:-$HOME/.ssh/dcb_bench}
 SUFFIX=$(echo -n "$SUB/$RG" | md5sum | cut -c1-6)
 SA_HNS=emdcbhns$SUFFIX
@@ -91,8 +96,24 @@ vmss() { # vmss <name> <sku> <count>
     --enable-vtpm true --admin-username azureuser --ssh-key-values "$SSH_KEY.pub" \
     --vnet-name "$P-vnet" --subnet bench --nsg "$P-nsg" --lb "" \
     --platform-fault-domain-count 1 --accelerated-networking true --assign-identity "$identity_id" \
+    ${ZONE:+--zones "$ZONE"} \
     --tags "${TAGS[@]}" azsecpack=nonprod -o none
 }
+
+disks() {
+  local i=0 vm
+  for vm in $(az vm list -g "$RG" --query "[?contains(name,'$P-vmss')].name" -o tsv | sort); do
+    i=$((i + 1))
+    az disk create -g "$RG" -n "$P-pv2-$i" --sku PremiumV2_LRS --size-gb 64 --zone "$ZONE" --tags "${TAGS[@]}" -o none
+    az disk create -g "$RG" -n "$P-pzrs-$i" --sku Premium_ZRS --size-gb 1024 --tags "${TAGS[@]}" -o none
+    az vm disk attach -g "$RG" --vm-name "$vm" --name "$P-pv2-$i" --lun 0 --caching None -o none
+    az vm disk attach -g "$RG" --vm-name "$vm" --name "$P-pzrs-$i" --lun 1 --caching None -o none
+  done
+}
+
+MOUNT_CMD='for d in 0:pv2 1:pzrs; do dev=/dev/disk/azure/scsi1/lun${d%%:*}; m=/mnt/${d##*:};
+  mountpoint -q $m && continue; sudo mkfs.ext4 -q -F $dev && sudo mkdir -p $m && sudo mount -o noatime $dev $m &&
+  sudo chown azureuser $m; done; df -h /mnt/pv2 /mnt/pzrs'
 
 sa_id() { az storage account show -g "$RG" -n "$1" --query id -o tsv; }
 # The main VMSS sorts first (vm1..3); extra scale sets from `addvmss` are named $P-xl* and follow.
@@ -101,6 +122,8 @@ vm_id() { vm_ids | sed -n "${1}p" | cut -f2; }
 
 case ${1:-} in
   up) up ;;
+  disks) disks ;;
+  mountdisks) exec "$0" ssh "$2" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$MOUNT_CMD" ;;
   # Extra one-VM scale set with another size, e.g. addvmss xl32 Standard_D32ds_v5 (becomes vm4).
   addvmss) vmss "$P-$2" "$3" 1; vm_ids ;;
   ssh) shift; n=$1; shift
@@ -119,5 +142,5 @@ case ${1:-} in
   stop) for s in $(az vmss list -g "$RG" --query "[].name" -o tsv); do az vmss deallocate -g "$RG" -n "$s" -o none; done ;;
   start) for s in $(az vmss list -g "$RG" --query "[].name" -o tsv); do az vmss start -g "$RG" -n "$s" -o none; done ;;
   down) az group delete -n "$RG" --yes ;;
-  *) echo "usage: $0 up|addvmss <name> <sku>|ssh <n> [ssh args] cmd|tunnel <n> <port>|push <n> files...|pull <n> src dst|stop|start|down" >&2; exit 2 ;;
+  *) echo "usage: $0 up|disks|mountdisks <n>|addvmss <name> <sku>|ssh <n> [ssh args] cmd|tunnel <n> <port>|push <n> files...|pull <n> src dst|stop|start|down" >&2; exit 2 ;;
 esac

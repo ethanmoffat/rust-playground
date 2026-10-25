@@ -10,7 +10,9 @@ mod wal;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use commit_loop::{Adopt, CheckpointExec, CommitLoop, CommitRecord, Idempotency, Limits, LoopConfig, Pacing};
+use commit_loop::{
+    Adopt, CheckpointExec, CommitLoop, CommitRecord, EpochMode, FenceOn, Idempotency, Limits, LoopConfig, Pacing,
+};
 use deltalake_core::kernel::transaction::{CommitBuilder, CommitProperties};
 use deltalake_core::kernel::{Action, Add, Remove};
 use deltalake_core::protocol::DeltaOperation;
@@ -49,6 +51,35 @@ enum Command {
     Checkpoint(TableArg),
     /// Commit compaction-style (remove N, add 1) transactions while appends run.
     Optimize(OptimizeArgs),
+    /// Add txn-only commits that accumulate distinct appIds (follow-up Q3).
+    SeedTxn(SeedTxnArgs),
+    /// Print the txn version a fresh snapshot reports for each appId.
+    TxnProbe(TxnProbeArgs),
+    /// Checkpoint, then delete every log file before the checkpoint regardless of age.
+    CleanupLog(TableArg),
+    /// Delete every data file removed from the table, with zero retention.
+    Vacuum(TableArg),
+}
+
+#[derive(Args)]
+struct SeedTxnArgs {
+    #[arg(long)]
+    table_url: Url,
+    /// Distinct appIds to add.
+    #[arg(long)]
+    count: usize,
+    #[arg(long, default_value_t = 100)]
+    per_commit: usize,
+    #[arg(long, default_value = "seed")]
+    prefix: String,
+}
+
+#[derive(Args)]
+struct TxnProbeArgs {
+    #[arg(long)]
+    table_url: Url,
+    #[arg(long)]
+    app_id: Vec<String>,
 }
 
 #[derive(Args)]
@@ -74,7 +105,11 @@ impl Tables {
     fn urls(&self) -> Result<Vec<Url>> {
         let mut urls = self.table_url.clone();
         if let Some(base) = &self.table_base {
-            let base = if base.as_str().ends_with('/') { base.clone() } else { Url::parse(&format!("{base}/"))? };
+            let base = if base.as_str().ends_with('/') {
+                base.clone()
+            } else {
+                Url::parse(&format!("{base}/"))?
+            };
             for i in 0..self.tables {
                 urls.push(base.join(&format!("t{i:05}"))?);
             }
@@ -93,6 +128,12 @@ struct CreateArgs {
     /// Table property `key=value`; repeatable.
     #[arg(long = "prop")]
     props: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, clap::ValueEnum)]
+enum WalSync {
+    PerCommit,
+    Group,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, clap::ValueEnum)]
@@ -148,6 +189,32 @@ struct RunArgs {
     /// its unlanded pending manifests from `--wal-dir` under this loop's appId.
     #[arg(long)]
     adopt_from: Option<String>,
+    /// appId ownership model (follow-up Q1 and Q2).
+    #[arg(long, value_enum, default_value_t = EpochMode::Off)]
+    epochs: EpochMode,
+    /// Signaled ownership: on start, fence the current appId of this identity; repeatable.
+    #[arg(long)]
+    fence_identity: Vec<String>,
+    /// Inferred ownership: when a file arrives while not the owner, fence the previous committer.
+    #[arg(long)]
+    infer_fence: bool,
+    /// Commit this identity's pending manifests under a fresh epoch, then exit. No producer.
+    #[arg(long)]
+    drain_only: bool,
+    /// Manifest durability (follow-up Q4): `per-commit` writes a file per manifest with three
+    /// fsyncs on the commit task; `group` appends to one process-wide log with one fdatasync per
+    /// batch on a dedicated thread.
+    #[arg(long, value_enum, default_value_t = WalSync::PerCommit)]
+    wal_sync: WalSync,
+    /// Group mode: after the first queued append, wait this long for more before syncing.
+    #[arg(long, default_value_t = 0)]
+    group_sync_ms: u64,
+    /// Group mode: synthetic data appended through the same log and syncs, MB/s.
+    #[arg(long, default_value_t = 0.0)]
+    data_wal_mbps: f64,
+    /// Router simulation: produce files only while this file contains `--app-id`.
+    #[arg(long)]
+    route_file: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = ProducerKind::Small)]
     producer: ProducerKind,
     /// Files per second per table. With `--producer arrow`, 0 encodes continuously.
@@ -277,7 +344,11 @@ struct OptimizeArgs {
 fn parse_props(props: &[String]) -> Result<Vec<(String, String)>> {
     props
         .iter()
-        .map(|p| p.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())).context("prop must be key=value"))
+        .map(|p| {
+            p.split_once('=')
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .context("prop must be key=value")
+        })
         .collect()
 }
 
@@ -301,7 +372,9 @@ async fn delayed<F: std::future::Future>(delay: Duration, f: F) -> F::Output {
 }
 
 fn table_name(url: &Url) -> String {
-    url.path_segments().and_then(|mut s| s.next_back().map(str::to_owned)).unwrap_or_default()
+    url.path_segments()
+        .and_then(|mut s| s.next_back().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 fn table_root(url: &Url) -> Result<Path> {
@@ -319,6 +392,42 @@ struct Sample {
     producer_storage: store::CounterSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     producer: Option<arrow_producer::StatsSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_sync: Option<WalSample>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_disk: Option<wal::DiskStats>,
+}
+
+#[derive(Serialize)]
+struct WalSample {
+    #[serde(flatten)]
+    totals: wal::SyncStats,
+    /// Sync latency percentiles over the sample period.
+    p50_ms: f64,
+    p99_ms: f64,
+    max_ms: f64,
+}
+
+fn wal_sample(log: &wal::GroupLog) -> WalSample {
+    let totals = log.stats();
+    let mut l = totals.latencies.clone();
+    l.sort_by(f64::total_cmp);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let pct = |p: f64| {
+        l.get(((l.len() as f64 * p) as usize).min(l.len().saturating_sub(1)))
+            .copied()
+            .unwrap_or(0.0)
+    };
+    WalSample {
+        p50_ms: pct(0.5),
+        p99_ms: pct(0.99),
+        max_ms: l.last().copied().unwrap_or(0.0),
+        totals,
+    }
 }
 
 /// CPU seconds by thread-name group from /proc (Linux only; empty elsewhere).
@@ -330,10 +439,16 @@ fn thread_cpu() -> BTreeMap<String, f64> {
 fn thread_stats() -> (BTreeMap<String, f64>, BTreeMap<String, usize>) {
     let mut out = BTreeMap::new();
     let mut counts = BTreeMap::new();
-    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else { return (out, counts) };
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return (out, counts);
+    };
     for task in tasks.flatten() {
-        let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else { continue };
-        let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else { continue };
+        let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else {
+            continue;
+        };
+        let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+            continue;
+        };
         let comm = &stat[open + 1..close];
         let fields: Vec<&str> = stat[close + 2..].split_whitespace().collect();
         let ticks: f64 = fields.get(11).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0)
@@ -400,6 +515,15 @@ async fn run(args: RunArgs) -> Result<()> {
     let root = table::root_store(&urls[0])?;
     let faults = Arc::new(args.faults.clone());
     std::fs::create_dir_all(&args.wal_dir)?;
+    let group_log = (args.wal_sync == WalSync::Group)
+        .then(|| {
+            wal::init_group(
+                &args.wal_dir,
+                Duration::from_millis(args.group_sync_ms),
+                args.data_wal_mbps,
+            )
+        })
+        .transpose()?;
     if let Some(parent) = args.out.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -443,7 +567,10 @@ async fn run(args: RunArgs) -> Result<()> {
     });
 
     let commit_rt = if args.commit_runtime == CommitRuntime::Current {
-        tokio::runtime::Builder::new_current_thread().thread_name("commit-blk").enable_all().build()?
+        tokio::runtime::Builder::new_current_thread()
+            .thread_name("commit-blk")
+            .enable_all()
+            .build()?
     } else {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(args.commit_threads.max(1))
@@ -466,7 +593,10 @@ async fn run(args: RunArgs) -> Result<()> {
     let producer_store: Arc<dyn ObjectStore> = Arc::new(InstrumentedStore::new(
         Arc::clone(&root),
         Arc::clone(&producer_counters),
-        Arc::new(FaultPlan { fault_crash_mid_upload: args.faults.fault_crash_mid_upload, ..FaultPlan::default() }),
+        Arc::new(FaultPlan {
+            fault_crash_mid_upload: args.faults.fault_crash_mid_upload,
+            ..FaultPlan::default()
+        }),
     ));
 
     if args.adopt_from.is_some() && urls.len() != 1 {
@@ -501,11 +631,21 @@ async fn run(args: RunArgs) -> Result<()> {
                 LogCleanup::Off => Some(false),
             },
             reload_after_checkpoint: args.reload_after_checkpoint,
-            separate_checkpoint_every: matches!(args.checkpoint, CheckpointMode::Separate).then_some(args.checkpoint_every),
+            separate_checkpoint_every: matches!(args.checkpoint, CheckpointMode::Separate)
+                .then_some(args.checkpoint_every),
             checkpoint_exec: args.checkpoint_exec,
             limits: limits.clone(),
             max_files_per_commit: args.max_files_per_commit,
             scan_window: args.scan_window,
+            epochs: args.epochs,
+            fence_on: if args.infer_fence {
+                FenceOn::Inferred
+            } else if args.fence_identity.is_empty() {
+                FenceOn::None
+            } else {
+                FenceOn::Explicit(args.fence_identity.clone())
+            },
+            drain_only: args.drain_only,
         };
         wal::Wal::open(&args.wal_dir, &app_id)?;
         let wal_dir = args.wal_dir.clone();
@@ -524,7 +664,12 @@ async fn run(args: RunArgs) -> Result<()> {
                 let wal = wal::Wal::open(&wal_dir, &cfg.app_id)?;
                 let old = adopt_app_id
                     .as_ref()
-                    .map(|id| Ok::<_, anyhow::Error>(Adopt { wal: wal::Wal::open(&wal_dir, id)?, app_id: id.clone() }))
+                    .map(|id| {
+                        Ok::<_, anyhow::Error>(Adopt {
+                            wal: wal::Wal::open(&wal_dir, id)?,
+                            app_id: id.clone(),
+                        })
+                    })
                     .transpose()?;
                 let started = CommitLoop::start(bench, wal, cfg.clone(), old, record_tx.clone()).await;
                 drop(permit);
@@ -566,6 +711,10 @@ async fn run(args: RunArgs) -> Result<()> {
             )));
             continue;
         }
+        if args.drain_only {
+            drop(tx);
+            continue;
+        }
         let pcfg = producer::ProducerConfig {
             table_name: name,
             encoders: args.encoders,
@@ -573,10 +722,17 @@ async fn run(args: RunArgs) -> Result<()> {
             rows: args.rows,
             multipart: args.multipart,
             duration: Duration::from_secs(args.duration),
+            route: args.route_file.clone().map(|file| (file, args.app_id.clone())),
         };
         producers.push(tokio::spawn(delayed(
             start_delay,
-            producer::produce(Arc::clone(&producer_store), table_root(url)?, pcfg, tx, Some(Arc::clone(&sent))),
+            producer::produce(
+                Arc::clone(&producer_store),
+                table_root(url)?,
+                pcfg,
+                tx,
+                Some(Arc::clone(&sent)),
+            ),
         )));
     }
     drop(record_tx);
@@ -586,6 +742,8 @@ async fn run(args: RunArgs) -> Result<()> {
     let sampler = {
         let counters = Arc::clone(&producer_counters);
         let producer_stats = producer_stats.clone();
+        let group_log = group_log.clone();
+        let wal_dir = args.wal_dir.clone();
         let period = Duration::from_secs(args.sample_secs.max(1));
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(period);
@@ -601,6 +759,8 @@ async fn run(args: RunArgs) -> Result<()> {
                         rss_mb: rss_mb(),
                         producer_storage: counters.snapshot(),
                         producer: producer_stats.as_ref().map(|s| s.snapshot()),
+                        wal_sync: group_log.as_deref().map(wal_sample),
+                        wal_disk: wal::disk_stats(&wal_dir),
                     })
                     .is_err()
                 {
@@ -637,11 +797,16 @@ async fn run(args: RunArgs) -> Result<()> {
         end["producer"] = serde_json::to_value(&snap)?;
         end["producer"]["produce_s"] = produce_s.into();
         end["producer"]["encoders"] = args.encoders.into();
-        end["producer"]["nic_tx_delta_bytes"] =
-            start_stats.and_then(|s| Some(snap.nic_tx_bytes? - s.nic_tx_bytes?)).into();
+        end["producer"]["nic_tx_delta_bytes"] = start_stats
+            .and_then(|s| Some(snap.nic_tx_bytes? - s.nic_tx_bytes?))
+            .into();
     }
     writeln!(out, "{end}")?;
-    eprintln!("done: {produced} files in {:.1}s, loop errors: {}", elapsed.as_secs_f64(), loop_errors.len());
+    eprintln!(
+        "done: {produced} files in {:.1}s, loop errors: {}",
+        elapsed.as_secs_f64(),
+        loop_errors.len()
+    );
     if !loop_errors.is_empty() {
         eprintln!("{loop_errors:#?}");
         bail!("{} commit loop(s) failed", loop_errors.len());
@@ -677,7 +842,11 @@ async fn checkpoint(args: TableArg) -> Result<()> {
     let log = Path::from(format!("{}/_delta_log", table_root(&args.table_url)?.as_ref()));
     let version = bench.table.version().unwrap_or(0);
     let name = format!("{version:020}.checkpoint.parquet");
-    let size = root.head(&Path::from(format!("{}/{name}", log.as_ref()))).await.map(|m| m.size).ok();
+    let size = root
+        .head(&Path::from(format!("{}/{name}", log.as_ref())))
+        .await
+        .map(|m| m.size)
+        .ok();
     println!(
         "{}",
         serde_json::json!({
@@ -709,7 +878,11 @@ async fn optimize(args: OptimizeArgs) -> Result<()> {
         let bytes = table::small_parquet(-1, 10, "optimize")?;
         let rel = format!("data/optimize-{}.parquet", uuid::Uuid::new_v4());
         let size = i64::try_from(bytes.len())?;
-        root.put(&Path::from(format!("{}/{rel}", prefix.as_ref())), PutPayload::from(bytes)).await?;
+        root.put(
+            &Path::from(format!("{}/{rel}", prefix.as_ref())),
+            PutPayload::from(bytes),
+        )
+        .await?;
         let now = now_millis();
         let mut actions: Vec<Action> = picked
             .iter()
@@ -747,7 +920,10 @@ async fn optimize(args: OptimizeArgs) -> Result<()> {
             .build(
                 Some(bench.table.snapshot()?),
                 bench.table.log_store(),
-                DeltaOperation::Optimize { predicate: None, target_size: 0 },
+                DeltaOperation::Optimize {
+                    predicate: None,
+                    target_size: 0,
+                },
             )
             .await;
         let (outcome, retries, error) = match result {
@@ -768,6 +944,105 @@ async fn optimize(args: OptimizeArgs) -> Result<()> {
     Ok(())
 }
 
+async fn seed_txn(args: SeedTxnArgs) -> Result<()> {
+    let root = table::root_store(&args.table_url)?;
+    let mut bench = table::open(&args.table_url, root, Arc::new(FaultPlan::default())).await?;
+    let started = Instant::now();
+    let mut commits = 0;
+    for chunk in (0..args.count).collect::<Vec<_>>().chunks(args.per_commit.max(1)) {
+        let txns = chunk
+            .iter()
+            .map(|i| {
+                deltalake_core::kernel::Transaction::new_with_last_update(
+                    format!("{}-{i}", args.prefix),
+                    1,
+                    Some(now_millis()),
+                )
+            })
+            .collect();
+        let props = CommitProperties::default()
+            .with_application_transactions(txns)
+            .with_create_checkpoint(false);
+        let finalized = CommitBuilder::from(props)
+            .with_actions(Vec::new())
+            .build(
+                Some(bench.table.snapshot()?),
+                bench.table.log_store(),
+                DeltaOperation::Write {
+                    mode: deltalake_core::protocol::SaveMode::Append,
+                    partition_by: None,
+                    predicate: None,
+                },
+            )
+            .await?;
+        bench.table.state = Some(finalized.snapshot());
+        commits += 1;
+    }
+    println!(
+        "{}",
+        serde_json::json!({"kind": "seed_txn", "app_ids": args.count, "commits": commits,
+            "ms": started.elapsed().as_secs_f64() * 1000.0, "version": bench.table.version()})
+    );
+    Ok(())
+}
+
+async fn txn_probe(args: TxnProbeArgs) -> Result<()> {
+    let root = table::root_store(&args.table_url)?;
+    let bench = table::open(&args.table_url, root, Arc::new(FaultPlan::default())).await?;
+    let state = bench.table.snapshot()?;
+    let mut out = serde_json::Map::new();
+    for app_id in &args.app_id {
+        let v = state
+            .transaction_version(bench.table.log_store().as_ref(), app_id)
+            .await?;
+        out.insert(
+            app_id.clone(),
+            serde_json::json!({"version": v, "fenced": v.map(|v| v >= commit_loop::FENCE_OFFSET)}),
+        );
+    }
+    println!(
+        "{}",
+        serde_json::json!({"kind": "txn_probe", "table_version": bench.table.version(), "txns": out,
+            "retention": state.metadata().configuration().get("delta.setTransactionRetentionDuration")})
+    );
+    Ok(())
+}
+
+async fn cleanup_log(args: TableArg) -> Result<()> {
+    let root = table::root_store(&args.table_url)?;
+    let bench = table::open(&args.table_url, root, Arc::new(FaultPlan::default())).await?;
+    deltalake_core::checkpoints::create_checkpoint(&bench.table, None).await?;
+    let version = bench.table.version().context("table has no version")?;
+    let deleted = deltalake_core::checkpoints::cleanup_expired_logs_for(
+        version,
+        bench.table.log_store().as_ref(),
+        now_millis() + 60_000,
+        None,
+    )
+    .await?;
+    println!(
+        "{}",
+        serde_json::json!({"kind": "cleanup_log", "checkpoint_version": version, "deleted": deleted})
+    );
+    Ok(())
+}
+
+async fn vacuum(args: TableArg) -> Result<()> {
+    let root = table::root_store(&args.table_url)?;
+    let bench = table::open(&args.table_url, root, Arc::new(FaultPlan::default())).await?;
+    let (_, metrics) = bench
+        .table
+        .vacuum()
+        .with_retention_period(chrono::Duration::zero())
+        .with_enforce_retention_duration(false)
+        .await?;
+    println!(
+        "{}",
+        serde_json::json!({"kind": "vacuum", "deleted": metrics.files_deleted.len()})
+    );
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -776,14 +1051,24 @@ async fn main() -> Result<()> {
         .init();
     match Cli::parse().command {
         Command::Create(args) => {
-            create_tables(&args.tables.urls()?, &parse_props(&args.props)?, table::TableSchema::Small).await
+            create_tables(
+                &args.tables.urls()?,
+                &parse_props(&args.props)?,
+                table::TableSchema::Small,
+            )
+            .await
         }
         Command::Run(args) => run(*args).await,
         Command::Check(args) => {
             let report = checker::check(&args.table_url, &args.wal_dir, &args.sent).await?;
             let mut value = serde_json::to_value(&report)?;
             if !args.full {
-                for key in ["missing_accepted", "duplicate_paths", "split_manifests", "dangling_files"] {
+                for key in [
+                    "missing_accepted",
+                    "duplicate_paths",
+                    "split_manifests",
+                    "dangling_files",
+                ] {
                     if let Some(list) = value.get(key).and_then(|v| v.as_array()).map(Vec::len) {
                         value[format!("{key}_count")] = list.into();
                         if let Some(arr) = value.get_mut(key).and_then(|v| v.as_array_mut()) {
@@ -798,5 +1083,9 @@ async fn main() -> Result<()> {
         Command::Read(args) => read(args).await,
         Command::Checkpoint(args) => checkpoint(args).await,
         Command::Optimize(args) => optimize(args).await,
+        Command::SeedTxn(args) => seed_txn(args).await,
+        Command::TxnProbe(args) => txn_probe(args).await,
+        Command::CleanupLog(args) => cleanup_log(args).await,
+        Command::Vacuum(args) => vacuum(args).await,
     }
 }
