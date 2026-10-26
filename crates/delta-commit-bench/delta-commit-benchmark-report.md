@@ -485,8 +485,9 @@ mechanism removes or hides entries, and X restarts (or resumes, for `inproc`). L
 | Same, then VACUUM deletes the removed files | no | G2 and G4 fail | G2 and G4 fail | The re-added file no longer exists. Reads fail. |
 | Table deleted and recreated at the same path | no | X commits 4 batches into the new table | 3 batches | Old data appears in the new table. |
 
-- **What removes a fence:** only `txn` retention and table recreation. Checkpoints, log cleanup, OPTIMIZE
-  and VACUUM keep `txn` entries.
+- **What removes a fence:** only `txn` retention and table recreation. Checkpoints, log cleanup and
+  OPTIMIZE keep `txn` entries. VACUUM ran only after retention expired. It deletes data files and never
+  rewrites the log, so it cannot remove `txn` entries.
 - **The stale owner that stays running is protected regardless of retention.** Its snapshot predates
   the fence, and the conflict checker sees the fence in the winning commits.
 - **A restarted owner is not protected.** Expiry removes both the fence and X's own last `txn` version,
